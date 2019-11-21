@@ -18,6 +18,7 @@ import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Timer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -36,6 +37,10 @@ public class NetworkMetrics {
   public final Histogram selectorSelectTime;
   public final Counter selectorIOCount;
   public final Histogram selectorIOTime;
+  public final Counter selectorReadyKeyCount;
+  public final Counter selectorPrepareKeyCount;
+  public final Counter selectorReadKeyCount;
+  public final Counter selectorWriteKeyCount;
   public final Counter selectorNioCloseErrorCount;
   public final Counter selectorDisconnectedErrorCount;
   public final Counter selectorIOErrorCount;
@@ -45,17 +50,29 @@ public class NetworkMetrics {
   private final List<AtomicLong> selectorActiveConnectionsList;
   private final List<Set<String>> selectorUnreadyConnectionsList;
 
-  // Plaintext metrics
-  // the bytes rate to receive the entire request
-  public final Meter plaintextReceiveBytesRate;
-  // the bytes rate to send the entire response
-  public final Meter plaintextSendBytesRate;
-  // the time to receive 1KB data in one read call
-  public final Histogram plaintextReceiveTimeInUsPerKB;
-  // the time to send 1KB data in one write call
-  public final Histogram plaintextSendTimeInUsPerKB;
-  // the time to send data in one write call
-  public final Histogram plaintextSendTime;
+  // Transmission metrics
+  // The time from NetworkSend create to send start
+  public final Histogram transmissionSendPendingTime;
+  // From the first byte to all data write to socket channel
+  public final Histogram transmissionSendAllTime;
+  // From last byte of request sent out to first byte of response received
+  public final Histogram transmissionRoundTripTime;
+  // From the first byte to all data read from socket channel
+  public final Histogram transmissionReceiveAllTime;
+  // The bytes rate to send the entire response
+  public final Meter transmissionSendBytesRate;
+  //Tthe bytes rate to receive the entire request
+  public final Meter transmissionReceiveBytesRate;
+
+  // For a single read/write in transmission
+  // The time to send data in one write call
+  public final Histogram transmissionSendTime;
+  // The size of date sent in one write call
+  public final Histogram transmissionSendSize;
+  // The time to send data in one read call
+  public final Histogram transmissionReceiveTime;
+  // The size of date sent in one read call
+  public final Histogram transmissionReceiveSize;
 
   // SSL metrics
   public final Counter sslFactoryInitializationCount;
@@ -65,32 +82,23 @@ public class NetworkMetrics {
   public final Histogram sslHandshakeTime;
   public final Counter sslHandshakeCount;
   public final Counter sslHandshakeErrorCount;
-  // the bytes rate to receive the entire request
-  public final Meter sslReceiveBytesRate;
-  // the bytes rate to send the entire response
-  public final Meter sslSendBytesRate;
-  // the time to receive 1KB data in one read call
-  public final Histogram sslReceiveTimeInUsPerKB;
-  // the time to send 1KB data in one write call
-  public final Histogram sslSendTimeInUsPerKB;
-  public final Histogram sslEncryptionTimeInUsPerKB;
-  public final Histogram sslDecryptionTimeInUsPerKB;
-  // the time to send data in one write call
-  public final Histogram sslSendTime;
-  // the count of renegotiation after initial handshake done
+  // The count of renegotiation after initial handshake done
   public final Counter sslRenegotiationCount;
+  public final Meter sslEncryptionTimeInUsPerKB;
+  public final Meter sslDecryptionTimeInUsPerKB;
 
   // NetworkClient metrics
-  public final Histogram networkClientSendAndPollTime;
-  public final Histogram requestQueueTime;
-  public final Histogram requestSendTime;
-  public final Histogram requestSendTotalTime;
-  public final Histogram requestResponseRoundTripTime;
-  public final Histogram requestResponseTotalTime;
+  public final Timer networkClientSendAndPollTime;
+  public final Timer networkClientRequestQueueTime;
+  public final Timer networkClientRoundTripTime;
+  // NetworkClient request queuing time plus round trip time.
+  public final Timer networkClientTotalTime;
 
-  public final Counter connectionTimeOutError;
+  public final Counter connectionCheckoutTimeoutError;
   public final Counter connectionNotAvailable;
   public final Counter connectionReachLimit;
+  public final Counter connectionDisconnected;
+  public final Counter connectionReplenished;
   public final Counter networkClientIOError;
   public final Counter networkClientException;
   private List<AtomicLong> networkClientPendingRequestList;
@@ -101,6 +109,10 @@ public class NetworkMetrics {
     selectorConnectionCreated = registry.counter(MetricRegistry.name(Selector.class, "SelectorConnectionCreated"));
     selectorSelectCount = registry.counter(MetricRegistry.name(Selector.class, "SelectorSelectCount"));
     selectorIOCount = registry.counter(MetricRegistry.name(Selector.class, "SelectorIOCount"));
+    selectorReadyKeyCount = registry.counter(MetricRegistry.name(Selector.class, "SelectorReadyKeyCount"));
+    selectorPrepareKeyCount = registry.counter(MetricRegistry.name(Selector.class, "SelectorPrepareKeyCount"));
+    selectorReadKeyCount = registry.counter(MetricRegistry.name(Selector.class, "SelectorReadKeyCount"));
+    selectorWriteKeyCount = registry.counter(MetricRegistry.name(Selector.class, "SelectorWriteKeyCount"));
     selectorSelectTime = registry.histogram(MetricRegistry.name(Selector.class, "SelectorSelectTime"));
     selectorIOTime = registry.histogram(MetricRegistry.name(Selector.class, "SelectorIOTime"));
     selectorNioCloseErrorCount = registry.counter(MetricRegistry.name(Selector.class, "SelectorNioCloseErrorCount"));
@@ -112,19 +124,19 @@ public class NetworkMetrics {
     selectorCloseKeyErrorCount = registry.counter(MetricRegistry.name(Selector.class, "SelectorCloseKeyErrorCount"));
     selectorCloseSocketErrorCount =
         registry.counter(MetricRegistry.name(Selector.class, "SelectorCloseSocketErrorCount"));
-    plaintextReceiveBytesRate = registry.meter(MetricRegistry.name(Selector.class, "PlaintextReceiveBytesRate"));
-    plaintextSendBytesRate = registry.meter(MetricRegistry.name(Selector.class, "PlaintextSendBytesRate"));
-    plaintextReceiveTimeInUsPerKB =
-        registry.histogram(MetricRegistry.name(Selector.class, "PlaintextReceiveTimeInUsPerKB"));
-    plaintextSendTimeInUsPerKB = registry.histogram(MetricRegistry.name(Selector.class, "PlaintextSendTimeInUsPerKB"));
-    plaintextSendTime = registry.histogram(MetricRegistry.name(Selector.class, "PlaintextSendTime"));
-    sslReceiveBytesRate = registry.meter(MetricRegistry.name(Selector.class, "SslReceiveBytesRate"));
-    sslSendBytesRate = registry.meter(MetricRegistry.name(Selector.class, "SslSendBytesRate"));
-    sslEncryptionTimeInUsPerKB = registry.histogram(MetricRegistry.name(Selector.class, "SslEncryptionTimeInUsPerKB"));
-    sslDecryptionTimeInUsPerKB = registry.histogram(MetricRegistry.name(Selector.class, "SslDecryptionTimeInUsPerKB"));
-    sslReceiveTimeInUsPerKB = registry.histogram(MetricRegistry.name(Selector.class, "SslReceiveTimeInUsPerKB"));
-    sslSendTimeInUsPerKB = registry.histogram(MetricRegistry.name(Selector.class, "SslSendTimeInUsPerKB"));
-    sslSendTime = registry.histogram(MetricRegistry.name(Selector.class, "SslSendTime"));
+
+    transmissionSendPendingTime =
+        registry.histogram(MetricRegistry.name(Selector.class, "TransmissionSendPendingTime"));
+    transmissionSendAllTime = registry.histogram(MetricRegistry.name(Selector.class, "TransmissionSendAllTime"));
+    transmissionRoundTripTime = registry.histogram(MetricRegistry.name(Selector.class, "TransmissionRoundTripTime"));
+    transmissionReceiveAllTime = registry.histogram(MetricRegistry.name(Selector.class, "TransmissionReceiveAllTime"));
+    transmissionSendBytesRate = registry.meter(MetricRegistry.name(Selector.class, "TransmissionSendBytesRate"));
+    transmissionReceiveBytesRate = registry.meter(MetricRegistry.name(Selector.class, "TransmissionReceiveBytesRate"));
+    transmissionSendTime = registry.histogram(MetricRegistry.name(Selector.class, "TransmissionSendTime"));
+    transmissionSendSize = registry.histogram(MetricRegistry.name(Selector.class, "TransmissionSendSize"));
+    transmissionReceiveTime = registry.histogram(MetricRegistry.name(Selector.class, "TransmissionReceiveTime"));
+    transmissionReceiveSize = registry.histogram(MetricRegistry.name(Selector.class, "TransmissionReceiveSize"));
+
     sslFactoryInitializationCount =
         registry.counter(MetricRegistry.name(Selector.class, "SslFactoryInitializationCount"));
     sslFactoryInitializationErrorCount =
@@ -137,18 +149,21 @@ public class NetworkMetrics {
     sslHandshakeCount = registry.counter(MetricRegistry.name(Selector.class, "SslHandshakeCount"));
     sslHandshakeErrorCount = registry.counter(MetricRegistry.name(Selector.class, "SslHandshakeErrorCount"));
     sslRenegotiationCount = registry.counter(MetricRegistry.name(Selector.class, "SslRenegotiationCount"));
+    sslEncryptionTimeInUsPerKB = registry.meter(MetricRegistry.name(Selector.class, "SslEncryptionTimeInUsPerKB"));
+    sslDecryptionTimeInUsPerKB = registry.meter(MetricRegistry.name(Selector.class, "SslDecryptionTimeInUsPerKB"));
 
     networkClientSendAndPollTime =
-        registry.histogram(MetricRegistry.name(NetworkClient.class, "NetworkClientSendAndPollTime"));
-    requestQueueTime = registry.histogram(MetricRegistry.name(NetworkClient.class, "RequestQueueTime"));
-    requestSendTime = registry.histogram(MetricRegistry.name(NetworkClient.class, "RequestSendTime"));
-    requestSendTotalTime = registry.histogram(MetricRegistry.name(NetworkClient.class, "RequestSendTotalTime"));
-    requestResponseRoundTripTime =
-        registry.histogram(MetricRegistry.name(NetworkClient.class, "RequestResponseRoundTripTime"));
-    requestResponseTotalTime = registry.histogram(MetricRegistry.name(NetworkClient.class, "RequestResponseTotalTime"));
-    connectionTimeOutError = registry.counter(MetricRegistry.name(NetworkClient.class, "ConnectionTimeOutError"));
+        registry.timer(MetricRegistry.name(NetworkClient.class, "NetworkClientSendAndPollTime"));
+    networkClientRequestQueueTime =
+        registry.timer(MetricRegistry.name(NetworkClient.class, "NetworkClientRequestQueueTime"));
+    networkClientRoundTripTime = registry.timer(MetricRegistry.name(NetworkClient.class, "NetworkClientRoundTripTime"));
+    networkClientTotalTime = registry.timer(MetricRegistry.name(NetworkClient.class, "NetworkClientTotalTime"));
+    connectionCheckoutTimeoutError =
+        registry.counter(MetricRegistry.name(NetworkClient.class, "ConnectionCheckoutTimeoutError"));
     connectionNotAvailable = registry.counter(MetricRegistry.name(NetworkClient.class, "ConnectionNotAvailable"));
     connectionReachLimit = registry.counter(MetricRegistry.name(NetworkClient.class, "ConnectionReachLimit"));
+    connectionDisconnected = registry.counter(MetricRegistry.name(NetworkClient.class, "ConnectionDisconnected"));
+    connectionReplenished = registry.counter(MetricRegistry.name(NetworkClient.class, "ConnectionReplenished"));
     networkClientIOError = registry.counter(MetricRegistry.name(NetworkClient.class, "NetworkClientIOError"));
     networkClientException = registry.counter(MetricRegistry.name(NetworkClient.class, "NetworkClientException"));
 
@@ -156,41 +171,32 @@ public class NetworkMetrics {
     selectorUnreadyConnectionsList = new ArrayList<>();
     networkClientPendingRequestList = new ArrayList<>();
 
-    final Gauge<Long> selectorActiveConnectionsCount = new Gauge<Long>() {
-      @Override
-      public Long getValue() {
-        long activeConnectionsCount = 0;
-        for (AtomicLong activeConnection : selectorActiveConnectionsList) {
-          activeConnectionsCount += activeConnection.get();
-        }
-        return activeConnectionsCount;
+    final Gauge<Long> selectorActiveConnectionsCount = () -> {
+      long activeConnectionsCount = 0;
+      for (AtomicLong activeConnection : selectorActiveConnectionsList) {
+        activeConnectionsCount += activeConnection.get();
       }
+      return activeConnectionsCount;
     };
     registry.register(MetricRegistry.name(Selector.class, "SelectorActiveConnectionsCount"),
         selectorActiveConnectionsCount);
 
-    final Gauge<Long> selectorUnreadyConnectionsCount = new Gauge<Long>() {
-      @Override
-      public Long getValue() {
-        long unreadyConnectionCount = 0;
-        for (Set<String> unreadyConnection : selectorUnreadyConnectionsList) {
-          unreadyConnectionCount += unreadyConnection.size();
-        }
-        return unreadyConnectionCount;
+    final Gauge<Long> selectorUnreadyConnectionsCount = () -> {
+      long unreadyConnectionCount = 0;
+      for (Set<String> unreadyConnection : selectorUnreadyConnectionsList) {
+        unreadyConnectionCount += unreadyConnection.size();
       }
+      return unreadyConnectionCount;
     };
     registry.register(MetricRegistry.name(Selector.class, "SelectorUnreadyConnectionsCount"),
         selectorUnreadyConnectionsCount);
 
-    final Gauge<Long> networkClientPendingRequestsCount = new Gauge<Long>() {
-      @Override
-      public Long getValue() {
-        long pendingRequestsCount = 0;
-        for (AtomicLong pendingRequest : networkClientPendingRequestList) {
-          pendingRequestsCount += pendingRequest.get();
-        }
-        return pendingRequestsCount;
+    final Gauge<Long> networkClientPendingRequestsCount = () -> {
+      long pendingRequestsCount = 0;
+      for (AtomicLong pendingRequest : networkClientPendingRequestList) {
+        pendingRequestsCount += pendingRequest.get();
       }
+      return pendingRequestsCount;
     };
     registry.register(MetricRegistry.name(NetworkClient.class, "NetworkClientPendingConnectionsCount"),
         networkClientPendingRequestsCount);
@@ -236,32 +242,17 @@ class ServerNetworkMetrics extends NetworkMetrics {
   public ServerNetworkMetrics(final SocketRequestResponseChannel channel, MetricRegistry registry,
       final List<Processor> processorThreads) {
     super(registry);
-    requestQueueSize = new Gauge<Integer>() {
-      @Override
-      public Integer getValue() {
-        return channel.getRequestQueueSize();
-      }
-    };
+    requestQueueSize = channel::getRequestQueueSize;
     registry.register(MetricRegistry.name(SocketRequestResponseChannel.class, "RequestQueueSize"), requestQueueSize);
     responseQueueSize = new ArrayList<Gauge<Integer>>(channel.getNumberOfProcessors());
 
     for (int i = 0; i < channel.getNumberOfProcessors(); i++) {
       final int index = i;
-      responseQueueSize.add(i, new Gauge<Integer>() {
-        @Override
-        public Integer getValue() {
-          return channel.getResponseQueueSize(index);
-        }
-      });
+      responseQueueSize.add(i, () -> channel.getResponseQueueSize(index));
       registry.register(MetricRegistry.name(SocketRequestResponseChannel.class, i + "-ResponseQueueSize"),
           responseQueueSize.get(i));
     }
-    numberOfProcessorThreads = new Gauge<Integer>() {
-      @Override
-      public Integer getValue() {
-        return getLiveThreads(processorThreads);
-      }
-    };
+    numberOfProcessorThreads = () -> getLiveThreads(processorThreads);
     registry.register(MetricRegistry.name(SocketServer.class, "NumberOfProcessorThreads"), numberOfProcessorThreads);
 
     acceptConnectionErrorCount =

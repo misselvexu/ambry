@@ -16,7 +16,7 @@ package com.github.ambry.router;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.config.NetworkConfig;
-import com.github.ambry.network.NetworkClient;
+import com.github.ambry.network.SocketNetworkClient;
 import com.github.ambry.network.NetworkMetrics;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
@@ -25,16 +25,17 @@ import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.Time;
 import java.io.IOException;
 import java.util.List;
+import java.util.Set;
 
 
 /**
- * A mock class used for verifying whether certain methods of the {@link NetworkClient} gets called in certain
+ * A mock class used for verifying whether certain methods of the {@link SocketNetworkClient} gets called in certain
  * tests and how many responses are received by the client.
  */
-class MockNetworkClient extends NetworkClient {
-  boolean wokenUp = false;
-  int responseCount = 0;
-  int processedResponseCount = 0;
+class MockNetworkClient extends SocketNetworkClient {
+  private boolean wokenUp = false;
+  private int responseCount = 0;
+  private int processedResponseCount = 0;
 
   /**
    * Construct a MockNetworkClient with mock components.
@@ -66,9 +67,10 @@ class MockNetworkClient extends NetworkClient {
    * {@inheritDoc}
    */
   @Override
-  public List<ResponseInfo> sendAndPoll(List<RequestInfo> requestInfos, int pollTimeoutMs) {
+  public List<ResponseInfo> sendAndPoll(List<RequestInfo> requestsToSend, Set<Integer> requestsToDrop,
+      int pollTimeoutMs) {
     processedResponseCount = responseCount;
-    List<ResponseInfo> responseInfoList = super.sendAndPoll(requestInfos, pollTimeoutMs);
+    List<ResponseInfo> responseInfoList = super.sendAndPoll(requestsToSend, requestsToDrop, pollTimeoutMs);
     responseCount += responseInfoList.size();
     return responseInfoList;
   }
@@ -85,7 +87,7 @@ class MockNetworkClient extends NetworkClient {
 
   /**
    * Get the number of responses received by the client before the current
-   * {@link MockNetworkClient#sendAndPoll(List, int)} call.
+   * {@link SocketNetworkClient#sendAndPoll(List, Set, int)} call.
    * @return the number of processed responses.
    */
   int getProcessedResponseCount() {

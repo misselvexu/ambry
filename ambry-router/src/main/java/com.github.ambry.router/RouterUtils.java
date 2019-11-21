@@ -17,12 +17,21 @@ import com.github.ambry.account.Account;
 import com.github.ambry.account.AccountService;
 import com.github.ambry.account.Container;
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
+import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.config.RouterConfig;
+import com.github.ambry.network.NetworkClientErrorCode;
+import com.github.ambry.network.ResponseInfo;
+import com.github.ambry.protocol.Response;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.Utils;
+import java.io.DataInputStream;
+import java.io.IOException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.function.ToIntFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -124,6 +133,18 @@ class RouterUtils {
   }
 
   /**
+   * @param correlationId correlation ID for the request that timed out
+   * @param dataNode the node that the request was made to.
+   * @param blobId the blob ID of the request.
+   * @return a {@link RouterException} with the {@link RouterErrorCode#OperationTimedOut} error code.
+   */
+  static RouterException buildTimeoutException(int correlationId, DataNodeId dataNode, BlobId blobId) {
+    return new RouterException(
+        "Timed out waiting for a response. correlationId=" + correlationId + ", dataNode=" + dataNode + ", blobId="
+            + blobId, RouterErrorCode.OperationTimedOut);
+  }
+
+  /**
    * Atomically replace the exception for an operation depending on the precedence of the new exception.
    * First, if the current operationException is null, directly set operationException as exception;
    * Second, if operationException exists, compare ErrorCodes of exception and existing operation Exception depending
@@ -150,5 +171,51 @@ class RouterUtils {
       }
       return newException;
     });
+  }
+
+  /**
+   * Extract the {@link Response} from the given {@link ResponseInfo}
+   * @param <R> the {@link Response} type.
+   * @param responseHandler the {@link ResponseHandler} instance to use.
+   * @param routerMetrics the {@link NonBlockingRouterMetrics} instance to use.
+   * @param responseInfo the {@link ResponseInfo} from which the {@link Response} is to be extracted.
+   * @param deserializer the {@link Deserializer} to use.
+   * @param errorExtractor extract the {@link ServerErrorCode} to send to {@link ResponseHandler#onEvent}.
+   * @return the extracted {@link Response} if there is one; null otherwise.
+   */
+  static <R extends Response> R extractResponseAndNotifyResponseHandler(ResponseHandler responseHandler,
+      NonBlockingRouterMetrics routerMetrics, ResponseInfo responseInfo, Deserializer<R> deserializer,
+      Function<R, ServerErrorCode> errorExtractor, boolean shareMemory) {
+    R response = null;
+    ReplicaId replicaId = responseInfo.getRequestInfo().getReplicaId();
+    NetworkClientErrorCode networkClientErrorCode = responseInfo.getError();
+    if (networkClientErrorCode == null) {
+      try {
+        DataInputStream dis = Utils.createDataInputStreamFromBuffer(responseInfo.getResponse(), shareMemory);
+        response = deserializer.readFrom(dis);
+        responseHandler.onEvent(replicaId, errorExtractor.apply(response));
+      } catch (Exception e) {
+        // Ignore. There is no value in notifying the response handler.
+        logger.error("Response deserialization received unexpected error", e);
+        routerMetrics.responseDeserializationErrorCount.inc();
+      }
+    } else {
+      responseHandler.onEvent(replicaId, networkClientErrorCode);
+    }
+    return response;
+  }
+
+  /**
+   * Used to deserialize an object from a {@link DataInputStream}.
+   * @param <T> the type of the deserialized object.
+   */
+  @FunctionalInterface
+  interface Deserializer<T> {
+    /**
+     * @param stream the {@link DataInputStream} to read from.
+     * @return the deserialized object.
+     * @throws IOException on deserialization errors.
+     */
+    T readFrom(DataInputStream stream) throws IOException;
   }
 }

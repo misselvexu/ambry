@@ -21,14 +21,18 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.concurrent.ThreadLocalRandom;
 import org.apache.helix.model.InstanceConfig;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
 /**
@@ -37,15 +41,24 @@ import org.json.JSONObject;
 public class ClusterMapUtils {
   // datacenterId == UNKNOWN_DATACENTER_ID indicate datacenterId is not available at the time when this blobId is formed.
   public static final byte UNKNOWN_DATACENTER_ID = -1;
-  public static final String ZNODE_NAME = "PartitionOverride";
-  public static final String ZNODE_PATH = "/ClusterConfigs/" + ZNODE_NAME;
-  public static final String PROPERTYSTORE_ZNODE_PATH = "/PROPERTYSTORE/ClusterConfigs/" + ZNODE_NAME;
+  public static final String PARTITION_OVERRIDE_STR = "PartitionOverride";
+  public static final String REPLICA_ADDITION_STR = "ReplicaAddition";
+  public static final String PROPERTYSTORE_STR = "PROPERTYSTORE";
+  // Following two ZNode paths are the path to ZNode that stores some admin configs. Partition override config is used
+  // to administratively override partition from frontend's point of view. Replica addition config is used to specify
+  // detailed new replica infos (capacity, mount path, etc) which will be added to target server.
+  // Note that, root path in Helix is "/ClusterName/PROPERTYSTORE", so the full path is (use partition override as example)
+  // "/ClusterName/PROPERTYSTORE/AdminConfigs/PartitionOverride"
+  public static final String PARTITION_OVERRIDE_ZNODE_PATH = "/AdminConfigs/" + PARTITION_OVERRIDE_STR;
+  public static final String REPLICA_ADDITION_ZNODE_PATH = "/AdminConfigs/" + REPLICA_ADDITION_STR;
   static final String DISK_CAPACITY_STR = "capacityInBytes";
   static final String DISK_STATE = "diskState";
   static final String PARTITION_STATE = "state";
+  static final String PARTITION_CLASS_STR = "partitionClass";
   static final String REPLICAS_STR = "Replicas";
   static final String REPLICAS_DELIM_STR = ",";
   static final String REPLICAS_STR_SEPARATOR = ":";
+  static final String REPLICAS_CAPACITY_STR = "replicaCapacityInBytes";
   static final String SSLPORT_STR = "sslPort";
   static final String RACKID_STR = "rackId";
   static final String SEALED_STR = "SEALED";
@@ -53,7 +66,6 @@ public class ClusterMapUtils {
   static final String AVAILABLE_STR = "AVAILABLE";
   static final String READ_ONLY_STR = "RO";
   static final String READ_WRITE_STR = "RW";
-  static final String UNAVAILABLE_STR = "UNAVAILABLE";
   static final String ZKCONNECTSTR_STR = "zkConnectStr";
   static final String ZKINFO_STR = "zkInfo";
   static final String DATACENTER_STR = "datacenter";
@@ -68,6 +80,7 @@ public class ClusterMapUtils {
   static final long MIN_DISK_CAPACITY_IN_BYTES = 10L * 1024 * 1024 * 1024;
   static final long MAX_DISK_CAPACITY_IN_BYTES = 10L * 1024 * 1024 * 1024 * 1024;
   static final int CURRENT_SCHEMA_VERSION = 0;
+  private static final Logger logger = LoggerFactory.getLogger(ClusterMapUtils.class);
 
   /**
    * Stores all zk related info for a DC.
@@ -118,7 +131,7 @@ public class ClusterMapUtils {
    * @return a map of dcName -> DcInfo.
    * @throws JSONException if there is an error parsing the JSON.
    */
-  static Map<String, DcZkInfo> parseDcJsonAndPopulateDcInfo(String dcInfoJsonString) throws JSONException {
+  public static Map<String, DcZkInfo> parseDcJsonAndPopulateDcInfo(String dcInfoJsonString) throws JSONException {
     Map<String, DcZkInfo> dataCenterToZkAddress = new HashMap<>();
     JSONObject root = new JSONObject(dcInfoJsonString);
     JSONArray all = root.getJSONArray(ZKINFO_STR);
@@ -178,7 +191,7 @@ public class ClusterMapUtils {
    * @param instanceConfig the {@link InstanceConfig} associated with the interested instance.
    * @return the datacenter name associated with the given instance.
    */
-  static String getDcName(InstanceConfig instanceConfig) {
+  public static String getDcName(InstanceConfig instanceConfig) {
     return instanceConfig.getRecord().getSimpleField(DATACENTER_STR);
   }
 
@@ -187,7 +200,7 @@ public class ClusterMapUtils {
    * @param instanceConfig the {@link InstanceConfig} associated with the interested instance.
    * @return the ssl port associated with the given instance.
    */
-  static Integer getSslPortStr(InstanceConfig instanceConfig) {
+  public static Integer getSslPortStr(InstanceConfig instanceConfig) {
     String sslPortStr = instanceConfig.getRecord().getSimpleField(SSLPORT_STR);
     return sslPortStr == null ? null : Integer.valueOf(sslPortStr);
   }
@@ -313,6 +326,8 @@ public class ClusterMapUtils {
   static boolean areAllReplicasForPartitionUp(PartitionId partition) {
     for (ReplicaId replica : partition.getReplicaIds()) {
       if (replica.isDown()) {
+        logger.debug("Replica [{}] on {} {} is down", replica.getPartitionId().toPathString(),
+            replica.getDataNodeId().getHostname(), replica.getMountPath());
         return false;
       }
     }
@@ -328,6 +343,8 @@ public class ClusterMapUtils {
   static class PartitionSelectionHelper {
     private Collection<? extends PartitionId> allPartitions;
     private Map<String, SortedMap<Integer, List<PartitionId>>> partitionIdsByClassAndLocalReplicaCount;
+    private Map<PartitionId, List<ReplicaId>> partitionIdToLocalReplicas;
+    private String localDatacenterName;
 
     /**
      * @param allPartitions the list of all {@link PartitionId}s
@@ -335,6 +352,7 @@ public class ClusterMapUtils {
      *                            are not required.
      */
     PartitionSelectionHelper(Collection<? extends PartitionId> allPartitions, String localDatacenterName) {
+      this.localDatacenterName = localDatacenterName;
       updatePartitions(allPartitions, localDatacenterName);
     }
 
@@ -347,6 +365,7 @@ public class ClusterMapUtils {
     void updatePartitions(Collection<? extends PartitionId> allPartitions, String localDatacenterName) {
       this.allPartitions = allPartitions;
       partitionIdsByClassAndLocalReplicaCount = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+      partitionIdToLocalReplicas = new HashMap<>();
       for (PartitionId partition : allPartitions) {
         String partitionClass = partition.getPartitionClass();
         int localReplicaCount = 0;
@@ -354,6 +373,7 @@ public class ClusterMapUtils {
           if (localDatacenterName != null && !localDatacenterName.isEmpty() && replicaId.getDataNodeId()
               .getDatacenterName()
               .equals(localDatacenterName)) {
+            partitionIdToLocalReplicas.computeIfAbsent(partition, key -> new LinkedList<>()).add(replicaId);
             localReplicaCount++;
           }
         }
@@ -393,9 +413,74 @@ public class ClusterMapUtils {
           if (areAllReplicasForPartitionUp((partition))) {
             healthyWritablePartitions.add(partition);
           }
+        } else {
+          logger.debug("{} is in READ_ONLY state, skipping it", partition.toString());
         }
       }
       return healthyWritablePartitions.isEmpty() ? writablePartitions : healthyWritablePartitions;
+    }
+
+    /**
+     * Returns a writable partition selected at random, that belongs to the specified partition class and that is in the
+     * state {@link PartitionState#READ_WRITE} AND has enough replicas up. In case none of the partitions have enough
+     * replicas up, any writable partition is returned. Enough replicas is considered to be all local replicas if such
+     * information is available. In case localDatacenterName is not available, all of the partition's replicas should be up.
+     * @param partitionClass the class of the partitions desired. Can be {@code null}.
+     * @param partitionsToExclude partitions that should be excluded from the result. Can be {@code null} or empty.
+     * @return A writable partition or {@code null} if no writable partition with given criteria found
+     */
+    PartitionId getRandomWritablePartition(String partitionClass, List<PartitionId> partitionsToExclude) {
+      PartitionId anyWritablePartition = null;
+      List<PartitionId> partitionsInClass = getPartitionsInClass(partitionClass, true);
+
+      int workingSize = partitionsInClass.size();
+      while (workingSize > 0) {
+        int randomIndex = ThreadLocalRandom.current().nextInt(workingSize);
+        PartitionId selected = partitionsInClass.get(randomIndex);
+        if (partitionsToExclude == null || partitionsToExclude.size() == 0 || !partitionsToExclude.contains(selected)) {
+          if (selected.getPartitionState() == PartitionState.READ_WRITE) {
+            anyWritablePartition = selected;
+            if (areEnoughReplicasForPartitionUp(selected)) {
+              return selected;
+            }
+          }
+        }
+        if (randomIndex != workingSize - 1) {
+          partitionsInClass.set(randomIndex, partitionsInClass.get(workingSize - 1));
+        }
+        workingSize--;
+      }
+      //if we are here then that means we couldn't find any partition with all local replicas up
+      return anyWritablePartition;
+    }
+
+    /**
+     * Check whether the parition has has enough replicas up for write operations to try. Enough replicas is considered
+     * to be all local replicas if such information is available. In case localDatacenterName is not available, all of
+     * the partition's replicas should be up.
+     * @param partitionId the {@link PartitionId} to check.
+     * @return true if enough replicas are up; false otherwise.
+     */
+    private boolean areEnoughReplicasForPartitionUp(PartitionId partitionId) {
+      if (localDatacenterName != null && !localDatacenterName.isEmpty()) {
+        return areAllLocalReplicasForPartitionUp(partitionId);
+      } else {
+        return areAllReplicasForPartitionUp(partitionId);
+      }
+    }
+
+    /**
+     * Check whether all local replicas of the given {@link PartitionId} are up.
+     * @param partitionId the {@link PartitionId} to check.
+     * @return true if all local replicas are up; false otherwise.
+     */
+    private boolean areAllLocalReplicasForPartitionUp(PartitionId partitionId) {
+      for (ReplicaId replica : partitionIdToLocalReplicas.get(partitionId)) {
+        if (replica.isDown()) {
+          return false;
+        }
+      }
+      return true;
     }
 
     /**
@@ -428,4 +513,3 @@ public class ClusterMapUtils {
     }
   }
 }
-

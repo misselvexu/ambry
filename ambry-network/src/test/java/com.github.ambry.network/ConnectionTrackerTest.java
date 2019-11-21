@@ -13,6 +13,7 @@
  */
 package com.github.ambry.network;
 
+import com.github.ambry.clustermap.MockDataNodeId;
 import com.github.ambry.config.NetworkConfig;
 import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
@@ -20,6 +21,8 @@ import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.Time;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
@@ -41,9 +44,11 @@ public class ConnectionTrackerTest {
   private Time time;
   private int connStringIndex = 0;
   private ArrayList<String> connIds = new ArrayList<String>();
+  private Port plainTextPort;
+  private Port sslPort;
 
   @Before
-  public void initialize() throws IOException {
+  public void initialize() {
     Properties props = new Properties();
     props.setProperty("router.hostname", "localhost");
     props.setProperty("router.datacenter.name", "DC1");
@@ -53,6 +58,8 @@ public class ConnectionTrackerTest {
     routerConfig = new RouterConfig(verifiableProperties);
     networkConfig = new NetworkConfig(verifiableProperties);
     time = new MockTime();
+    plainTextPort = new Port(100, PortType.PLAINTEXT);
+    sslPort = new Port(200, PortType.SSL);
   }
 
   /**
@@ -66,24 +73,24 @@ public class ConnectionTrackerTest {
 
   /**
    * Tests honoring of pool totalConnectionsCounts.
-   * @throws IOException
    */
   @Test
-  public void testConnectionTracker() {
+  public void testConnectionTracker() throws IOException {
     connectionTracker = new ConnectionTracker(routerConfig.routerScalingUnitMaxConnectionsPerPortPlainText,
         routerConfig.routerScalingUnitMaxConnectionsPerPortSsl);
     // When no connections were ever made to a host:port, connectionTracker should return null, but
     // initiate connections.
     int totalConnectionsCount = 0;
     int availableCount = 0;
-    Port port1 = new Port(100, PortType.PLAINTEXT);
-
+    List<String> mountPaths = Collections.singletonList("/mnt/path");
+    MockDataNodeId dataNodeId1 =
+        new MockDataNodeId("host1", Collections.singletonList(plainTextPort), mountPaths, "DC1");
+    MockDataNodeId dataNodeId2 = new MockDataNodeId("host2", Arrays.asList(plainTextPort, sslPort), mountPaths, "DC1");
     boolean done = false;
     do {
-      String connId = connectionTracker.checkOutConnection("host1", port1);
-      if (connId == null && connectionTracker.mayCreateNewConnection("host1", port1)) {
-        connId = mockNewConnection("host1", port1);
-        connectionTracker.startTrackingInitiatedConnection("host1", port1, connId);
+      String connId = connectionTracker.checkOutConnection("host1", plainTextPort, dataNodeId1);
+      if (connId == null && connectionTracker.mayCreateNewConnection("host1", plainTextPort, dataNodeId1)) {
+        connId = connectionTracker.connectAndTrack(this::mockNewConnection, "host1", plainTextPort, dataNodeId1);
       } else {
         done = true;
       }
@@ -92,13 +99,11 @@ public class ConnectionTrackerTest {
     totalConnectionsCount = routerConfig.routerScalingUnitMaxConnectionsPerPortPlainText;
     assertCounts(totalConnectionsCount, availableCount);
 
-    Port port2 = new Port(200, PortType.SSL);
     done = false;
     do {
-      String connId = connectionTracker.checkOutConnection("host2", port2);
-      if (connId == null && connectionTracker.mayCreateNewConnection("host2", port2)) {
-        connId = mockNewConnection("host2", port2);
-        connectionTracker.startTrackingInitiatedConnection("host2", port2, connId);
+      String connId = connectionTracker.checkOutConnection("host2", sslPort, dataNodeId2);
+      if (connId == null && connectionTracker.mayCreateNewConnection("host2", sslPort, dataNodeId2)) {
+        connId = connectionTracker.connectAndTrack(this::mockNewConnection, "host2", sslPort, dataNodeId1);
       } else {
         done = true;
       }
@@ -114,7 +119,7 @@ public class ConnectionTrackerTest {
     }
     assertCounts(totalConnectionsCount, availableCount);
 
-    String conn = connectionTracker.checkOutConnection("host2", port2);
+    String conn = connectionTracker.checkOutConnection("host2", sslPort, dataNodeId2);
     Assert.assertNotNull(conn);
     availableCount--;
     assertCounts(totalConnectionsCount, availableCount);
@@ -128,7 +133,7 @@ public class ConnectionTrackerTest {
     String checkedInConn = conn;
     Set<String> connIdSet = new HashSet<String>();
     for (int i = 0; i < routerConfig.routerScalingUnitMaxConnectionsPerPortSsl; i++) {
-      conn = connectionTracker.checkOutConnection("host2", port2);
+      conn = connectionTracker.checkOutConnection("host2", sslPort, dataNodeId2);
       Assert.assertNotNull(conn);
       connIdSet.add(conn);
       availableCount--;
@@ -139,7 +144,7 @@ public class ConnectionTrackerTest {
     Assert.assertTrue(connIdSet.contains(checkedInConn));
 
     // Now that the pool has been exhausted, checkOutConnection should return null.
-    Assert.assertNull(connectionTracker.checkOutConnection("host2", port2));
+    Assert.assertNull(connectionTracker.checkOutConnection("host2", sslPort, dataNodeId2));
     //And it should not have initiated a new connection.
     assertCounts(totalConnectionsCount, availableCount);
 
@@ -157,10 +162,10 @@ public class ConnectionTrackerTest {
     }
 
     // test connection removal.
-    String conn11 = connectionTracker.checkOutConnection("host1", port1);
+    String conn11 = connectionTracker.checkOutConnection("host1", plainTextPort, dataNodeId1);
     Assert.assertNotNull(conn11);
     availableCount--;
-    String conn12 = connectionTracker.checkOutConnection("host1", port1);
+    String conn12 = connectionTracker.checkOutConnection("host1", plainTextPort, dataNodeId1);
     Assert.assertNotNull(conn12);
     availableCount--;
     connectionTracker.checkInConnection(conn11);
@@ -181,20 +186,108 @@ public class ConnectionTrackerTest {
     }
     assertCounts(totalConnectionsCount, availableCount);
 
-    Assert.assertNotNull(connectionTracker.checkOutConnection("host1", port1));
+    Assert.assertNotNull(connectionTracker.checkOutConnection("host1", plainTextPort, dataNodeId1));
     availableCount--;
     for (int i = 0; i < 2; i++) {
       Assert.assertNull("There should not be any available connections to check out",
-          connectionTracker.checkOutConnection("host1", port1));
+          connectionTracker.checkOutConnection("host1", plainTextPort, dataNodeId1));
       Assert.assertTrue("It should be okay to initiate a new connection",
-          connectionTracker.mayCreateNewConnection("host1", port1));
-      connectionTracker.startTrackingInitiatedConnection("host1", port1, mockNewConnection("host1", port1));
+          connectionTracker.mayCreateNewConnection("host1", plainTextPort, dataNodeId1));
+      connectionTracker.connectAndTrack(this::mockNewConnection, "host1", plainTextPort, dataNodeId1);
       totalConnectionsCount++;
     }
     Assert.assertNull("There should not be any available connections to check out",
-        connectionTracker.checkOutConnection("host1", port1));
+        connectionTracker.checkOutConnection("host1", plainTextPort, dataNodeId1));
     Assert.assertFalse("It should not be okay to initiate a new connection",
-        connectionTracker.mayCreateNewConnection("host1", port1));
+        connectionTracker.mayCreateNewConnection("host1", plainTextPort, dataNodeId1));
+    assertCounts(totalConnectionsCount, availableCount);
+  }
+
+  /**
+   * Test behavior of {@link ConnectionTracker#setMinimumActiveConnectionsPercentage} and
+   * {@link ConnectionTracker#replenishConnections}.
+   * @throws IOException
+   */
+  @Test
+  public void testReplenishConnections() {
+    connectionTracker = new ConnectionTracker(routerConfig.routerScalingUnitMaxConnectionsPerPortPlainText,
+        routerConfig.routerScalingUnitMaxConnectionsPerPortSsl);
+    // When no connections were ever made to a host:port, connectionTracker should return null, but
+    // initiate connections.
+    int minActiveConnectionsCount = 0;
+    int totalConnectionsCount = 0;
+    int availableCount = 0;
+
+    MockDataNodeId dataNodeId1 =
+        new MockDataNodeId("host1", Collections.singletonList(plainTextPort), Collections.emptyList(), "DC1");
+    MockDataNodeId dataNodeId2 =
+        new MockDataNodeId("host2", Arrays.asList(plainTextPort, sslPort), Collections.emptyList(), "DC1");
+    dataNodeId2.setSslEnabledDataCenters(Collections.singletonList("DC1"));
+    connectionTracker.setMinimumActiveConnectionsPercentage(dataNodeId1, 50);
+    minActiveConnectionsCount += 50 * routerConfig.routerScalingUnitMaxConnectionsPerPortPlainText / 100;
+    connectionTracker.setMinimumActiveConnectionsPercentage(dataNodeId2, 200);
+    minActiveConnectionsCount += routerConfig.routerScalingUnitMaxConnectionsPerPortSsl;
+
+    // call replenishConnections to warm up connections
+    assertCounts(totalConnectionsCount, availableCount);
+    connectionTracker.replenishConnections(this::mockNewConnection, Integer.MAX_VALUE);
+    totalConnectionsCount += minActiveConnectionsCount;
+    assertCounts(totalConnectionsCount, availableCount);
+    List<String> newConnections = getNewlyEstablishedConnections();
+    newConnections.forEach(connectionTracker::checkInConnection);
+    availableCount += minActiveConnectionsCount;
+    assertCounts(totalConnectionsCount, availableCount);
+    Assert.assertTrue(connectionTracker.mayCreateNewConnection("host1", plainTextPort, dataNodeId1));
+    Assert.assertFalse(connectionTracker.mayCreateNewConnection("host2", sslPort, dataNodeId2));
+
+    // remove 2 connections
+    newConnections.stream().limit(2).forEach(connectionTracker::removeConnection);
+    totalConnectionsCount -= 2;
+    availableCount -= 2;
+    assertCounts(totalConnectionsCount, availableCount);
+
+    // replenish connections again
+    connectionTracker.replenishConnections(this::mockNewConnection, Integer.MAX_VALUE);
+    totalConnectionsCount += 2;
+    assertCounts(totalConnectionsCount, availableCount);
+    newConnections = getNewlyEstablishedConnections();
+    newConnections.forEach(connectionTracker::checkInConnection);
+    availableCount += 2;
+    assertCounts(totalConnectionsCount, availableCount);
+
+    // check out connections
+    String conn1 = connectionTracker.checkOutConnection("host1", plainTextPort, dataNodeId1);
+    Assert.assertNotNull(conn1);
+    String conn2 = connectionTracker.checkOutConnection("host2", sslPort, dataNodeId2);
+    Assert.assertNotNull(conn2);
+    availableCount -= 2;
+    assertCounts(totalConnectionsCount, availableCount);
+
+    // destroy one and return the other and then replenish
+    connectionTracker.removeConnection(conn1);
+    connectionTracker.checkInConnection(conn2);
+    totalConnectionsCount -= 1;
+    availableCount += 1;
+    assertCounts(totalConnectionsCount, availableCount);
+    connectionTracker.replenishConnections(this::mockNewConnection, Integer.MAX_VALUE);
+    totalConnectionsCount += 1;
+    assertCounts(totalConnectionsCount, availableCount);
+
+    // check out and destroy all host2 connections
+    String connId;
+    while ((connId = connectionTracker.checkOutConnection("host2", sslPort, dataNodeId2)) != null) {
+      connectionTracker.removeConnection(connId);
+    }
+    totalConnectionsCount -= 2;
+    availableCount -= 2;
+    assertCounts(totalConnectionsCount, availableCount);
+
+    // Replenish connection with rate limit of 1 connection per host per call.
+    connectionTracker.replenishConnections(this::mockNewConnection, 1);
+    totalConnectionsCount += 1;
+    assertCounts(totalConnectionsCount, availableCount);
+    connectionTracker.replenishConnections(this::mockNewConnection, 1);
+    totalConnectionsCount += 1;
     assertCounts(totalConnectionsCount, availableCount);
   }
 
@@ -213,7 +306,7 @@ public class ConnectionTrackerTest {
    */
   private String mockNewConnection(String host, Port port) {
     // mocks selector connect.
-    String connId = host + Integer.toString(port.getPort()) + connStringIndex++;
+    String connId = host + port.getPort() + connStringIndex++;
     connIds.add(connId);
     return connId;
   }
@@ -224,7 +317,7 @@ public class ConnectionTrackerTest {
    */
   private List<String> getNewlyEstablishedConnections() {
     ArrayList<String> toReturnList = connIds;
-    connIds = new ArrayList<String>();
+    connIds = new ArrayList<>();
     return toReturnList;
   }
 }

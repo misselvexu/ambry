@@ -18,9 +18,13 @@ import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.clustermap.ClusterAgentsFactory;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.ClusterParticipant;
+import com.github.ambry.clustermap.ClusterSpectator;
+import com.github.ambry.clustermap.ClusterSpectatorFactory;
 import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.clustermap.ReplicaStatusDelegate;
 import com.github.ambry.commons.LoggingNotificationSystem;
+import com.github.ambry.commons.ServerMetrics;
+import com.github.ambry.config.CloudConfig;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.ConnectionPoolConfig;
 import com.github.ambry.config.DiskManagerConfig;
@@ -40,8 +44,11 @@ import com.github.ambry.network.Port;
 import com.github.ambry.network.PortType;
 import com.github.ambry.network.SocketServer;
 import com.github.ambry.notification.NotificationSystem;
+import com.github.ambry.protocol.AmbryRequests;
+import com.github.ambry.protocol.RequestHandlerPool;
+import com.github.ambry.replication.CloudToStoreReplicationManager;
+import com.github.ambry.replication.FindTokenHelper;
 import com.github.ambry.replication.ReplicationManager;
-import com.github.ambry.store.FindTokenFactory;
 import com.github.ambry.store.StorageManager;
 import com.github.ambry.store.StoreKeyConverterFactory;
 import com.github.ambry.store.StoreKeyFactory;
@@ -75,11 +82,14 @@ public class AmbryServer {
   private StorageManager storageManager = null;
   private StatsManager statsManager = null;
   private ReplicationManager replicationManager = null;
+  private CloudToStoreReplicationManager cloudToStoreReplicationManager = null;
   private Logger logger = LoggerFactory.getLogger(getClass());
   private final VerifiableProperties properties;
   private final ClusterAgentsFactory clusterAgentsFactory;
+  private final ClusterSpectatorFactory clusterSpectatorFactory;
   private ClusterMap clusterMap;
   private ClusterParticipant clusterParticipant;
+  private ClusterSpectator vcrClusterSpectator;
   private MetricRegistry registry = null;
   private JmxReporter reporter = null;
   private ConnectionPool connectionPool = null;
@@ -87,15 +97,21 @@ public class AmbryServer {
   private ServerMetrics metrics = null;
   private Time time;
 
-  public AmbryServer(VerifiableProperties properties, ClusterAgentsFactory clusterAgentsFactory, Time time)
-      throws IOException {
-    this(properties, clusterAgentsFactory, new LoggingNotificationSystem(), time);
+  public AmbryServer(VerifiableProperties properties, ClusterAgentsFactory clusterAgentsFactory,
+      ClusterSpectatorFactory clusterSpectatorFactory, Time time) {
+    this(properties, clusterAgentsFactory, clusterSpectatorFactory, new LoggingNotificationSystem(), time);
   }
 
   public AmbryServer(VerifiableProperties properties, ClusterAgentsFactory clusterAgentsFactory,
       NotificationSystem notificationSystem, Time time) {
+    this(properties, clusterAgentsFactory, null, notificationSystem, time);
+  }
+
+  public AmbryServer(VerifiableProperties properties, ClusterAgentsFactory clusterAgentsFactory,
+      ClusterSpectatorFactory clusterSpectatorFactory, NotificationSystem notificationSystem, Time time) {
     this.properties = properties;
     this.clusterAgentsFactory = clusterAgentsFactory;
+    this.clusterSpectatorFactory = clusterSpectatorFactory;
     this.notificationSystem = notificationSystem;
     this.time = time;
   }
@@ -109,7 +125,7 @@ public class AmbryServer {
       logger.info("Setting up JMX.");
       long startTime = SystemTime.getInstance().milliseconds();
       registry = clusterMap.getMetricRegistry();
-      this.metrics = new ServerMetrics(registry);
+      this.metrics = new ServerMetrics(registry, AmbryRequests.class, AmbryServer.class);
       reporter = JmxReporter.forRegistry(registry).build();
       reporter.start();
 
@@ -123,6 +139,7 @@ public class AmbryServer {
       SSLConfig sslConfig = new SSLConfig(properties);
       ClusterMapConfig clusterMapConfig = new ClusterMapConfig(properties);
       StatsManagerConfig statsConfig = new StatsManagerConfig(properties);
+      CloudConfig cloudConfig = new CloudConfig(properties);
       // verify the configs
       properties.verify();
 
@@ -135,7 +152,6 @@ public class AmbryServer {
       }
 
       StoreKeyFactory storeKeyFactory = Utils.getObj(storeConfig.storeKeyFactory, clusterMap);
-      FindTokenFactory findTokenFactory = Utils.getObj(replicationConfig.replicationTokenFactory, storeKeyFactory);
       storageManager =
           new StorageManager(storeConfig, diskManagerConfig, scheduler, registry, clusterMap.getReplicaIds(nodeId),
               storeKeyFactory, new BlobStoreRecovery(), new BlobStoreHardDelete(),
@@ -154,26 +170,37 @@ public class AmbryServer {
               serverConfig.serverMessageTransformer);
       replicationManager.start();
 
-      ArrayList<Port> ports = new ArrayList<Port>();
-      ports.add(new Port(networkConfig.port, PortType.PLAINTEXT));
-      if (nodeId.hasSSLPort()) {
-        ports.add(new Port(nodeId.getSSLPort(), PortType.SSL));
+      if (replicationConfig.replicationEnabledWithVcrCluster) {
+        logger.info("Creating Helix cluster spectator for cloud to store replication.");
+        vcrClusterSpectator = clusterSpectatorFactory.getClusterSpectator(cloudConfig, clusterMapConfig);
+        cloudToStoreReplicationManager =
+            new CloudToStoreReplicationManager(replicationConfig, clusterMapConfig, storeConfig, storageManager,
+                storeKeyFactory, clusterMap, scheduler, nodeId, connectionPool, registry, notificationSystem,
+                storeKeyConverterFactory, serverConfig.serverMessageTransformer, vcrClusterSpectator,
+                clusterParticipant);
+        cloudToStoreReplicationManager.start();
       }
-
-      networkServer = new SocketServer(networkConfig, sslConfig, registry, ports);
-      requests =
-          new AmbryRequests(storageManager, networkServer.getRequestResponseChannel(), clusterMap, nodeId, registry,
-              findTokenFactory, notificationSystem, replicationManager, storeKeyFactory,
-              serverConfig.serverEnableStoreDataPrefetch, storeKeyConverterFactory);
-      requestHandlerPool = new RequestHandlerPool(serverConfig.serverRequestHandlerNumOfThreads,
-          networkServer.getRequestResponseChannel(), requests);
-      networkServer.start();
 
       logger.info("Creating StatsManager to publish stats");
       statsManager = new StatsManager(storageManager, clusterMap.getReplicaIds(nodeId), registry, statsConfig, time);
       if (serverConfig.serverStatsPublishLocalEnabled) {
         statsManager.start();
       }
+
+      ArrayList<Port> ports = new ArrayList<Port>();
+      ports.add(new Port(networkConfig.port, PortType.PLAINTEXT));
+      if (nodeId.hasSSLPort()) {
+        ports.add(new Port(nodeId.getSSLPort(), PortType.SSL));
+      }
+      networkServer = new SocketServer(networkConfig, sslConfig, registry, ports);
+      FindTokenHelper findTokenHelper = new FindTokenHelper(storeKeyFactory, replicationConfig);
+      ServerMetrics serverMetrics = new ServerMetrics(registry, AmbryRequests.class, AmbryServer.class);
+      requests = new AmbryServerRequests(storageManager, networkServer.getRequestResponseChannel(), clusterMap, nodeId,
+          registry, serverMetrics, findTokenHelper, notificationSystem, replicationManager, storeKeyFactory,
+          serverConfig.serverEnableStoreDataPrefetch, storeKeyConverterFactory, statsManager);
+      requestHandlerPool = new RequestHandlerPool(serverConfig.serverRequestHandlerNumOfThreads,
+          networkServer.getRequestResponseChannel(), requests);
+      networkServer.start();
 
       List<AmbryHealthReport> ambryHealthReports = new ArrayList<>();
       Set<String> validStatsTypes = new HashSet<>();
@@ -190,6 +217,9 @@ public class AmbryServer {
         });
       }
 
+      if (vcrClusterSpectator != null) {
+        vcrClusterSpectator.spectate();
+      }
       clusterParticipant.participate(ambryHealthReports);
 
       logger.info("started");
@@ -224,6 +254,9 @@ public class AmbryServer {
       }
       if (requestHandlerPool != null) {
         requestHandlerPool.shutdown();
+      }
+      if (cloudToStoreReplicationManager != null) {
+        cloudToStoreReplicationManager.shutdown();
       }
       if (replicationManager != null) {
         replicationManager.shutdown();

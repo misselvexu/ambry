@@ -123,6 +123,7 @@ public class FrontendIntegrationTest {
       new InMemAccountServiceFactory(false, true).getAccountService();
   private static final String DATA_CENTER_NAME = "Datacenter-Name";
   private static final String HOST_NAME = "localhost";
+  private static final String CLUSTER_NAME = "Cluster-name";
 
   static {
     try {
@@ -144,6 +145,7 @@ public class FrontendIntegrationTest {
   private static NettyClient sslNettyClient = null;
 
   private final NettyClient nettyClient;
+  private final boolean addClusterPrefix;
 
   /**
    * Running it many times so that keep-alive bugs are caught.
@@ -154,8 +156,10 @@ public class FrontendIntegrationTest {
   public static List<Object[]> data() {
     List<Object[]> parameters = new ArrayList<>();
     for (int i = 0; i < 5; i++) {
-      parameters.add(new Object[]{false});
-      parameters.add(new Object[]{true});
+      parameters.add(new Object[]{false, true});
+      parameters.add(new Object[]{true, true});
+      parameters.add(new Object[]{false, false});
+      parameters.add(new Object[]{true, false});
     }
     return parameters;
   }
@@ -193,8 +197,9 @@ public class FrontendIntegrationTest {
   /**
    * @param useSSL {@code true} if SSL should be tested.
    */
-  public FrontendIntegrationTest(boolean useSSL) {
+  public FrontendIntegrationTest(boolean useSSL, boolean addClusterPrefix) {
     nettyClient = useSSL ? sslNettyClient : plaintextNettyClient;
+    this.addClusterPrefix = addClusterPrefix;
   }
 
   /**
@@ -379,7 +384,7 @@ public class FrontendIntegrationTest {
     URI uri = new URI(signedPostUrl);
     httpRequest = buildRequest(HttpMethod.POST, uri.getPath() + "?" + uri.getQuery(), null, content);
     responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
-    String blobId = verifyPostAndReturnBlobId(responseParts);
+    String blobId = verifyPostAndReturnBlobId(responseParts, content.capacity());
 
     // verify POST
     headers.add(RestUtils.Headers.BLOB_SIZE, content.capacity());
@@ -392,8 +397,7 @@ public class FrontendIntegrationTest {
     // Get signed URL
     HttpHeaders getHeaders = new DefaultHttpHeaders();
     getHeaders.add(RestUtils.Headers.URL_TYPE, RestMethod.GET.name());
-    blobId = blobId.startsWith("/") ? blobId.substring(1) : blobId;
-    getHeaders.add(RestUtils.Headers.BLOB_ID, blobId);
+    getHeaders.add(RestUtils.Headers.BLOB_ID, addClusterPrefix ? "/" + CLUSTER_NAME + blobId : blobId);
     httpRequest = buildRequest(HttpMethod.GET, Operations.GET_SIGNED_URL, getHeaders, null);
     responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
     response = getHttpResponse(responseParts);
@@ -422,9 +426,9 @@ public class FrontendIntegrationTest {
     Account account = ACCOUNT_SERVICE.createAndAddRandomAccount();
     Container container = account.getContainerById(Container.DEFAULT_PRIVATE_CONTAINER_ID);
     Pair<List<String>, byte[]> idsAndContent = uploadDataChunksAndVerify(account, container, 50, 50, 50, 50, 17);
-    stitchBlobAndVerify(account, container, idsAndContent.getFirst(), idsAndContent.getSecond());
+    stitchBlobAndVerify(account, container, idsAndContent.getFirst(), idsAndContent.getSecond(), 217);
     idsAndContent = uploadDataChunksAndVerify(account, container, 167);
-    stitchBlobAndVerify(account, container, idsAndContent.getFirst(), idsAndContent.getSecond());
+    stitchBlobAndVerify(account, container, idsAndContent.getFirst(), idsAndContent.getSecond(), 167);
   }
 
   /**
@@ -561,7 +565,7 @@ public class FrontendIntegrationTest {
     TestSSLUtils.addSSLProperties(properties, "", SSLFactory.Mode.SERVER, trustStoreFile, "frontend");
     // add key for singleKeyManagementService
     properties.put("kms.default.container.key", TestUtils.getRandomKey(32));
-    properties.setProperty("clustermap.cluster.name", "Cluster-Name");
+    properties.setProperty("clustermap.cluster.name", CLUSTER_NAME);
     properties.setProperty("clustermap.datacenter.name", DATA_CENTER_NAME);
     properties.setProperty("clustermap.host.name", HOST_NAME);
     return new VerifiableProperties(properties);
@@ -600,7 +604,7 @@ public class FrontendIntegrationTest {
     } else {
       headers.add(RestUtils.Headers.USER_META_DATA_HEADER_PREFIX + "key1", "value1");
       headers.add(RestUtils.Headers.USER_META_DATA_HEADER_PREFIX + "key2", "value2");
-      blobId = postBlobAndVerify(headers, content);
+      blobId = postBlobAndVerify(headers, content, contentSize);
     }
     headers.add(RestUtils.Headers.BLOB_SIZE, content.capacity());
     getBlobAndVerify(blobId, null, null, headers, isPrivate, content, expectedAccountName, expectedContainerName);
@@ -680,11 +684,11 @@ public class FrontendIntegrationTest {
    * @throws ExecutionException
    * @throws InterruptedException
    */
-  private String postBlobAndVerify(HttpHeaders headers, ByteBuffer content)
+  private String postBlobAndVerify(HttpHeaders headers, ByteBuffer content, long contentSize)
       throws ExecutionException, InterruptedException {
     FullHttpRequest httpRequest = buildRequest(HttpMethod.POST, "/", headers, content);
     ResponseParts responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
-    return verifyPostAndReturnBlobId(responseParts);
+    return verifyPostAndReturnBlobId(responseParts, contentSize);
   }
 
   /**
@@ -692,7 +696,7 @@ public class FrontendIntegrationTest {
    * @param responseParts the response received from the server.
    * @returnn the blob ID of the blob.
    */
-  private String verifyPostAndReturnBlobId(ResponseParts responseParts) {
+  private String verifyPostAndReturnBlobId(ResponseParts responseParts, long contentSize) {
     HttpResponse response = getHttpResponse(responseParts);
     assertEquals("Unexpected response status", HttpResponseStatus.CREATED, response.status());
     assertTrue("No Date header", response.headers().getTimeMillis(HttpHeaderNames.DATE, -1) != -1);
@@ -703,6 +707,8 @@ public class FrontendIntegrationTest {
     assertNotNull("Blob ID from POST should not be null", blobId);
     assertNoContent(responseParts.queue, 1);
     assertTrue("Channel should be active", HttpUtil.isKeepAlive(response));
+    assertEquals("Correct blob size should be returned in response", Long.toString(contentSize),
+        response.headers().get(RestUtils.Headers.BLOB_SIZE));
     verifyTrackingHeaders(response);
     return blobId;
   }
@@ -1024,7 +1030,7 @@ public class FrontendIntegrationTest {
   private void updateBlobTtlAndVerify(String blobId, HttpHeaders getExpectedHeaders, boolean isPrivate,
       String accountName, String containerName, byte[] usermetadata) throws ExecutionException, InterruptedException {
     HttpHeaders headers = new DefaultHttpHeaders();
-    headers.set(RestUtils.Headers.BLOB_ID, blobId);
+    headers.set(RestUtils.Headers.BLOB_ID, addClusterPrefix ? "/" + CLUSTER_NAME + blobId : blobId);
     headers.set(RestUtils.Headers.SERVICE_ID, "updateBlobTtlAndVerify");
     FullHttpRequest httpRequest = buildRequest(HttpMethod.PUT, "/" + Operations.UPDATE_TTL, headers, null);
     ResponseParts responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
@@ -1162,7 +1168,7 @@ public class FrontendIntegrationTest {
     HttpRequest httpRequest = RestTestUtils.createRequest(HttpMethod.POST, "/", headers);
     HttpPostRequestEncoder encoder = createEncoder(httpRequest, content, usermetadata);
     ResponseParts responseParts = nettyClient.sendRequest(encoder.finalizeRequest(), encoder, null).get();
-    return verifyPostAndReturnBlobId(responseParts);
+    return verifyPostAndReturnBlobId(responseParts, content.capacity());
   }
 
   /**
@@ -1255,7 +1261,7 @@ public class FrontendIntegrationTest {
       // Use signed URL to POST
       httpRequest = buildRequest(HttpMethod.POST, uri.getPath() + "?" + uri.getQuery(), null, content);
       responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
-      String signedId = verifyPostAndReturnBlobId(responseParts);
+      String signedId = verifyPostAndReturnBlobId(responseParts, chunkSize);
       assertTrue("Blob ID for chunk upload must be signed", idSigningService.isIdSigned(signedId.substring(1)));
       Pair<String, Map<String, String>> idAndMetadata = idSigningService.parseSignedId(signedId.substring(1));
       // Inspect metadata fields
@@ -1275,7 +1281,7 @@ public class FrontendIntegrationTest {
         getBlobInfoAndVerify(id, GetOption.None, expectedGetHeaders, !container.isCacheable(), account.getName(),
             container.getName(), null);
       }
-      signedChunkIds.add(signedId);
+      signedChunkIds.add(addClusterPrefix ? "/" + CLUSTER_NAME + signedId : signedId);
       fullContentStream.write(contentArray);
     }
     return new Pair<>(signedChunkIds, fullContentStream.toByteArray());
@@ -1290,7 +1296,7 @@ public class FrontendIntegrationTest {
    * @throws Exception
    */
   private void stitchBlobAndVerify(Account account, Container container, List<String> signedChunkIds,
-      byte[] fullContentArray) throws Exception {
+      byte[] fullContentArray, long stitchedBlobSize) throws Exception {
     // stitchBlob
     HttpHeaders stitchHeaders = new DefaultHttpHeaders();
     setAmbryHeadersForPut(stitchHeaders, TTL_SECS, !container.isCacheable(), "stitcher", "video/mp4",
@@ -1298,7 +1304,7 @@ public class FrontendIntegrationTest {
     HttpRequest httpRequest = buildRequest(HttpMethod.POST, Operations.STITCH, stitchHeaders,
         ByteBuffer.wrap(StitchRequestSerDe.toJson(signedChunkIds).toString().getBytes(StandardCharsets.UTF_8)));
     ResponseParts responseParts = nettyClient.sendRequest(httpRequest, null, null).get();
-    String stitchedBlobId = verifyPostAndReturnBlobId(responseParts);
+    String stitchedBlobId = verifyPostAndReturnBlobId(responseParts, stitchedBlobSize);
     HttpHeaders expectedGetHeaders = new DefaultHttpHeaders().add(stitchHeaders);
     // Test different request types on stitched blob ID
     // (getBlobInfo, getBlob, getBlob w/ range, head, updateBlobTtl, deleteBlob)

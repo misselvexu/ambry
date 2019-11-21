@@ -23,11 +23,13 @@ import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobInfo;
 import com.github.ambry.messageformat.BlobProperties;
+import com.github.ambry.messageformat.MessageFormatRecord;
 import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -55,11 +57,11 @@ public class GetManagerTest {
   private final AtomicReference<MockSelectorState> mockSelectorState = new AtomicReference<MockSelectorState>();
   private NonBlockingRouter router;
   private final boolean testEncryption;
+  private final int metadataContentVersion;
   private KeyManagementService kms = null;
   private CryptoService cryptoService = null;
   private CryptoJobHandler cryptoJobHandler = null;
   private RouterConfig routerConfig;
-  private int chunkSize;
   private int requestParallelism;
   private int successTarget;
   // Request params;
@@ -69,39 +71,39 @@ public class GetManagerTest {
   private byte[] putContent;
   private ReadableStreamChannel putChannel;
   private GetBlobOptions options = new GetBlobOptionsBuilder().build();
+  private List<ChunkInfo> chunkInfos;
+  private static final int CHUNK_SIZE = new Random().nextInt(1024 * 1024) + 1;
+  private static final int LARGE_BLOB_SIZE = CHUNK_SIZE * 6 + 11;
   private static final int MAX_PORTS_PLAIN_TEXT = 3;
   private static final int MAX_PORTS_SSL = 3;
   private static final int CHECKOUT_TIMEOUT_MS = 1000;
+  private static final int NUM_STITCHED_CHUNKS = 10;
 
   /**
-   * Running for both regular and encrypted blobs
-   * @return an array with both {@code false} and {@code true}.
+   * Running for both regular and encrypted blobs, and versions 2 and 3 of MetadataContent
+   * @return an array with all four different choices
    */
   @Parameterized.Parameters
   public static List<Object[]> data() {
-    return Arrays.asList(new Object[][]{{false}, {true}});
+    return Arrays.asList(new Object[][]{{false, MessageFormatRecord.Metadata_Content_Version_V2},
+        {false, MessageFormatRecord.Metadata_Content_Version_V3},
+        {true, MessageFormatRecord.Metadata_Content_Version_V2},
+        {true, MessageFormatRecord.Metadata_Content_Version_V3}});
   }
 
   /**
    * Pre-initialization common to all tests.
    * @param testEncryption {@code true} if blobs need to be tested w/ encryption. {@code false} otherwise
    */
-  public GetManagerTest(boolean testEncryption) throws Exception {
+  public GetManagerTest(boolean testEncryption, int metadataContentVersion) throws Exception {
     this.testEncryption = testEncryption;
-    // random chunkSize in the range [1, 1 MB]
-    chunkSize = random.nextInt(1024 * 1024) + 1;
+    this.metadataContentVersion = metadataContentVersion;
     requestParallelism = 3;
     successTarget = 2;
     mockSelectorState.set(MockSelectorState.Good);
     mockClusterMap = new MockClusterMap();
     mockServerLayout = new MockServerLayout(mockClusterMap);
-    if (testEncryption) {
-      VerifiableProperties vProps = new VerifiableProperties(new Properties());
-      kms = new SingleKeyManagementService(new KMSConfig(vProps),
-          TestUtils.getRandomKey(SingleKeyManagementServiceTest.DEFAULT_KEY_SIZE_CHARS));
-      cryptoService = new GCMCryptoService(new CryptoServiceConfig(vProps));
-      cryptoJobHandler = new CryptoJobHandler(CryptoJobHandlerTest.DEFAULT_THREAD_COUNT);
-    }
+    resetEncryptionObjects();
   }
 
   /**
@@ -124,7 +126,7 @@ public class GetManagerTest {
    */
   @Test
   public void testSimpleBlobGetSuccess() throws Exception {
-    testGetSuccess(chunkSize, new GetBlobOptionsBuilder().build());
+    testGetSuccess(CHUNK_SIZE, new GetBlobOptionsBuilder().build());
   }
 
   /**
@@ -133,7 +135,38 @@ public class GetManagerTest {
    */
   @Test
   public void testCompositeBlobGetSuccess() throws Exception {
-    testGetSuccess(chunkSize * 6 + 11, new GetBlobOptionsBuilder().build());
+    testGetSuccess(LARGE_BLOB_SIZE, new GetBlobOptionsBuilder().build());
+  }
+
+  /**
+   * Tests getBlobInfo() and getBlob() of stitched composite blobs
+   * @throws Exception
+   */
+  @Test
+  public void testCompositeBlobGetSuccessStitchDifferentSizedBlobs() throws Exception {
+    if (metadataContentVersion > MessageFormatRecord.Metadata_Content_Version_V2) {
+      testGetSuccessStitch(LARGE_BLOB_SIZE, new GetBlobOptionsBuilder().build());
+    } else {
+      router = getNonBlockingRouter();
+      router.close();
+    }
+  }
+
+  /**
+   * Tests getBlob() for segments of stitched composite blobs
+   * @throws Exception
+   */
+  @Test
+  public void testCompositeBlobGetSuccessStitchDifferentSizedBlobsSegments() throws Exception {
+    if (metadataContentVersion > MessageFormatRecord.Metadata_Content_Version_V2) {
+      //Test grabbing every segment
+      for (int i = 0; i < NUM_STITCHED_CHUNKS; i++) {
+        testGetSuccessStitch(LARGE_BLOB_SIZE, new GetBlobOptionsBuilder().blobSegment(i).build());
+      }
+    } else {
+      router = getNonBlockingRouter();
+      router.close();
+    }
   }
 
   /**
@@ -142,9 +175,52 @@ public class GetManagerTest {
    */
   @Test
   public void testRangeRequest() throws Exception {
-    testGetSuccess(chunkSize * 6 + 11, new GetBlobOptionsBuilder().operationType(GetBlobOptions.OperationType.Data)
-        .range(ByteRanges.fromOffsetRange(chunkSize * 2 + 3, chunkSize * 5 + 4))
+    testGetSuccess(LARGE_BLOB_SIZE, new GetBlobOptionsBuilder().operationType(GetBlobOptions.OperationType.Data)
+        .range(ByteRanges.fromOffsetRange(CHUNK_SIZE * 2 + 3, CHUNK_SIZE * 5 + 4))
         .build());
+  }
+
+  /**
+   * Tests the router range request interface on stitched blobs.
+   * @throws Exception
+   */
+  @Test
+  public void testRangeRequestStitchDifferentSizedBlobs() throws Exception {
+    if (metadataContentVersion > 2) {
+      testGetSuccessStitch(LARGE_BLOB_SIZE, new GetBlobOptionsBuilder().operationType(GetBlobOptions.OperationType.Data)
+          .range(ByteRanges.fromOffsetRange(CHUNK_SIZE * 2 + 3, CHUNK_SIZE * 5 + 4))
+          .build());
+    } else {
+      router = getNonBlockingRouter();
+      router.close();
+    }
+  }
+
+  /**
+   * Tests the router range request interface on stitched blob segments.
+   * @throws Exception
+   */
+  @Test
+  public void testRangeRequestStitchDifferentSizedBlobsSegments() throws Exception {
+    if (metadataContentVersion > MessageFormatRecord.Metadata_Content_Version_V2) {
+      //Test grabbing every segment with various offset ranges
+      for (int i = 0; i < NUM_STITCHED_CHUNKS; i++) {
+        testGetSuccessStitch(LARGE_BLOB_SIZE, new GetBlobOptionsBuilder().blobSegment(i)
+            .range(ByteRanges.fromOffsetRange(0, CHUNK_SIZE / NUM_STITCHED_CHUNKS))
+            .build());
+        testGetSuccessStitch(LARGE_BLOB_SIZE, new GetBlobOptionsBuilder().blobSegment(i)
+            .range(ByteRanges.fromOffsetRange(CHUNK_SIZE / NUM_STITCHED_CHUNKS / 2, CHUNK_SIZE / NUM_STITCHED_CHUNKS))
+            .build());
+        testGetSuccessStitch(LARGE_BLOB_SIZE, new GetBlobOptionsBuilder().blobSegment(i)
+            .range(ByteRanges.fromOffsetRange(5, CHUNK_SIZE / NUM_STITCHED_CHUNKS - 5))
+            .build());
+        testGetSuccessStitch(LARGE_BLOB_SIZE,
+            new GetBlobOptionsBuilder().blobSegment(i).range(ByteRanges.fromOffsetRange(0, 0)).build());
+      }
+    } else {
+      router = getNonBlockingRouter();
+      router.close();
+    }
   }
 
   /**
@@ -157,6 +233,39 @@ public class GetManagerTest {
     setOperationParams(blobSize, options);
     String blobId =
         router.putBlob(putBlobProperties, putUserMetadata, putChannel, new PutBlobOptionsBuilder().build()).get();
+    getBlobAndCompareContent(blobId);
+    // Test GetBlobInfoOperation, regardless of options passed in.
+    this.options = new GetBlobOptionsBuilder().operationType(GetBlobOptions.OperationType.BlobInfo).build();
+    getBlobAndCompareContent(blobId);
+    router.close();
+  }
+
+  /**
+   * Test a get request on a stitched blob.
+   * @param blobSize the size of the blob to put/get.
+   * @param options the {@link GetBlobOptions} for the get request.
+   */
+  private void testGetSuccessStitch(int blobSize, GetBlobOptions options) throws Exception {
+    router = getNonBlockingRouter();
+    ByteBuffer byteBuffer = ByteBuffer.allocate(blobSize);
+    //Divide blob into NUM_STITCHED_CHUNKS chunks to be stitched
+    int chunkSize = blobSize / NUM_STITCHED_CHUNKS;
+    List<String> stitchBlobsIds = new ArrayList<>();
+    chunkInfos = new ArrayList<>();
+    int curBlobSize = blobSize;
+    for (int i = 0; i < NUM_STITCHED_CHUNKS; i++) {
+      //Give each chunk a different size
+      int curChunkSize = Math.min(curBlobSize, chunkSize + i * 5);
+      setOperationParams(curChunkSize, options);
+      byteBuffer.put(putContent);
+      curBlobSize -= curChunkSize;
+      stitchBlobsIds.add(
+          router.putBlob(putBlobProperties, putUserMetadata, putChannel, new PutBlobOptionsBuilder().build()).get());
+      chunkInfos.add(new ChunkInfo(stitchBlobsIds.get(i), curChunkSize, -1L));
+    }
+    setOperationParams(blobSize, options);
+    putContent = byteBuffer.array();
+    String blobId = router.stitchBlob(putBlobProperties, putUserMetadata, chunkInfos).get();
     getBlobAndCompareContent(blobId);
     // Test GetBlobInfoOperation, regardless of options passed in.
     this.options = new GetBlobOptionsBuilder().operationType(GetBlobOptions.OperationType.BlobInfo).build();
@@ -225,7 +334,7 @@ public class GetManagerTest {
   private void testBadCallback(Callback<GetBlobResult> getBlobCallback, CountDownLatch getBlobCallbackCalled,
       Boolean checkBadCallbackBlob) throws Exception {
     router = getNonBlockingRouter();
-    setOperationParams(chunkSize * 6 + 11, new GetBlobOptionsBuilder().build());
+    setOperationParams(LARGE_BLOB_SIZE, new GetBlobOptionsBuilder().build());
     final CountDownLatch getBlobInfoCallbackCalled = new CountDownLatch(1);
     String blobId =
         router.putBlob(putBlobProperties, putUserMetadata, putChannel, new PutBlobOptionsBuilder().build()).get();
@@ -265,7 +374,7 @@ public class GetManagerTest {
     Assert.assertTrue("Router should not be closed", router.isOpen());
 
     // Test that GetManager is still operational
-    setOperationParams(chunkSize, new GetBlobOptionsBuilder().build());
+    setOperationParams(CHUNK_SIZE, new GetBlobOptionsBuilder().build());
     blobId = router.putBlob(putBlobProperties, putUserMetadata, putChannel, new PutBlobOptionsBuilder().build()).get();
     getBlobAndCompareContent(blobId);
     this.options = infoOptions;
@@ -281,7 +390,7 @@ public class GetManagerTest {
   @Test
   public void testFailureOnAllPollThatSends() throws Exception {
     router = getNonBlockingRouter();
-    setOperationParams(chunkSize, new GetBlobOptionsBuilder().build());
+    setOperationParams(CHUNK_SIZE, new GetBlobOptionsBuilder().build());
     String blobId =
         router.putBlob(putBlobProperties, putUserMetadata, putChannel, new PutBlobOptionsBuilder().build()).get();
     mockSelectorState.set(MockSelectorState.ThrowExceptionOnSend);
@@ -322,7 +431,7 @@ public class GetManagerTest {
   @Test
   public void testBadBlobId() throws Exception {
     router = getNonBlockingRouter();
-    setOperationParams(chunkSize, new GetBlobOptionsBuilder().build());
+    setOperationParams(CHUNK_SIZE, new GetBlobOptionsBuilder().build());
     String[] badBlobIds = {"", "abc", "123", "invalid_id", "[],/-"};
     for (String blobId : badBlobIds) {
       for (GetBlobOptions.OperationType opType : GetBlobOptions.OperationType.values()) {
@@ -340,6 +449,7 @@ public class GetManagerTest {
    */
   private void getBlobAndCompareContent(String blobId) throws Exception {
     GetBlobResult result = router.getBlob(blobId, options).get();
+
     switch (options.getOperationType()) {
       case All:
         compareBlobInfo(result.getBlobInfo());
@@ -393,26 +503,43 @@ public class GetManagerTest {
    * @param readableStreamChannel the {@link ReadableStreamChannel} that is the candidate for comparison.
    */
   private void compareContent(ReadableStreamChannel readableStreamChannel) throws Exception {
-    RouterTestHelpers.compareContent(putContent, options.getRange(), readableStreamChannel);
+    ByteRange byteRange = options.getRange();
+    if (options.hasBlobSegmentIdx()) {
+      long offset = 0;
+      long size = chunkInfos.get(0).getChunkSizeInBytes();
+      for (int i = 0; i < options.getBlobSegmentIdx(); i++) {
+        size = chunkInfos.get(i + 1).getChunkSizeInBytes();
+        offset += chunkInfos.get(i).getChunkSizeInBytes();
+      }
+      if (options.getRange() == null) {
+        byteRange = ByteRanges.fromOffsetRange(offset, offset + size - 1);
+      } else {
+        byteRange = ByteRanges.fromOffsetRange(options.getRange().getStartOffset() + offset,
+            options.getRange().getEndOffset() + offset);
+      }
+    }
+    RouterTestHelpers.compareContent(putContent, byteRange, readableStreamChannel);
   }
 
   /**
    * @return Return a {@link NonBlockingRouter} created with default {@link VerifiableProperties}
    */
-  private NonBlockingRouter getNonBlockingRouter() throws IOException {
+  private NonBlockingRouter getNonBlockingRouter() throws IOException, GeneralSecurityException {
     Properties properties = new Properties();
     properties.setProperty("router.hostname", "localhost");
     properties.setProperty("router.datacenter.name", "DC1");
-    properties.setProperty("router.max.put.chunk.size.bytes", Integer.toString(chunkSize));
+    properties.setProperty("router.max.put.chunk.size.bytes", Integer.toString(CHUNK_SIZE));
     properties.setProperty("router.put.request.parallelism", Integer.toString(requestParallelism));
     properties.setProperty("router.put.success.target", Integer.toString(successTarget));
+    properties.setProperty("router.metadata.content.version", String.valueOf(metadataContentVersion));
     VerifiableProperties vProps = new VerifiableProperties(properties);
     routerConfig = new RouterConfig(vProps);
-    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(mockClusterMap),
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(mockClusterMap, routerConfig),
         new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, mockServerLayout, mockTime), new LoggingNotificationSystem(), mockClusterMap, kms,
         cryptoService, cryptoJobHandler, new InMemAccountService(false, true), mockTime,
         MockClusterMap.DEFAULT_PARTITION_CLASS);
+    resetEncryptionObjects();
     return router;
   }
 
@@ -431,6 +558,20 @@ public class GetManagerTest {
     random.nextBytes(putContent);
     putChannel = new ByteBufferReadableStreamChannel(ByteBuffer.wrap(putContent));
     this.options = options;
+  }
+
+  /**
+   * Resets objects related to encryption testing
+   * @throws GeneralSecurityException
+   */
+  private void resetEncryptionObjects() throws GeneralSecurityException {
+    if (testEncryption) {
+      VerifiableProperties vProps = new VerifiableProperties(new Properties());
+      kms = new SingleKeyManagementService(new KMSConfig(vProps),
+          TestUtils.getRandomKey(SingleKeyManagementServiceTest.DEFAULT_KEY_SIZE_CHARS));
+      cryptoService = new GCMCryptoService(new CryptoServiceConfig(vProps));
+      cryptoJobHandler = new CryptoJobHandler(CryptoJobHandlerTest.DEFAULT_THREAD_COUNT);
+    }
   }
 }
 

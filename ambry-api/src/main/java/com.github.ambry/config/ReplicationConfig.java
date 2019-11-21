@@ -22,7 +22,14 @@ public class ReplicationConfig {
    */
   @Config("replication.token.factory")
   @Default("com.github.ambry.store.StoreFindTokenFactory")
-  public final String replicationTokenFactory;
+  public final String replicationStoreTokenFactory;
+
+  /**
+   * The factory class the replication uses to create cloud token
+   */
+  @Config("replication.cloud.token.factory")
+  @Default("com.github.ambry.cloud.CloudFindTokenFactory")
+  public final String replicationCloudTokenFactory;
 
   /**
    * The number of replica threads on each server that runs the replication protocol for intra dc replication
@@ -106,10 +113,44 @@ public class ReplicationConfig {
   @Default("true")
   public final boolean replicationIncludeAll;
 
+  /**
+   * If true, replication token will be persisted when shutdown or replica remote.
+   * For CloudBackupManger and ReplicationManager, token is persisted when shutdown if this config is true.
+   * For CloudBackupManger, where replica may be removed, token is also persisted if this config is true.
+   * ReplicationManager doesn't support replica remove now.
+   * This is used for test only as of now.
+   */
+  @Config("replication.persist.token.on.shutdown.or.replica.remove")
+  @Default("true")
+  public final boolean replicationPersistTokenOnShutdownOrReplicaRemove;
+
+  /**
+   * If true, replication will register metric for each partition to track lag between local and remote replicas.
+   */
+  @Config("replication.track.per.partition.lag.from.remote")
+  @Default("false")
+  public final boolean replicationTrackPerPartitionLagFromRemote;
+
+  /**
+   * The version of metadata request to be used for replication.
+   */
+  @Config("replication.metadata.request.version")
+  @Default("1")
+  public final short replicaMetadataRequestVersion;
+
+  /**
+   * If set to true, the Ambry data nodes will also replicate from vcr nodes based on vcr helix cluster map.
+   */
+  @Config("replication.enabled.with.vcr.cluster")
+  @Default("false")
+  public final boolean replicationEnabledWithVcrCluster;
+
   public ReplicationConfig(VerifiableProperties verifiableProperties) {
 
-    replicationTokenFactory =
+    replicationStoreTokenFactory =
         verifiableProperties.getString("replication.token.factory", "com.github.ambry.store.StoreFindTokenFactory");
+    replicationCloudTokenFactory = verifiableProperties.getString("replication.cloud.token.factory",
+        "com.github.ambry.cloud.CloudFindTokenFactory");
     replicationNumOfIntraDCReplicaThreads =
         verifiableProperties.getInt("replication.no.of.intra.dc.replica.threads", 1);
     replicationNumOfInterDCReplicaThreads =
@@ -133,5 +174,12 @@ public class ReplicationConfig {
     replicationFetchSizeInBytes =
         verifiableProperties.getLongInRange("replication.fetch.size.in.bytes", 1048576, 1, Long.MAX_VALUE);
     replicationIncludeAll = verifiableProperties.getBoolean("replication.include.all", true);
+    replicationPersistTokenOnShutdownOrReplicaRemove =
+        verifiableProperties.getBoolean("replication.persist.token.on.shutdown.or.replica.remove", true);
+    replicationTrackPerPartitionLagFromRemote =
+        verifiableProperties.getBoolean("replication.track.per.partition.lag.from.remote", false);
+    replicaMetadataRequestVersion =
+        verifiableProperties.getShortInRange("replication.metadata.request.version", (short) 1, (short) 1, (short) 2);
+    replicationEnabledWithVcrCluster = verifiableProperties.getBoolean("replication.enabled.with.vcr.cluster", false);
   }
 }

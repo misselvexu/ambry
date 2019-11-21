@@ -16,6 +16,8 @@ package com.github.ambry.store;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.config.StoreConfig;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.replication.FindToken;
+import com.github.ambry.replication.FindTokenType;
 import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.SystemTime;
@@ -76,7 +78,7 @@ public class HardDeleterTest {
       short containerId = Utils.getRandomShort(TestUtils.RANDOM);
       IndexValue indexValue =
           new IndexValue(sizeOfEntry, offset, IndexValue.FLAGS_DEFAULT_VALUE, 12345, time.milliseconds(), acccountId,
-              containerId);
+              containerId, (short) 0);
       index.addToIndex(new IndexEntry(id, indexValue),
           new FileSpan(offset, new Offset(logSegmentName, nextOffset + sizeOfEntry)));
       ByteBuffer byteBuffer = ByteBuffer.allocate((int) sizeOfEntry);
@@ -160,16 +162,17 @@ public class HardDeleterTest {
     scheduler = Utils.newScheduler(1, false);
     MetricRegistry metricRegistry = new MetricRegistry();
     StoreMetrics metrics = new StoreMetrics(metricRegistry);
-    log = new Log(rootDirectory.getAbsolutePath(), 10000, 10000, StoreTestUtils.DEFAULT_DISK_SPACE_ALLOCATOR, metrics);
     Properties props = new Properties();
     // the test will set the tokens, so disable the index persistor.
     props.setProperty("store.data.flush.interval.seconds", "3600");
     props.setProperty("store.deleted.message.retention.days", "1");
     props.setProperty("store.index.max.number.of.inmem.elements", "2");
+    props.setProperty("store.segment.size.in.bytes", "10000");
     // the following determines the number of entries that will be fetched at most. We need this to test the
     // case where the endToken does not reach the journal.
     props.setProperty("store.hard.delete.operations.bytes.per.sec", "40");
     StoreConfig config = new StoreConfig(new VerifiableProperties(props));
+    log = new Log(rootDirectory.getAbsolutePath(), 10000, StoreTestUtils.DEFAULT_DISK_SPACE_ALLOCATOR, config, metrics);
     StoreKeyFactory factory = Utils.getObj("com.github.ambry.store.MockIdFactory");
     time = new MockTime(SystemTime.getInstance().milliseconds());
 
@@ -186,8 +189,8 @@ public class HardDeleterTest {
   @After
   public void cleanup() throws StoreException, IOException {
     scheduler.shutdown();
-    index.close();
-    log.close();
+    index.close(false);
+    log.close(false);
   }
 
   /**
@@ -357,7 +360,7 @@ public class HardDeleterTest {
         // reset the internal tokens
         index.resetHardDeleterTokens();
       }
-      index.close();
+      index.close(false);
     } catch (Exception e) {
       e.printStackTrace();
       assertEquals(false, true);
@@ -373,9 +376,9 @@ public class HardDeleterTest {
     }
 
     /**
-     * Always returns a {@link StoreFindToken.Type#Uninitialized} token.
+     * Always returns a {@link FindTokenType#Uninitialized} token.
      * @param token the {@link StoreFindToken} to revalidate.
-     * @return a {@link StoreFindToken.Type#Uninitialized} token.
+     * @return a {@link FindTokenType#Uninitialized} token.
      */
     @Override
     FindToken revalidateFindToken(FindToken token) {

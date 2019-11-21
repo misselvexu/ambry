@@ -24,8 +24,11 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -39,6 +42,8 @@ import static com.github.ambry.clustermap.ClusterMapSnapshotConstants.*;
 public class MockClusterMap implements ClusterMap {
   public static final String DEFAULT_PARTITION_CLASS = "defaultPartitionClass";
   public static final String SPECIAL_PARTITION_CLASS = "specialPartitionClass";
+  public static final int PLAIN_TEXT_PORT_START_NUMBER = 62000;
+  public static final int SSL_PORT_START_NUMBER = 63000;
 
   protected final boolean enableSSLPorts;
   protected final Map<Long, PartitionId> partitions;
@@ -105,12 +110,12 @@ public class MockClusterMap implements ClusterMap {
       int numDefaultStoresPerMountPoint, boolean createOnlyDefaultPartitionClass) throws IOException {
     this.enableSSLPorts = enableSSLPorts;
     this.numMountPointsPerNode = numMountPointsPerNode;
-    dataNodes = new ArrayList<MockDataNodeId>(numNodes);
+    dataNodes = new ArrayList<>(numNodes);
     //Every group of 3 nodes will be put in the same DC.
     int dcIndex = 0;
     String dcName = null;
-    int currentPlainTextPort = 62000;
-    int currentSSLPort = 63000;
+    int currentPlainTextPort = PLAIN_TEXT_PORT_START_NUMBER;
+    int currentSSLPort = SSL_PORT_START_NUMBER;
     for (int i = 0; i < numNodes; i++) {
       if (i % 3 == 0) {
         dcIndex++;
@@ -119,15 +124,16 @@ public class MockClusterMap implements ClusterMap {
       }
       MockDataNodeId dataNodeId;
       if (enableSSLPorts) {
-        dataNodeId = createDataNode(getListOfPorts(currentPlainTextPort++, currentSSLPort++), dcName);
+        dataNodeId =
+            createDataNode(getListOfPorts(currentPlainTextPort++, currentSSLPort++), dcName, numMountPointsPerNode);
       } else {
-        dataNodeId = createDataNode(getListOfPorts(currentPlainTextPort++), dcName);
+        dataNodeId = createDataNode(getListOfPorts(currentPlainTextPort++), dcName, numMountPointsPerNode);
       }
       dataNodes.add(dataNodeId);
       dcToDataNodes.computeIfAbsent(dcName, name -> new ArrayList<>()).add(dataNodeId);
       localDatacenterName = dcName;
     }
-    partitions = new HashMap<Long, PartitionId>();
+    partitions = new HashMap<>();
 
     // create partitions
     long partitionId = 0;
@@ -153,8 +159,83 @@ public class MockClusterMap implements ClusterMap {
     partitionSelectionHelper = new ClusterMapUtils.PartitionSelectionHelper(partitions.values(), localDatacenterName);
   }
 
+  /**
+   * Creates a mock cluster map with given list of data nodes and partitions.
+   * @param enableSSLPorts whether to enable SSL port.
+   * @param datanodes the list of data nodes created in this mock cluster map.
+   * @param numMountPointsPerNode number of mount points (mocking disks) that will be created in each data node
+   * @param partitionIdList the list of partitions created in this cluster map.
+   * @param localDatacenterName the name of local datacenter.
+   */
+  public MockClusterMap(boolean enableSSLPorts, List<MockDataNodeId> datanodes, int numMountPointsPerNode,
+      List<PartitionId> partitionIdList, String localDatacenterName) {
+    this.enableSSLPorts = enableSSLPorts;
+    this.dataNodes = datanodes;
+    this.numMountPointsPerNode = numMountPointsPerNode;
+    partitions = new HashMap<>();
+    partitionIdList.forEach(p -> partitions.put(Long.valueOf(p.toPathString()), p));
+    this.localDatacenterName = localDatacenterName;
+    partitionSelectionHelper = new ClusterMapUtils.PartitionSelectionHelper(partitions.values(), localDatacenterName);
+    Set<String> dcNames = new HashSet<>();
+    datanodes.forEach(node -> dcNames.add(node.getDatacenterName()));
+    dataCentersInClusterMap.addAll(dcNames);
+    specialPartition = null;
+  }
+
+  /**
+   * Create a cluster map for recovery from the given {@code vcrNode} and {@code recoveryNode}.
+   * The cluster is created such that {@code recoveryNode} has {@code vcrNode}'s replicas as peer replicas.
+   * @param recoveryNode The data node.
+   * @param vcrNode The vcr node.
+   * @param dcName Name of the datacenter.
+   */
+  private MockClusterMap(MockDataNodeId recoveryNode, MockDataNodeId vcrNode, String dcName) {
+    this.enableSSLPorts = false;
+    this.numMountPointsPerNode = 1;
+    dataNodes = new ArrayList<>();
+    dataNodes.add(recoveryNode);
+    dataNodes.add(vcrNode);
+
+    dataCentersInClusterMap.add(dcName);
+    localDatacenterName = dcName;
+
+    dcToDataNodes.computeIfAbsent(dcName, name -> new ArrayList<>()).add(recoveryNode);
+    dcToDataNodes.computeIfAbsent(dcName, name -> new ArrayList<>()).add(vcrNode);
+
+    partitions = new HashMap<>();
+
+    // create partitions
+    MockPartitionId mockPartitionId = new MockPartitionId();
+    List<ReplicaId> replicaIds = new ArrayList<>(dataNodes.size());
+    MockReplicaId recoveryReplica = new MockReplicaId(recoveryNode.getPort(), mockPartitionId, recoveryNode, 0);
+    replicaIds.add(recoveryReplica);
+    MockReplicaId vcrReplica = new MockReplicaId(vcrNode.getPort(), mockPartitionId, vcrNode, 0);
+    replicaIds.add(vcrReplica);
+    mockPartitionId.replicaIds = replicaIds;
+
+    // Set only vcrReplica as peer of recovery replica.
+    recoveryReplica.setPeerReplicas(Collections.singletonList(vcrReplica));
+    partitions.put(mockPartitionId.partition, mockPartitionId);
+
+    partitionSelectionHelper = new ClusterMapUtils.PartitionSelectionHelper(partitions.values(), localDatacenterName);
+    specialPartition = null;
+  }
+
+  /**
+   * Create a cluster map for recovery from the given {@code vcrNode} and {@code recoveryNode}.
+   * The cluster is created such that {@code recoveryNode} has {@code vcrNode}'s replicas as peer replicas.
+   * @param recoveryNode The data node.
+   * @param vcrNode The vcr node.
+   * @param dcName Name of the datacenter.
+   * @return {@link MockClusterMap} object.
+   */
+  public static MockClusterMap createOneNodeRecoveryClusterMap(MockDataNodeId recoveryNode, MockDataNodeId vcrNode,
+      String dcName) {
+    return new MockClusterMap(recoveryNode, vcrNode, dcName);
+  }
+
   protected ArrayList<Port> getListOfPorts(int port) {
-    ArrayList<Port> ports = new ArrayList<Port>();
+    ArrayList<Port> ports = new ArrayList<>();
     ports.add(new Port(port, PortType.PLAINTEXT));
     return ports;
   }
@@ -166,7 +247,7 @@ public class MockClusterMap implements ClusterMap {
     return ports;
   }
 
-  protected int getPlainTextPort(ArrayList<Port> ports) {
+  public static int getPlainTextPort(ArrayList<Port> ports) {
     for (Port port : ports) {
       if (port.getPortType() == PortType.PLAINTEXT) {
         return port.getPort();
@@ -175,11 +256,12 @@ public class MockClusterMap implements ClusterMap {
     throw new IllegalArgumentException("No PlainText port found ");
   }
 
-  protected MockDataNodeId createDataNode(ArrayList<Port> ports, String datacenter) throws IOException {
+  public static MockDataNodeId createDataNode(ArrayList<Port> ports, String datacenter, int numMountPointsPerNode)
+      throws IOException {
     File f = null;
     int port = getPlainTextPort(ports);
     try {
-      List<String> mountPaths = new ArrayList<String>(numMountPointsPerNode);
+      List<String> mountPaths = new ArrayList<>(numMountPointsPerNode);
       f = File.createTempFile("ambry", ".tmp");
       for (int i = 0; i < numMountPointsPerNode; i++) {
         File mountFile = new File(f.getParent(), "mountpathfile" + port + i);
@@ -193,6 +275,19 @@ public class MockClusterMap implements ClusterMap {
         f.delete();
       }
     }
+  }
+
+  /**
+   * Create a new partition and add it to mock clustermap.
+   * @param dataNodes the replicas of new partition should be placed on the given data nodes only.
+   * @return new {@link PartitionId}
+   */
+  public PartitionId createNewPartition(List<MockDataNodeId> dataNodes) {
+    int mountPathIndexToUse = (new Random()).nextInt(this.dataNodes.get(0).getMountPaths().size());
+    PartitionId partitionId =
+        new MockPartitionId(partitions.size(), DEFAULT_PARTITION_CLASS, dataNodes, mountPathIndexToUse);
+    partitions.put((long) partitions.size(), partitionId);
+    return partitionId;
   }
 
   /**
@@ -218,6 +313,15 @@ public class MockClusterMap implements ClusterMap {
       partitionIdList = partitionSelectionHelper.getWritablePartitions(partitionClass);
     }
     return partitionIdList;
+  }
+
+  @Override
+  public PartitionId getRandomWritablePartition(String partitionClass, List<PartitionId> partitionsToExclude) {
+    lastRequestedPartitionClasses.add(partitionClass);
+    if (!partitionsUnavailable) {
+      return partitionSelectionHelper.getRandomWritablePartition(partitionClass, partitionsToExclude);
+    }
+    return null;
   }
 
   @Override
@@ -257,12 +361,11 @@ public class MockClusterMap implements ClusterMap {
 
   @Override
   public List<ReplicaId> getReplicaIds(DataNodeId dataNodeId) {
-    ArrayList<ReplicaId> replicaIdsToReturn = new ArrayList<ReplicaId>();
+    ArrayList<ReplicaId> replicaIdsToReturn = new ArrayList<>();
     for (PartitionId partitionId : partitions.values()) {
       List<? extends ReplicaId> replicaIds = partitionId.getReplicaIds();
       for (ReplicaId replicaId : replicaIds) {
-        if (replicaId.getDataNodeId().getHostname().compareTo(dataNodeId.getHostname()) == 0
-            && replicaId.getDataNodeId().getPort() == dataNodeId.getPort()) {
+        if (replicaId.getDataNodeId().compareTo(dataNodeId) == 0) {
           replicaIdsToReturn.add(replicaId);
         }
       }
@@ -272,7 +375,7 @@ public class MockClusterMap implements ClusterMap {
 
   @Override
   public List<DataNodeId> getDataNodeIds() {
-    return new ArrayList<DataNodeId>(dataNodes);
+    return new ArrayList<>(dataNodes);
   }
 
   public List<MockDataNodeId> getDataNodes() {
@@ -326,7 +429,7 @@ public class MockClusterMap implements ClusterMap {
     }
   }
 
-  protected static boolean deleteFileOrDirectory(File f) throws IOException {
+  public static boolean deleteFileOrDirectory(File f) throws IOException {
     if (f.exists()) {
       if (f.isDirectory()) {
         File[] children = f.listFiles();
@@ -401,6 +504,19 @@ public class MockClusterMap implements ClusterMap {
   }
 
   @Override
+  public ReplicaId getBootstrapReplica(String partitionIdStr, DataNodeId dataNodeId) {
+    ReplicaId newReplica = null;
+    PartitionId partition = partitions.get(Long.valueOf(partitionIdStr));
+    for (ReplicaId replicaId : partition.getReplicaIds()) {
+      if (replicaId.getDataNodeId().compareTo(dataNodeId) == 0) {
+        newReplica = replicaId;
+        break;
+      }
+    }
+    return newReplica;
+  }
+
+  @Override
   public void close() {
     // No-op.
   }
@@ -439,4 +555,3 @@ public class MockClusterMap implements ClusterMap {
     exceptionOnSnapshot = e;
   }
 }
-

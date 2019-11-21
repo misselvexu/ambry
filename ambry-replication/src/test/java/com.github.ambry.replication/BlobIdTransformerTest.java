@@ -13,7 +13,13 @@
  */
 package com.github.ambry.replication;
 
+import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.DataNodeId;
+import com.github.ambry.clustermap.MockPartitionId;
+import com.github.ambry.clustermap.PartitionId;
+import com.github.ambry.clustermap.ReplicaEventType;
+import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.BlobIdFactory;
 import com.github.ambry.messageformat.BlobProperties;
@@ -21,6 +27,7 @@ import com.github.ambry.messageformat.BlobType;
 import com.github.ambry.messageformat.DeleteMessageFormatInputStream;
 import com.github.ambry.messageformat.MessageFormatException;
 import com.github.ambry.messageformat.MessageFormatInputStream;
+import com.github.ambry.messageformat.MessageFormatRecord;
 import com.github.ambry.messageformat.MetadataContentSerDe;
 import com.github.ambry.messageformat.PutMessageFormatBlobV1InputStream;
 import com.github.ambry.messageformat.PutMessageFormatInputStream;
@@ -46,8 +53,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import org.json.JSONObject;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import static org.junit.Assert.*;
 
@@ -55,12 +65,14 @@ import static org.junit.Assert.*;
 /**
  * Tests the BlobIdTransformer
  */
+@RunWith(Parameterized.class)
 public class BlobIdTransformerTest {
   private final ClusterMap clusterMap = new MockReadingClusterMap();
   private final BlobIdFactory blobIdFactory = new BlobIdFactory(clusterMap);
   private final BlobIdTransformer transformer;
   private final List<Pair> pairList;
   private final MockStoreKeyConverterFactory factory;
+  private final short metadataContentVersion;
   private static final int BLOB_STREAM_SIZE = 128;
   private static final int BLOB_ENCRYPTION_KEY_SIZE = 32;
   private static final int USER_META_DATA_SIZE = 64;
@@ -105,10 +117,21 @@ public class BlobIdTransformerTest {
       new Class[]{PutMessageFormatInputStream.class, PutMessageFormatBlobV1InputStream.class};
 
   /**
+   * Running for both regular and encrypted blobs, and versions 2 and 3 of MetadataContent
+   * @return an array with all four different choices
+   */
+  @Parameterized.Parameters
+  public static List<Object[]> data() {
+    return Arrays.asList(new Object[][]{{MessageFormatRecord.Metadata_Content_Version_V2},
+        {MessageFormatRecord.Metadata_Content_Version_V3}});
+  }
+
+  /**
    * Sets up common components
    * @throws IOException
    */
-  public BlobIdTransformerTest() throws Exception {
+  public BlobIdTransformerTest(int metadataContentVersion) throws Exception {
+    this.metadataContentVersion = (short) metadataContentVersion;
     Pair<String, String>[] pairs =
         new Pair[]{BLOB_ID_PAIR_VERSION_1_CONVERTED, BLOB_ID_PAIR_VERSION_2_CONVERTED, BLOB_ID_PAIR_VERSION_3_CONVERTED,
             BLOB_ID_PAIR_VERSION_3_NULL, BLOB_ID_VERSION_1_METADATA_CONVERTED, BLOB_ID_VERSION_1_DATACHUNK_0_CONVERTED,
@@ -502,8 +525,8 @@ public class BlobIdTransformerTest {
       int inputStreamSize;
       MessageInfo messageInfo;
       BlobProperties blobProperties =
-          new BlobProperties(blobPropertiesSize, "serviceId", "ownerId", "contentType", false, 0, 0, blobId.getAccountId(),
-              blobId.getContainerId(), hasEncryption, null);
+          new BlobProperties(blobPropertiesSize, "serviceId", "ownerId", "contentType", false, 0, 0,
+              blobId.getAccountId(), blobId.getContainerId(), hasEncryption, null);
       if (clazz != null) {
         MessageFormatInputStream messageFormatInputStream;
         if (clazz == PutMessageFormatInputStream.class) {
@@ -553,13 +576,117 @@ public class BlobIdTransformerTest {
       for (String datachunkId : datachunkIds) {
         storeKeys.add(blobIdFactory.getStoreKey(datachunkId));
       }
-      ByteBuffer output =
-          MetadataContentSerDe.serializeMetadataContent(COMPOSITE_BLOB_DATA_CHUNK_SIZE, COMPOSITE_BLOB_SIZE, storeKeys);
+      ByteBuffer output;
+      switch (metadataContentVersion) {
+        case MessageFormatRecord.Metadata_Content_Version_V2:
+          output = MetadataContentSerDe.serializeMetadataContentV2(COMPOSITE_BLOB_DATA_CHUNK_SIZE, COMPOSITE_BLOB_SIZE,
+              storeKeys);
+          break;
+        case MessageFormatRecord.Metadata_Content_Version_V3:
+          int totalLeft = COMPOSITE_BLOB_SIZE;
+          List<Pair<StoreKey, Long>> keyAndSizeList = new ArrayList<>();
+          int i = 0;
+          while (totalLeft >= COMPOSITE_BLOB_DATA_CHUNK_SIZE) {
+            keyAndSizeList.add(new Pair<>(storeKeys.get(i++), (long) COMPOSITE_BLOB_DATA_CHUNK_SIZE));
+            totalLeft -= COMPOSITE_BLOB_DATA_CHUNK_SIZE;
+          }
+          if (totalLeft > 0) {
+            keyAndSizeList.add(new Pair<>(storeKeys.get(i), (long) totalLeft));
+          }
+          output = MetadataContentSerDe.serializeMetadataContentV3(COMPOSITE_BLOB_SIZE, keyAndSizeList);
+          break;
+        default:
+          throw new IllegalStateException("Unexpected metadata content version: " + metadataContentVersion);
+      }
       output.flip();
       return output;
     }
   }
 
   private class BlobIdTransformerTestException extends Exception {
+  }
+
+  /**
+   * Mock clusterMap used when one wants the inputStream input for getPartitionIdFromStream
+   * to be read and have constructed a MockPartitionId from the input
+   */
+  private class MockReadingClusterMap implements ClusterMap {
+    private boolean throwException = false;
+
+    public MockReadingClusterMap() {
+    }
+
+    public void setThrowException(boolean bool) {
+      this.throwException = bool;
+    }
+
+    public PartitionId getPartitionIdFromStream(InputStream inputStream) throws IOException {
+      if (this.throwException) {
+        throw new IOException();
+      } else {
+        byte[] bytes = new byte[10];
+        inputStream.read(bytes);
+        ByteBuffer bb = ByteBuffer.wrap(bytes);
+        bb.getShort();
+        long num = bb.getLong();
+        return new MockPartitionId(num, (String) null);
+      }
+    }
+
+    public List<? extends PartitionId> getWritablePartitionIds(String partitionClass) {
+      return null;
+    }
+
+    public PartitionId getRandomWritablePartition(String partitionClass, List<PartitionId> partitionsToExclude) {
+      return null;
+    }
+
+    public List<? extends PartitionId> getAllPartitionIds(String partitionClass) {
+      return null;
+    }
+
+    public boolean hasDatacenter(String s) {
+      return false;
+    }
+
+    public byte getLocalDatacenterId() {
+      return 0;
+    }
+
+    public String getDatacenterName(byte b) {
+      return null;
+    }
+
+    public DataNodeId getDataNodeId(String s, int i) {
+      return null;
+    }
+
+    public List<? extends ReplicaId> getReplicaIds(DataNodeId dataNodeId) {
+      return null;
+    }
+
+    public List<? extends DataNodeId> getDataNodeIds() {
+      return null;
+    }
+
+    public MetricRegistry getMetricRegistry() {
+      return null;
+    }
+
+    public void onReplicaEvent(ReplicaId replicaId, ReplicaEventType replicaEventType) {
+    }
+
+    @Override
+    public JSONObject getSnapshot() {
+      return null;
+    }
+
+    @Override
+    public ReplicaId getBootstrapReplica(String partitionIdStr, DataNodeId dataNodeId) {
+      return null;
+    }
+
+    public void close() {
+    }
   }
 }

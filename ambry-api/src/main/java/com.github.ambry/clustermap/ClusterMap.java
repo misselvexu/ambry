@@ -42,6 +42,14 @@ public interface ClusterMap extends AutoCloseable {
   List<? extends PartitionId> getWritablePartitionIds(String partitionClass);
 
   /**
+   * Get a writable partition chosen at random that belongs to given partitionclass.
+   * @param partitionClass the partition class whose writable partitions are required. Can be {@code null}
+   * @param partitionsToExclude list of partitions that shouldnt be considered as a possible partition returned
+   * @return chosen random partition. Can be {@code null}
+   */
+  PartitionId getRandomWritablePartition(String partitionClass, List<PartitionId> partitionsToExclude);
+
+  /**
    * Gets a list of all partitions in the cluster.  Gets a mutable shallow copy of the list of all partitions.
    * @param partitionClass the partition class whose partitions are required. Can be {@code null}
    * @return a list of all partitions belonging to the partition class (or all partitions if {@code partitionClass} is
@@ -76,7 +84,8 @@ public interface ClusterMap extends AutoCloseable {
    *
    * @param hostname of the DataNodeId
    * @param port of the DataNodeId
-   * @return DataNodeId for this hostname and port.
+   * @return DataNodeId for this hostname and port, or {@code null} if the hostname and port does not match a node in
+   *         the cluster.
    */
   DataNodeId getDataNodeId(String hostname, int port);
 
@@ -112,6 +121,16 @@ public interface ClusterMap extends AutoCloseable {
    * information about nodes, partitions and replicas from each datacenter
    */
   JSONObject getSnapshot();
+
+  /**
+   * Attempt to get a bootstrap replica of certain partition that is supposed to be added onto specified data node.
+   * This method is designed to fetch detailed infos about bootstrap replica and create an instance of this replica. The
+   * purpose is to support dynamically adding new replica to specified data node.
+   * @param partitionIdStr the partition id string
+   * @param dataNodeId the {@link DataNodeId} on which bootstrap replica is placed
+   * @return {@link ReplicaId} if there is a new replica satisfying given partition and data node. {@code null} otherwise.
+   */
+  ReplicaId getBootstrapReplica(String partitionIdStr, DataNodeId dataNodeId);
 
   /**
    * Close the cluster map. Any cleanups should be done in this call.

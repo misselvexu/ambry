@@ -13,6 +13,13 @@
  */
 package com.github.ambry.config;
 
+import com.github.ambry.router.OperationTrackerScope;
+import com.github.ambry.utils.Utils;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+
+
 /**
  * Configuration parameters required by a {@link com.github.ambry.router.Router}.
  * <p/>
@@ -59,13 +66,23 @@ public class RouterConfig {
 
   /**
    * The percentage of {@link RouterConfig#routerScalingUnitMaxConnectionsPerPortSsl} or
-   * {@link RouterConfig#routerScalingUnitMaxConnectionsPerPortPlainText} to warm up in the startup.
+   * {@link RouterConfig#routerScalingUnitMaxConnectionsPerPortPlainText} to warm up for data nodes in the local
+   * datacenter during startup.
    * {@link RouterConfig#routerConnectionsWarmUpTimeoutMs} may need to be adjusted.
    */
-  @Config("router.connections.warm.up.percentage.per.port")
+  @Config("router.connections.local.dc.warm.up.percentage")
   @Default("25")
-  public final int routerConnectionsWarmUpPercentagePerPort;
+  public final int routerConnectionsLocalDcWarmUpPercentage;
 
+  /**
+   * The percentage of {@link RouterConfig#routerScalingUnitMaxConnectionsPerPortSsl} or
+   * {@link RouterConfig#routerScalingUnitMaxConnectionsPerPortPlainText} to warm up for data nodes in remote
+   * datacenters during startup.
+   * {@link RouterConfig#routerConnectionsWarmUpTimeoutMs} may need to be adjusted.
+   */
+  @Config("router.connections.remote.dc.warm.up.percentage")
+  @Default("0")
+  public final int routerConnectionsRemoteDcWarmUpPercentage;
   /**
    * The max time allowed to establish connections to local DC in the startup
    */
@@ -86,6 +103,14 @@ public class RouterConfig {
   @Config("router.request.timeout.ms")
   @Default("2000")
   public final int routerRequestTimeoutMs;
+
+  /**
+   * {@code true} if the router should tell the network layer about requests that have timed out. The network client
+   * can choose how to drop these requests.
+   */
+  @Config("router.drop.request.on.timeout")
+  @Default("false")
+  public final boolean routerDropRequestOnTimeout;
 
   /**
    * The max chunk size to be used for put operations.
@@ -188,6 +213,13 @@ public class RouterConfig {
   public final short routerBlobidCurrentVersion;
 
   /**
+   * The version to use for new metadata blobs.
+   */
+  @Config("router.metadata.content.version")
+  @Default("2")
+  public final short routerMetadataContentVersion;
+
+  /**
    * The KeyManagementServiceFactory that will be used to fetch {@link com.github.ambry.router.KeyManagementService}
    */
   @Config("router.key.management.service.factory")
@@ -233,6 +265,110 @@ public class RouterConfig {
   public final boolean routerUseGetBlobOperationForBlobInfo;
 
   /**
+   * The custom percentiles of Histogram in operation tracker to be reported. This allows router to emit metrics of
+   * arbitrary percentiles (i.e. 97th, 93th etc). An example of this config is "0.91,0.93,0.97"(comma separated), each
+   * value should fall in {@code [0..1]}.
+   */
+  @Config("router.operation.tracker.custom.percentiles")
+  @Default("")
+  public final List<Double> routerOperationTrackerCustomPercentiles;
+
+  /**
+   * The metric scope that is applied to operation tracker. This config specifies at which granularity router should
+   * track the latency distribution. For example, Datacenter or Partition. The valid scope is defined in
+   * {@link OperationTrackerScope}
+   */
+  @Config("router.operation.tracker.metric.scope")
+  @Default("Datacenter")
+  public final OperationTrackerScope routerOperationTrackerMetricScope;
+
+  /**
+   * The maximum size of histogram reservoir in operation tracker. This configs specifies the max number of data points
+   * that can be kept by histogram reservoir.
+   */
+  @Config("router.operation.tracker.reservoir.size")
+  @Default("1028")
+  public final int routerOperationTrackerReservoirSize;
+
+  /**
+   * The decay factor of histogram reservoir in operation tracker. This config specifies how biased histogram should be
+   * on new data.
+   */
+  @Config("router.operation.tracker.reservoir.decay.factor")
+  @Default("0.015")
+  public final double routerOperationTrackerReservoirDecayFactor;
+
+  /**
+   * The minimum required data points to populate histogram in operation tracker. If number of data points is less than
+   * this threshold, the tracker ignores statistics from histogram.
+   */
+  @Config("router.operation.tracker.min.data.points.required")
+  @Default("1000")
+  public final long routerOperationTrackerMinDataPointsRequired;
+
+  /**
+   * If this config is set to {@code true} the operation tracker would terminate operations when there are more than 2
+   * NOT_FOUND responses returned from originating dc. Notice that some of the blob ids don't have the datacenter id, it
+   * will have no effect on those blobs.
+   */
+  @Config("router.operation.tracker.terminate.on.not.found.enabled")
+  @Default("false")
+  public final boolean routerOperationTrackerTerminateOnNotFoundEnabled;
+
+  /**
+   * The maximum number of inflight requests that allowed for adaptive tracker. If current number of inflight requests
+   * is larger than or equal to this threshold, tracker shouldn't send out any request even though the oldest is past due.
+   * {@link RouterConfig#routerGetRequestParallelism} is a suggestive number that operation tracker uses to determine how
+   * many requests can be outstanding in parallel (assuming request gets response in time). Adaptive tracker is allowed
+   * to issue more requests (total inflight requests may exceed #routerGetRequestParallelism) if old request is past due.
+   * {@link RouterConfig#routerOperationTrackerMaxInflightRequests} is the strict upper bound that at any point of time,
+   * number of inflight requests issued by adaptive tracker should not exceed this number. Hence, for adaptive tracker,
+   * inflight requests number should always be within [0, #routerOperationTrackerMaxInflightRequests]
+   */
+  @Config("router.operation.tracker.max.inflight.requests")
+  @Default("2")
+  public final int routerOperationTrackerMaxInflightRequests;
+
+  /**
+   * Indicates whether to enable excluding timed out requests in Histogram reservoir.
+   */
+  @Config("router.operation.tracker.exclude.timeout.enabled")
+  @Default("false")
+  public final boolean routerOperationTrackerExcludeTimeoutEnabled;
+
+  /**
+   * Indicates whether to dump resource-level histogram to log file.
+   */
+  @Config("router.operation.tracker.histogram.dump.enabled")
+  @Default("false")
+  public final boolean routerOperationTrackerHistogramDumpEnabled;
+
+  /**
+   * The period of dumping resource-level histogram (if enabled).
+   */
+  @Config("router.operation.tracker.histogram.dump.period")
+  @Default("600")
+  public final long routerOperationTrackerHistogramDumpPeriod;
+
+  /**
+   * The max number of chunks per PutOperation that may be buffered in memory.
+   */
+  @Config("router.max.in.mem.put.chunks")
+  @Default("4")
+  public final int routerMaxInMemPutChunks;
+
+  /**
+   * The max number of chunks per GetBlobOperation that may be buffered in memory.
+   */
+  @Config("router.max.in.mem.get.chunks")
+  @Default("4")
+  public final int routerMaxInMemGetChunks;
+
+  @Config("router.get.blob.operation.share.memory")
+  @Default("false")
+  public final boolean routerGetBlobOperationShareMemory;
+
+  /**
    * Create a RouterConfig instance.
    * @param verifiableProperties the properties map to refer to.
    */
@@ -244,13 +380,16 @@ public class RouterConfig {
         verifiableProperties.getIntInRange("router.scaling.unit.max.connections.per.port.plain.text", 5, 1, 100);
     routerScalingUnitMaxConnectionsPerPortSsl =
         verifiableProperties.getIntInRange("router.scaling.unit.max.connections.per.port.ssl", 2, 1, 100);
-    routerConnectionsWarmUpPercentagePerPort =
-        verifiableProperties.getIntInRange("router.connections.warm.up.percentage.per.port", 25, 0, 100);
+    routerConnectionsLocalDcWarmUpPercentage =
+        verifiableProperties.getIntInRange("router.connections.local.dc.warm.up.percentage", 25, 0, 100);
+    routerConnectionsRemoteDcWarmUpPercentage =
+        verifiableProperties.getIntInRange("router.connections.remote.dc.warm.up.percentage", 0, 0, 100);
     routerConnectionsWarmUpTimeoutMs =
         verifiableProperties.getIntInRange("router.connections.warm.up.timeout.ms", 5000, 0, Integer.MAX_VALUE);
     routerConnectionCheckoutTimeoutMs =
         verifiableProperties.getIntInRange("router.connection.checkout.timeout.ms", 1000, 1, 5000);
     routerRequestTimeoutMs = verifiableProperties.getIntInRange("router.request.timeout.ms", 2000, 1, 10000);
+    routerDropRequestOnTimeout = verifiableProperties.getBoolean("router.drop.request.on.timeout", false);
     routerMaxPutChunkSizeBytes =
         verifiableProperties.getIntInRange("router.max.put.chunk.size.bytes", 4 * 1024 * 1024, 1, Integer.MAX_VALUE);
     routerPutRequestParallelism =
@@ -277,6 +416,8 @@ public class RouterConfig {
     routerBlobidCurrentVersion =
         verifiableProperties.getShortFromAllowedValues("router.blobid.current.version", (short) 6,
             new Short[]{1, 2, 3, 4, 5, 6});
+    routerMetadataContentVersion =
+        verifiableProperties.getShortFromAllowedValues("router.metadata.content.version", (short) 2, new Short[]{2, 3});
     routerKeyManagementServiceFactory =
         verifiableProperties.getString("router.key.management.service.factory", DEFAULT_KMS_FACTORY);
     routerCryptoServiceFactory =
@@ -289,5 +430,37 @@ public class RouterConfig {
         verifiableProperties.getIntInRange("router.ttl.update.success.target", 2, 1, Integer.MAX_VALUE);
     routerUseGetBlobOperationForBlobInfo =
         verifiableProperties.getBoolean("router.use.get.blob.operation.for.blob.info", false);
+    List<String> customPercentiles =
+        Utils.splitString(verifiableProperties.getString("router.operation.tracker.custom.percentiles", ""), ",");
+    routerOperationTrackerCustomPercentiles =
+        Collections.unmodifiableList(customPercentiles.stream().map(Double::valueOf).collect(Collectors.toList()));
+    String scopeStr = verifiableProperties.getString("router.operation.tracker.metric.scope", "Datacenter");
+    routerOperationTrackerMetricScope = OperationTrackerScope.valueOf(scopeStr);
+    routerOperationTrackerReservoirSize =
+        verifiableProperties.getIntInRange("router.operation.tracker.reservoir.size", 1028, 0, Integer.MAX_VALUE);
+    routerOperationTrackerReservoirDecayFactor =
+        verifiableProperties.getDouble("router.operation.tracker.reservoir.decay.factor", 0.015);
+    routerOperationTrackerMinDataPointsRequired =
+        verifiableProperties.getLong("router.operation.tracker.min.data.points.required", 1000L);
+    routerOperationTrackerMaxInflightRequests =
+        verifiableProperties.getIntInRange("router.operation.tracker.max.inflight.requests", 2, 1, Integer.MAX_VALUE);
+    routerOperationTrackerExcludeTimeoutEnabled =
+        verifiableProperties.getBoolean("router.operation.tracker.exclude.timeout.enabled", false);
+    routerOperationTrackerHistogramDumpEnabled =
+        verifiableProperties.getBoolean("router.operation.tracker.histogram.dump.enabled", false);
+    routerOperationTrackerHistogramDumpPeriod =
+        verifiableProperties.getLongInRange("router.operation.tracker.histogram.dump.period", 600L, 1L, Long.MAX_VALUE);
+    if (routerGetRequestParallelism > routerOperationTrackerMaxInflightRequests) {
+      throw new IllegalArgumentException(
+          "Operation tracker parallelism is larger than operation tracker max inflight number");
+    }
+    routerOperationTrackerTerminateOnNotFoundEnabled =
+        verifiableProperties.getBoolean("router.operation.tracker.terminate.on.not.found.enabled", false);
+    routerMaxInMemPutChunks = verifiableProperties.getIntInRange("router.max.in.mem.put.chunks", 4, 1,
+        Integer.MAX_VALUE / routerMaxPutChunkSizeBytes);
+    routerMaxInMemGetChunks = verifiableProperties.getIntInRange("router.max.in.mem.get.chunks", 4, 1,
+        Integer.MAX_VALUE / routerMaxPutChunkSizeBytes);
+    routerGetBlobOperationShareMemory =
+        verifiableProperties.getBoolean("router.get.blob.operation.share.memory", false);
   }
 }

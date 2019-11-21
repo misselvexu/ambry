@@ -21,6 +21,8 @@ import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.clustermap.ReplicaStatusDelegate;
 import com.github.ambry.config.DiskManagerConfig;
 import com.github.ambry.config.StoreConfig;
+import com.github.ambry.server.ServerErrorCode;
+import com.github.ambry.server.StoreManager;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
 import java.util.ArrayList;
@@ -28,6 +30,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
@@ -38,11 +41,21 @@ import org.slf4j.LoggerFactory;
  * The storage manager that handles all the stores on this node. The stores on each disk are handled by a
  * {@link DiskManager}
  */
-public class StorageManager {
-  private final Map<PartitionId, DiskManager> partitionToDiskManager = new HashMap<>();
-  private final Map<DiskId, DiskManager> diskToDiskManager = new HashMap<>();
+public class StorageManager implements StoreManager {
+  private final ConcurrentHashMap<PartitionId, DiskManager> partitionToDiskManager = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<DiskId, DiskManager> diskToDiskManager = new ConcurrentHashMap<>();
   private final StorageManagerMetrics metrics;
   private final Time time;
+  private final StoreConfig storeConfig;
+  private final DiskManagerConfig diskManagerConfig;
+  private final ScheduledExecutorService scheduler;
+  private final StoreMetrics storeMainMetrics;
+  private final StoreMetrics storeUnderCompactionMetrics;
+  private final StoreKeyFactory keyFactory;
+  private final MessageStoreRecovery recovery;
+  private final MessageStoreHardDelete hardDelete;
+  private final ReplicaStatusDelegate replicaStatusDelegate;
+  private final List<String> stoppedReplicas;
   private static final Logger logger = LoggerFactory.getLogger(StorageManager.class);
 
   /**
@@ -62,12 +75,19 @@ public class StorageManager {
       StoreKeyFactory keyFactory, MessageStoreRecovery recovery, MessageStoreHardDelete hardDelete,
       ReplicaStatusDelegate replicaStatusDelegate, Time time) throws StoreException {
     verifyConfigs(storeConfig, diskManagerConfig);
-    metrics = new StorageManagerMetrics(registry);
-    StoreMetrics storeMainMetrics = new StoreMetrics(registry);
-    StoreMetrics storeUnderCompactionMetrics = new StoreMetrics("UnderCompaction", registry);
-    List<String> stoppedReplicas =
-        replicaStatusDelegate == null ? Collections.emptyList() : replicaStatusDelegate.getStoppedReplicas();
+    this.storeConfig = storeConfig;
+    this.diskManagerConfig = diskManagerConfig;
+    this.scheduler = scheduler;
     this.time = time;
+    this.keyFactory = keyFactory;
+    this.recovery = recovery;
+    this.hardDelete = hardDelete;
+    this.replicaStatusDelegate = replicaStatusDelegate;
+    metrics = new StorageManagerMetrics(registry);
+    storeMainMetrics = new StoreMetrics(registry);
+    storeUnderCompactionMetrics = new StoreMetrics("UnderCompaction", registry);
+    stoppedReplicas =
+        replicaStatusDelegate == null ? Collections.emptyList() : replicaStatusDelegate.getStoppedReplicas();
     Map<DiskId, List<ReplicaId>> diskToReplicaMap = new HashMap<>();
     for (ReplicaId replica : replicas) {
       DiskId disk = replica.getDiskId();
@@ -138,14 +158,37 @@ public class StorageManager {
     }
   }
 
+  @Override
+  public Store getStore(PartitionId id) {
+    return getStore(id, false);
+  }
+
   /**
    * @param id the {@link PartitionId} to find the store for.
+   * @param skipStateCheck whether to skip checking state of the store. if true, it also returns store that is not started yet.
    * @return the {@link Store} corresponding to the given {@link PartitionId}, or {@code null} if no store was found for
    *         that partition, or that store was not started.
    */
-  public Store getStore(PartitionId id) {
+  public Store getStore(PartitionId id, boolean skipStateCheck) {
     DiskManager diskManager = partitionToDiskManager.get(id);
-    return diskManager != null ? diskManager.getStore(id) : null;
+    return diskManager != null ? diskManager.getStore(id, skipStateCheck) : null;
+  }
+
+  @Override
+  public ServerErrorCode checkLocalPartitionStatus(PartitionId partition, ReplicaId localReplica) {
+    if (getStore(partition) == null) {
+      if (localReplica != null) {
+        // check stores on the disk
+        if (!isDiskAvailable(localReplica.getDiskId())) {
+          return ServerErrorCode.Disk_Unavailable;
+        } else {
+          return ServerErrorCode.Replica_Unavailable;
+        }
+      } else {
+        return ServerErrorCode.Partition_Unknown;
+      }
+    }
+    return ServerErrorCode.No_Error;
   }
 
   /**
@@ -162,27 +205,18 @@ public class StorageManager {
    * @param disk the {@link DiskId} to check.
    * @return {@code true} if the disk is available. {@code false} if not.
    */
-  public boolean isDiskAvailable(DiskId disk) {
+  boolean isDiskAvailable(DiskId disk) {
     DiskManager diskManager = diskToDiskManager.get(disk);
     return diskManager != null && !diskManager.areAllStoresDown();
   }
 
-  /**
-   * Schedules the {@link PartitionId} {@code id} for compaction next.
-   * @param id the {@link PartitionId} of the {@link Store} to compact.
-   * @return {@code true} if the scheduling was successful. {@code false} if not.
-   */
+  @Override
   public boolean scheduleNextForCompaction(PartitionId id) {
     DiskManager diskManager = partitionToDiskManager.get(id);
     return diskManager != null && diskManager.scheduleNextForCompaction(id);
   }
 
-  /**
-   * Disable compaction on the {@link PartitionId} {@code id}.
-   * @param id the {@link PartitionId} of the {@link Store} on which compaction is disabled or enabled.
-   * @param enabled whether to enable ({@code true}) or disable.
-   * @return {@code true} if disabling was successful. {@code false} if not.
-   */
+  @Override
   public boolean controlCompactionForBlobStore(PartitionId id, boolean enabled) {
     DiskManager diskManager = partitionToDiskManager.get(id);
     return diskManager != null && diskManager.controlCompactionForBlobStore(id, enabled);
@@ -190,7 +224,6 @@ public class StorageManager {
 
   /**
    * Shutdown the {@link DiskManager}s for the disks on this node.
-   * @throws StoreException
    * @throws InterruptedException
    */
   public void shutdown() throws InterruptedException {
@@ -220,30 +253,64 @@ public class StorageManager {
     }
   }
 
-  /**
-   * Start BlobStore with given {@link PartitionId} {@code id}.
-   * @param id the {@link PartitionId} of the {@link Store} which would be started.
-   */
+  @Override
+  public boolean addBlobStore(ReplicaId replica) {
+    if (partitionToDiskManager.containsKey(replica.getPartitionId())) {
+      logger.info("{} already exists in storage manager, rejecting adding store request", replica.getPartitionId());
+      return false;
+    }
+    DiskManager diskManager = diskToDiskManager.computeIfAbsent(replica.getDiskId(), disk -> {
+      DiskManager newDiskManager =
+          new DiskManager(disk, Collections.emptyList(), storeConfig, diskManagerConfig, scheduler, metrics,
+              storeMainMetrics, storeUnderCompactionMetrics, keyFactory, recovery, hardDelete, replicaStatusDelegate,
+              stoppedReplicas, time);
+      logger.info("Creating new DiskManager on {} for new added store", replica.getDiskId().getMountPath());
+      try {
+        newDiskManager.start();
+      } catch (Exception e) {
+        logger.error("Error while starting the new DiskManager for " + disk.getMountPath(), e);
+        return null;
+      }
+      return newDiskManager;
+    });
+    if (diskManager == null || !diskManager.addBlobStore(replica)) {
+      logger.error("Failed to add new store into DiskManager");
+      return false;
+    }
+    partitionToDiskManager.put(replica.getPartitionId(), diskManager);
+    logger.info("New store is successfully added into StorageManager");
+    return true;
+  }
+
+  @Override
   public boolean startBlobStore(PartitionId id) {
     DiskManager diskManager = partitionToDiskManager.get(id);
     return diskManager != null && diskManager.startBlobStore(id);
   }
 
-  /**
-   * Shutdown BlobStore with given {@link PartitionId} {@code id}.
-   * @param id the {@link PartitionId} of the {@link Store} which would be shutdown.
-   */
+  @Override
   public boolean shutdownBlobStore(PartitionId id) {
     DiskManager diskManager = partitionToDiskManager.get(id);
     return diskManager != null && diskManager.shutdownBlobStore(id);
   }
 
-  /**
-   * Set BlobStore Stopped state with given {@link PartitionId} {@code id}.
-   * @param partitionIds a list {@link PartitionId} of the {@link Store} whose stopped state should be set.
-   * @param markStop whether to mark BlobStore as stopped ({@code true}) or started.
-   * @return a list of {@link PartitionId} whose stopped state fails to be updated.
-   */
+  @Override
+  public boolean removeBlobStore(PartitionId id) {
+    DiskManager diskManager = partitionToDiskManager.get(id);
+    if (diskManager == null) {
+      logger.info("Store {} is not found in storage manager", id);
+      return false;
+    }
+    if (!diskManager.removeBlobStore(id)) {
+      logger.error("Fail to remove store {} from disk manager", id);
+      return false;
+    }
+    partitionToDiskManager.remove(id);
+    logger.info("Store {} is successfully removed from storage manager", id);
+    return true;
+  }
+
+  @Override
   public List<PartitionId> setBlobStoreStoppedState(List<PartitionId> partitionIds, boolean markStop) {
     Map<DiskManager, List<PartitionId>> diskManagerToPartitionMap = new HashMap<>();
     List<PartitionId> failToUpdateStores = new ArrayList<>();

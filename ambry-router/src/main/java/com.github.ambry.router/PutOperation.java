@@ -23,10 +23,10 @@ import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.BlobId.BlobDataType;
 import com.github.ambry.commons.BlobId.BlobIdType;
 import com.github.ambry.commons.ByteBufferAsyncWritableChannel;
-import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.RouterConfig;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.messageformat.BlobType;
+import com.github.ambry.messageformat.MessageFormatRecord;
 import com.github.ambry.messageformat.MetadataContentSerDe;
 import com.github.ambry.network.Port;
 import com.github.ambry.network.RequestInfo;
@@ -35,7 +35,7 @@ import com.github.ambry.notification.NotificationBlobType;
 import com.github.ambry.notification.NotificationSystem;
 import com.github.ambry.protocol.PutRequest;
 import com.github.ambry.protocol.PutResponse;
-import com.github.ambry.protocol.RequestOrResponse;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.store.StoreKey;
 import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.Time;
@@ -50,10 +50,12 @@ import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -337,13 +339,15 @@ class PutOperation {
           RouterErrorCode.InvalidPutArgument);
     }
     long totalSize = 0;
-    long intermediateChunkSize = chunksToStitch.get(0).getChunkSizeInBytes();
+    long intermediateChunkSize =
+        routerConfig.routerMetadataContentVersion == MessageFormatRecord.Metadata_Content_Version_V2
+            ? chunksToStitch.get(0).getChunkSizeInBytes() : routerConfig.routerMaxPutChunkSizeBytes;
     metadataPutChunk.setIntermediateChunkSize(intermediateChunkSize);
     for (ListIterator<ChunkInfo> iter = chunksToStitch.listIterator(); iter.hasNext(); ) {
       int chunkIndex = iter.nextIndex();
       ChunkInfo chunkInfo = iter.next();
       BlobId chunkId = unwrapChunkInfo(chunkInfo, intermediateChunkSize, !iter.hasNext());
-      metadataPutChunk.addChunkId(chunkId, chunkIndex);
+      metadataPutChunk.addChunkId(chunkId, chunkInfo.getChunkSizeInBytes(), chunkIndex);
       totalSize += chunkInfo.getChunkSizeInBytes();
     }
     blobSize = totalSize;
@@ -364,7 +368,9 @@ class PutOperation {
     long chunkSize = chunkInfo.getChunkSizeInBytes();
     long chunkExpirationTimeInMs = chunkInfo.getExpirationTimeInMs();
 
-    if (chunkSize == 0 || chunkSize > intermediateChunkSize || (!lastChunk && chunkSize < intermediateChunkSize)) {
+    if (chunkSize == 0 || chunkSize > intermediateChunkSize || (
+        routerConfig.routerMetadataContentVersion == MessageFormatRecord.Metadata_Content_Version_V2 && !lastChunk
+            && chunkSize < intermediateChunkSize)) {
       throw new RouterException(
           "Invalid chunkSize for " + (lastChunk ? "last" : "intermediate") + " chunk: " + chunkSize
               + "; intermediateChunkSize: " + intermediateChunkSize, RouterErrorCode.InvalidPutArgument);
@@ -455,8 +461,9 @@ class PutOperation {
    * @param putResponse the {@link PutResponse} associated with this response.
    */
   void handleResponse(ResponseInfo responseInfo, PutResponse putResponse) {
-    PutChunk putChunk = correlationIdToPutChunk.remove(
-        ((RequestOrResponse) responseInfo.getRequestInfo().getRequest()).getCorrelationId());
+    int correlationId = responseInfo.getRequestInfo().getRequest().getCorrelationId();
+    PutChunk putChunk = correlationIdToPutChunk.remove(correlationId);
+    logger.debug("Handling response for {}", correlationId);
     putChunk.handleResponse(responseInfo, putResponse);
     if (putChunk.isComplete()) {
       onChunkOperationComplete(putChunk);
@@ -480,7 +487,7 @@ class PutOperation {
     } else if (chunk != metadataPutChunk) {
       // a data chunk has succeeded.
       logger.trace("Successfully put data chunk with blob id : {}", chunk.getChunkBlobId());
-      metadataPutChunk.addChunkId(chunk.chunkBlobId, chunk.chunkIndex);
+      metadataPutChunk.addChunkId(chunk.chunkBlobId, chunk.chunkBlobSize, chunk.chunkIndex);
       metadataPutChunk.maybeNotifyForChunkCreation(chunk);
     } else {
       blobId = chunk.getChunkBlobId();
@@ -496,7 +503,7 @@ class PutOperation {
     if (chunk.chunkBlobProperties.isEncrypted()) {
       routerMetrics.putEncryptedChunkOperationLatencyMs.update(operationLatencyMs);
     } else {
-      routerMetrics.putChunkOperationLatencyMs.update(operationLatencyMs);
+      routerMetrics.putChunkOperationLatencyMs.update(operationLatencyMs, TimeUnit.MILLISECONDS);
     }
     chunk.clear();
   }
@@ -678,7 +685,7 @@ class PutOperation {
         break;
       }
     }
-    if (chunkToReturn == null && putChunks.size() < NonBlockingRouter.MAX_IN_MEM_CHUNKS) {
+    if (chunkToReturn == null && putChunks.size() < routerConfig.routerMaxInMemPutChunks) {
       chunkToReturn = new PutChunk();
       putChunks.add(chunkToReturn);
     }
@@ -793,6 +800,15 @@ class PutOperation {
   }
 
   /**
+   * This will return a view of the correlation IDs of requests that may still be in flight. This is not threadsafe
+   * and should only be called from the main event loop.
+   * @return the set of correlation IDs of requests that are still in flight.
+   */
+  Set<Integer> getInFlightCorrelationIds() {
+    return Collections.unmodifiableSet(correlationIdToPutChunk.keySet());
+  }
+
+  /**
    * If this is a composite object, fill the list with chunk IDs successfully created by this operation.
    * This does not include IDs being stitched together by a stitchBlob call.
    * @return the list of successfully put chunk ids if this is a composite object and not a stitch operation, empty list
@@ -810,7 +826,7 @@ class PutOperation {
   private boolean isComposite() {
     // If the overall operation failed, we treat the successfully put chunks as part of a composite blob.
     boolean operationFailed = blobId == null || getOperationException() != null;
-    return operationFailed || metadataPutChunk.indexToChunkIds.size() > 1 || isStitchOperation();
+    return operationFailed || metadataPutChunk.indexToChunkIdsAndChunkSizes.size() > 1 || isStitchOperation();
   }
 
   /**
@@ -1097,8 +1113,8 @@ class PutOperation {
             passedInBlobProperties.getCreationTimeInMs(), passedInBlobProperties.getAccountId(),
             passedInBlobProperties.getContainerId(), passedInBlobProperties.isEncrypted(),
             passedInBlobProperties.getExternalAssetTag());
-        operationTracker = new SimpleOperationTracker(routerConfig.routerDatacenterName, partitionId, false, null, true,
-            Integer.MAX_VALUE, routerConfig.routerPutSuccessTarget, routerConfig.routerPutRequestParallelism);
+        operationTracker =
+            new SimpleOperationTracker(routerConfig, RouterOperation.PutOperation, partitionId, null, true);
         correlationIdToChunkPutRequestInfo.clear();
         state = ChunkState.Ready;
       } catch (RouterException e) {
@@ -1244,7 +1260,7 @@ class PutOperation {
      */
     void poll(RequestRegistrationCallback<PutOperation> requestRegistrationCallback) {
       maybeFreeDefunctBuffers();
-      cleanupExpiredInFlightRequests();
+      cleanupExpiredInFlightRequests(requestRegistrationCallback);
       checkAndMaybeComplete();
       if (!isComplete()) {
         fetchRequests(requestRegistrationCallback);
@@ -1253,20 +1269,25 @@ class PutOperation {
 
     /**
      * Clean up requests sent out by this operation that have now timed out.
+     * @param requestRegistrationCallback The callback to use to notify the networking layer of dropped requests.
      */
-    private void cleanupExpiredInFlightRequests() {
+    private void cleanupExpiredInFlightRequests(RequestRegistrationCallback<PutOperation> requestRegistrationCallback) {
       Iterator<Map.Entry<Integer, ChunkPutRequestInfo>> inFlightRequestsIterator =
           correlationIdToChunkPutRequestInfo.entrySet().iterator();
       while (inFlightRequestsIterator.hasNext()) {
         Map.Entry<Integer, ChunkPutRequestInfo> entry = inFlightRequestsIterator.next();
-        if (time.milliseconds() - entry.getValue().startTimeMs > routerConfig.routerRequestTimeoutMs) {
-          onErrorResponse(entry.getValue().replicaId);
-          logger.trace("PutRequest with correlationId {} in flight has expired for replica {} ", entry.getKey(),
-              entry.getValue().replicaId.getDataNodeId());
+        int correlationId = entry.getKey();
+        ChunkPutRequestInfo info = entry.getValue();
+        if (time.milliseconds() - info.startTimeMs > routerConfig.routerRequestTimeoutMs) {
+          onErrorResponse(info.replicaId);
+          logger.debug("PutRequest with correlationId {} in flight has expired for replica {} ", correlationId,
+              info.replicaId.getDataNodeId());
           // Do not notify this as a failure to the response handler, as this timeout could simply be due to
           // connection unavailability. If there is indeed a network error, the NetworkClient will provide an error
           // response and the response handler will be notified accordingly.
-          chunkException = new RouterException("Timed out waiting for a response", RouterErrorCode.OperationTimedOut);
+          chunkException =
+              RouterUtils.buildTimeoutException(correlationId, info.replicaId.getDataNodeId(), chunkBlobId);
+          requestRegistrationCallback.registerRequestToDrop(correlationId);
           inFlightRequestsIterator.remove();
         } else {
           // the entries are ordered by correlation id and time. Break on the first request that has not timed out.
@@ -1285,7 +1306,7 @@ class PutOperation {
         String hostname = replicaId.getDataNodeId().getHostname();
         Port port = replicaId.getDataNodeId().getPortToConnectTo();
         PutRequest putRequest = createPutRequest();
-        RouterRequestInfo request = new RouterRequestInfo(hostname, port, putRequest, replicaId);
+        RequestInfo request = new RequestInfo(hostname, port, putRequest, replicaId);
         int correlationId = putRequest.getCorrelationId();
         correlationIdToChunkPutRequestInfo.put(correlationId,
             new ChunkPutRequestInfo(replicaId, putRequest, time.milliseconds()));
@@ -1322,16 +1343,13 @@ class PutOperation {
      * @return the chosen {@link PartitionId}
      * @throws RouterException
      */
-    protected PartitionId getPartitionForPut(String partitionClass, List<? extends PartitionId> partitionIdsToExclude)
+    protected PartitionId getPartitionForPut(String partitionClass, List<PartitionId> partitionIdsToExclude)
         throws RouterException {
-      // getWritablePartitions creates and returns a new list, so it is safe to manipulate it.
-      List<? extends PartitionId> partitions = clusterMap.getWritablePartitionIds(partitionClass);
-      partitions.removeAll(partitionIdsToExclude);
-      if (partitions.isEmpty()) {
+      PartitionId selected = clusterMap.getRandomWritablePartition(partitionClass, partitionIdsToExclude);
+      if (selected == null) {
         throw new RouterException("No writable partitions of class " + partitionClass + " available.",
             RouterErrorCode.AmbryUnavailable);
       }
-      PartitionId selected = partitions.get(ThreadLocalRandom.current().nextInt(partitions.size()));
       if (!partitionClass.equals(selected.getPartitionClass())) {
         throw new IllegalStateException(
             "Selected partition's class [" + selected.getPartitionClass() + "] is not as required: " + partitionClass);
@@ -1349,7 +1367,7 @@ class PutOperation {
      * @param putResponse the {@link PutResponse} associated with this response.
      */
     void handleResponse(ResponseInfo responseInfo, PutResponse putResponse) {
-      int correlationId = ((PutRequest) responseInfo.getRequestInfo().getRequest()).getCorrelationId();
+      int correlationId = responseInfo.getRequestInfo().getRequest().getCorrelationId();
       ChunkPutRequestInfo chunkPutRequestInfo = correlationIdToChunkPutRequestInfo.remove(correlationId);
       if (chunkPutRequestInfo == null) {
         // Ignore right away. This could mean:
@@ -1357,6 +1375,7 @@ class PutOperation {
         // - the response is for an earlier attempt of this chunk (slipped put scenario). And the map was cleared
         // before attempting the slipped put.
         // - the response is for an earlier chunk held by this PutChunk.
+        logger.debug("No matching request found for {}", correlationId);
         return;
       }
       long requestLatencyMs = time.milliseconds() - chunkPutRequestInfo.startTimeMs;
@@ -1365,13 +1384,13 @@ class PutOperation {
           requestLatencyMs);
       boolean isSuccessful;
       if (responseInfo.getError() != null) {
-        logger.trace("PutRequest with response correlationId {} timed out for replica {} ", correlationId,
+        logger.debug("PutRequest with response correlationId {} timed out for replica {} ", correlationId,
             chunkPutRequestInfo.replicaId.getDataNodeId());
         setChunkException(new RouterException("Operation timed out", RouterErrorCode.OperationTimedOut));
         isSuccessful = false;
       } else {
         if (putResponse == null) {
-          logger.trace(
+          logger.debug(
               "PutRequest with response correlationId {} received an unexpected error on response deserialization from replica {} ",
               correlationId, chunkPutRequestInfo.replicaId.getDataNodeId());
           setChunkException(new RouterException("Response deserialization received an unexpected error",
@@ -1407,7 +1426,7 @@ class PutOperation {
         }
       }
       if (isSuccessful) {
-        operationTracker.onResponse(chunkPutRequestInfo.replicaId, true);
+        operationTracker.onResponse(chunkPutRequestInfo.replicaId, TrackedRequestFinalState.SUCCESS);
         if (RouterUtils.isRemoteReplica(routerConfig, chunkPutRequestInfo.replicaId)) {
           logger.trace("Cross colo request successful for remote replica in {} ",
               chunkPutRequestInfo.replicaId.getDataNodeId().getDatacenterName());
@@ -1423,8 +1442,8 @@ class PutOperation {
      * Perform the necessary actions when a request to a replica fails.
      * @param replicaId the {@link ReplicaId} associated with the failed response.
      */
-    void onErrorResponse(ReplicaId replicaId) {
-      operationTracker.onResponse(replicaId, false);
+    private void onErrorResponse(ReplicaId replicaId) {
+      operationTracker.onResponse(replicaId, TrackedRequestFinalState.FAILURE);
       routerMetrics.routerRequestErrorCount.inc();
       routerMetrics.getDataNodeBasedMetrics(replicaId.getDataNodeId()).putRequestErrorCount.inc();
     }
@@ -1501,7 +1520,7 @@ class PutOperation {
    * on it.
    */
   private class MetadataPutChunk extends PutChunk {
-    private final TreeMap<Integer, StoreKey> indexToChunkIds;
+    private final TreeMap<Integer, Pair<StoreKey, Long>> indexToChunkIdsAndChunkSizes;
     private int intermediateChunkSize = routerConfig.routerMaxPutChunkSizeBytes;
     private Pair<? extends StoreKey, BlobProperties> firstChunkIdAndProperties = null;
 
@@ -1509,7 +1528,7 @@ class PutOperation {
      * Initialize the MetadataPutChunk.
      */
     MetadataPutChunk() {
-      indexToChunkIds = new TreeMap<>();
+      indexToChunkIdsAndChunkSizes = new TreeMap<>();
       // metadata blob is in building state.
       state = ChunkState.Building;
     }
@@ -1537,11 +1556,12 @@ class PutOperation {
 
     /**
      * Add the given blobId of a successfully put data chunk to the metadata at its position in the overall blob.
-     * @param chunkBlobId the blobId of the associated data chunk
+     * @param storeKey the blobId of the associated data chunk
+     * @param chunkSize size of the data chunk
      * @param chunkIndex the position of the associated data chunk in the overall blob.
      */
-    void addChunkId(BlobId chunkBlobId, int chunkIndex) {
-      indexToChunkIds.put(chunkIndex, chunkBlobId);
+    void addChunkId(StoreKey storeKey, long chunkSize, int chunkIndex) {
+      indexToChunkIdsAndChunkSizes.put(chunkIndex, new Pair<>(storeKey, chunkSize));
     }
 
     /**
@@ -1567,7 +1587,7 @@ class PutOperation {
      * blob is composite. If no first chunk was put successfully, this will do nothing.
      */
     void maybeNotifyForFirstChunkCreation() {
-      if (indexToChunkIds.get(0) != null) {
+      if (indexToChunkIdsAndChunkSizes.get(0) != null) {
         // reason to check for not null: there are chances that 2nd chunk would completes before the first chunk and
         // the first chunk failed later. In such cases, even though metadata chunk might return some successfully
         // completed chunkIds, the first chunk may be null
@@ -1583,7 +1603,8 @@ class PutOperation {
 
     @Override
     void poll(RequestRegistrationCallback<PutOperation> requestRegistrationCallback) {
-      if (isBuilding() && chunkFillingCompletedSuccessfully && indexToChunkIds.size() == getNumDataChunks()) {
+      if (isBuilding() && chunkFillingCompletedSuccessfully
+          && indexToChunkIdsAndChunkSizes.size() == getNumDataChunks()) {
         finalizeMetadataChunk();
       }
       if (isReady()) {
@@ -1604,12 +1625,20 @@ class PutOperation {
               passedInBlobProperties.isEncrypted(), passedInBlobProperties.getExternalAssetTag());
       if (isStitchOperation() || getNumDataChunks() > 1) {
         // values returned are in the right order as TreeMap returns them in key-order.
-        List<StoreKey> orderedChunkIdList = new ArrayList<>(indexToChunkIds.values());
-        buf = MetadataContentSerDe.serializeMetadataContent(intermediateChunkSize, getBlobSize(), orderedChunkIdList);
+        if (routerConfig.routerMetadataContentVersion == MessageFormatRecord.Metadata_Content_Version_V2) {
+          buf = MetadataContentSerDe.serializeMetadataContentV2(intermediateChunkSize, getBlobSize(),
+              getSuccessfullyPutChunkIds());
+        } else if (routerConfig.routerMetadataContentVersion == MessageFormatRecord.Metadata_Content_Version_V3) {
+          List<Pair<StoreKey, Long>> orderedChunkIdList = new ArrayList<>(indexToChunkIdsAndChunkSizes.values());
+          buf = MetadataContentSerDe.serializeMetadataContentV3(getBlobSize(), orderedChunkIdList);
+        } else {
+          throw new IllegalStateException(
+              "Unexpected metadata content version: " + routerConfig.routerMetadataContentVersion);
+        }
         onFillComplete(false);
       } else {
         // if there is only one chunk
-        blobId = (BlobId) indexToChunkIds.get(0);
+        blobId = (BlobId) indexToChunkIdsAndChunkSizes.get(0).getFirst();
         state = ChunkState.Complete;
         operationCompleted = true;
       }
@@ -1619,7 +1648,7 @@ class PutOperation {
      * @return a list of all of the successfully put chunk ids associated with this blob
      */
     List<StoreKey> getSuccessfullyPutChunkIds() {
-      return new ArrayList<>(indexToChunkIds.values());
+      return indexToChunkIdsAndChunkSizes.values().stream().map(Pair::getFirst).collect(Collectors.toList());
     }
 
     /**

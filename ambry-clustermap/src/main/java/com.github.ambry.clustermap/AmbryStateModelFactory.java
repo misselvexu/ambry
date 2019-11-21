@@ -13,25 +13,42 @@
  */
 package com.github.ambry.clustermap;
 
+import org.apache.helix.model.LeaderStandbySMD;
 import org.apache.helix.participant.statemachine.StateModel;
 import org.apache.helix.participant.statemachine.StateModelFactory;
 
 
 /**
- * A factory for creating {@link AmbryStateModel}
+ * A factory for creating {@link StateModel}.
  */
 class AmbryStateModelFactory extends StateModelFactory<StateModel> {
+  private final String ambryStateModelDef;
+  private final PartitionStateChangeListener partitionStateChangeListener;
+
+  AmbryStateModelFactory(String stateModelDef, PartitionStateChangeListener partitionStateChangeListener) {
+    ambryStateModelDef = stateModelDef;
+    this.partitionStateChangeListener = partitionStateChangeListener;
+  }
 
   /**
-   * Create and return an instance of {@link AmbryStateModel}
+   * Create and return an instance of {@link StateModel} based on given definition
    * @param resourceName the resource name for which this state model is being created.
    * @param partitionName the partition name for which this state model is being created.
-   *
-   * @return an instance of {@link AmbryStateModel}.
+   * @return an instance of {@link StateModel}.
    */
   @Override
   public StateModel createNewStateModel(String resourceName, String partitionName) {
-    return new AmbryStateModel();
+    StateModel stateModelToReturn;
+    switch (ambryStateModelDef) {
+      case AmbryStateModelDefinition.AMBRY_LEADER_STANDBY_MODEL:
+        stateModelToReturn = new AmbryPartitionStateModel(resourceName, partitionName, partitionStateChangeListener);
+        break;
+      case LeaderStandbySMD.name:
+        stateModelToReturn = new DefaultLeaderStandbyStateModel();
+        break;
+      default:
+        throw new IllegalArgumentException("Unsupported state model definition: " + ambryStateModelDef);
+    }
+    return stateModelToReturn;
   }
 }
-

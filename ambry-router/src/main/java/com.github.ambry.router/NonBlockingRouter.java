@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright 2016 LinkedIn Corp. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,6 +15,7 @@ package com.github.ambry.router;
 
 import com.github.ambry.account.AccountService;
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.config.RouterConfig;
@@ -31,10 +32,14 @@ import com.github.ambry.protocol.RequestOrResponseType;
 import com.github.ambry.store.StoreKey;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
+import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
@@ -66,11 +71,12 @@ class NonBlockingRouter implements Router {
   private final CryptoJobHandler cryptoJobHandler;
   private final AccountService accountService;
   private final Time time;
+  // Resources that need to be shut down when the router does.
+  private final List<Closeable> resourcesToClose;
 
   private static final Logger logger = LoggerFactory.getLogger(NonBlockingRouter.class);
   static final AtomicInteger currentOperationsCount = new AtomicInteger(0);
   private final AtomicInteger currentBackgroundOperationsCount = new AtomicInteger(0);
-  static final int MAX_IN_MEM_CHUNKS = 4;
   static final int SHUTDOWN_WAIT_MS = 10 * Time.MsPerSec;
   static final AtomicInteger correlationIdGenerator = new AtomicInteger(0);
 
@@ -115,6 +121,15 @@ class NonBlockingRouter implements Router {
     backgroundDeleter = new BackgroundDeleter();
     ocList.add(backgroundDeleter);
     routerMetrics.initializeNumActiveOperationsMetrics(currentOperationsCount, currentBackgroundOperationsCount);
+    resourcesToClose = new ArrayList<>();
+  }
+
+  /**
+   * Add a resource to close when the router shuts down.
+   * @param resource the resource that needs closing.
+   */
+  void addResourceToClose(Closeable resource) {
+    resourcesToClose.add(resource);
   }
 
   /**
@@ -146,14 +161,11 @@ class NonBlockingRouter implements Router {
     routerMetrics.operationQueuingRate.mark();
     try {
       if (isOpen.get()) {
-        getOperationController().getBlob(blobIdStr, internalOptions, new Callback<GetBlobResultInternal>() {
-          @Override
-          public void onCompletion(GetBlobResultInternal internalResult, Exception exception) {
-            GetBlobResult getBlobResult = internalResult == null ? null : internalResult.getBlobResult;
-            futureResult.done(getBlobResult, exception);
-            if (callback != null) {
-              callback.onCompletion(getBlobResult, exception);
-            }
+        getOperationController().getBlob(blobIdStr, internalOptions, (internalResult, exception) -> {
+          GetBlobResult getBlobResult = internalResult == null ? null : internalResult.getBlobResult;
+          futureResult.done(getBlobResult, exception);
+          if (callback != null) {
+            callback.onCompletion(getBlobResult, exception);
           }
         });
       } else {
@@ -411,6 +423,15 @@ class NonBlockingRouter implements Router {
     if (cryptoJobHandler != null) {
       cryptoJobHandler.close();
     }
+    for (Closeable resource : resourcesToClose) {
+      try {
+        resource.close();
+      } catch (IOException e) {
+        logger.error("Exception thrown on closing {}", resource.getClass().getName());
+      }
+    }
+    // close router metrics
+    routerMetrics.close();
   }
 
   /**
@@ -552,13 +573,27 @@ class NonBlockingRouter implements Router {
      */
     OperationController(String suffix, String defaultPartitionClass, AccountService accountService) throws IOException {
       networkClient = networkClientFactory.getNetworkClient();
-      // Warm up connections to dataNodes in local DC.
-      networkClient.warmUpConnections(clusterMap.getDataNodeIds()
-              .stream()
-              .filter(dataNodeId -> clusterMap.getDatacenterName(clusterMap.getLocalDatacenterId())
-                  .equals(dataNodeId.getDatacenterName()))
-              .collect(Collectors.toList()), routerConfig.routerConnectionsWarmUpPercentagePerPort,
-          routerConfig.routerConnectionsWarmUpTimeoutMs);
+      // Warm up connections to dataNodes in local and remote DCs.
+      List<ResponseInfo> responseInfos = new ArrayList<>();
+
+      String localDatacenter = clusterMap.getDatacenterName(clusterMap.getLocalDatacenterId());
+      Map<Boolean, List<DataNodeId>> localAndRemoteNodes = clusterMap.getDataNodeIds()
+          .stream()
+          .collect(Collectors.partitioningBy(dataNodeId -> localDatacenter.equals(dataNodeId.getDatacenterName())));
+      logger.info("Warming up local datacenter connections to {} nodes", localAndRemoteNodes.get(true).size());
+      networkClient.warmUpConnections(localAndRemoteNodes.get(true),
+          routerConfig.routerConnectionsLocalDcWarmUpPercentage, routerConfig.routerConnectionsWarmUpTimeoutMs,
+          responseInfos);
+      logger.info("Warming up remote datacenter connections to {} nodes", localAndRemoteNodes.get(false).size());
+      networkClient.warmUpConnections(localAndRemoteNodes.get(false),
+          routerConfig.routerConnectionsRemoteDcWarmUpPercentage, routerConfig.routerConnectionsWarmUpTimeoutMs,
+          responseInfos);
+      // Update ResponseHandler immediately if connections lost to certain nodes.
+      for (ResponseInfo responseInfo : responseInfos) {
+        if (responseInfo.getRequestInfo() == null) {
+          responseHandler.onConnectionTimeout(responseInfo.getDataNode());
+        }
+      }
       routerCallback = new RouterCallback(networkClient, backgroundDeleteRequests);
       putManager =
           new PutManager(clusterMap, responseHandler, notificationSystem, routerConfig, routerMetrics, routerCallback,
@@ -777,22 +812,22 @@ class NonBlockingRouter implements Router {
 
     /**
      * This method is used by the RequestResponseHandler thread to poll for requests to be sent
-     * @return a list of {@link RequestInfo} that contains the requests to be sent out.
+     * @param requestsToSend a list of {@link RequestInfo} that will contain the requests to be sent out.
+     * @param requestsToDrop a list of correlation IDs that will contain the IDs for requests that the network layer
+     *                       should drop.
      */
-    protected List<RequestInfo> pollForRequests() {
-      List<RequestInfo> requests = new ArrayList<>();
+    protected void pollForRequests(List<RequestInfo> requestsToSend, Set<Integer> requestsToDrop) {
       try {
-        putManager.poll(requests);
-        getManager.poll(requests);
+        putManager.poll(requestsToSend, requestsToDrop);
+        getManager.poll(requestsToSend, requestsToDrop);
         initiateBackgroundDeletes(backgroundDeleteRequests);
         backgroundDeleteRequests.clear();
-        deleteManager.poll(requests);
-        ttlUpdateManager.poll(requests);
+        deleteManager.poll(requestsToSend, requestsToDrop);
+        ttlUpdateManager.poll(requestsToSend, requestsToDrop);
       } catch (Exception e) {
         logger.error("Operation Manager poll received an unexpected error: ", e);
         routerMetrics.operationManagerPollErrorCount.inc();
       }
-      return requests;
     }
 
     /**
@@ -802,23 +837,33 @@ class NonBlockingRouter implements Router {
     protected void onResponse(List<ResponseInfo> responseInfoList) {
       for (ResponseInfo responseInfo : responseInfoList) {
         try {
-          RouterRequestInfo routerRequestInfo = (RouterRequestInfo) responseInfo.getRequestInfo();
-          RequestOrResponseType type = ((RequestOrResponse) routerRequestInfo.getRequest()).getRequestType();
-          switch (type) {
-            case PutRequest:
-              putManager.handleResponse(responseInfo);
-              break;
-            case GetRequest:
-              getManager.handleResponse(responseInfo);
-              break;
-            case DeleteRequest:
-              deleteManager.handleResponse(responseInfo);
-              break;
-            case TtlUpdateRequest:
-              ttlUpdateManager.handleResponse(responseInfo);
-              break;
-            default:
-              logger.error("Unexpected response type: " + type + " received, discarding");
+          RequestInfo requestInfo = responseInfo.getRequestInfo();
+          if (requestInfo == null) {
+            // If requestInfo is null, it means request has been failed previously due to long wait in pending requests
+            // queue. The failed request was already handled by one of the managers(PutManager, GetManager, etc). Current
+            // response comes from timed-out connection associated with previous request. Router only needs to notify
+            // responseHandler to mark the data node resource down.
+            DataNodeId dataNodeId = responseInfo.getDataNode();
+            responseHandler.onConnectionTimeout(dataNodeId);
+          } else {
+            RequestOrResponseType type = ((RequestOrResponse) requestInfo.getRequest()).getRequestType();
+            logger.debug("Handling response of type {} for {}", type, requestInfo.getRequest().getCorrelationId());
+            switch (type) {
+              case PutRequest:
+                putManager.handleResponse(responseInfo);
+                break;
+              case GetRequest:
+                getManager.handleResponse(responseInfo);
+                break;
+              case DeleteRequest:
+                deleteManager.handleResponse(responseInfo);
+                break;
+              case TtlUpdateRequest:
+                ttlUpdateManager.handleResponse(responseInfo);
+                break;
+              default:
+                logger.error("Unexpected response type: " + type + " received, discarding");
+            }
           }
         } catch (Exception e) {
           logger.error("Unexpected error received while handling a response: ", e);
@@ -840,9 +885,14 @@ class NonBlockingRouter implements Router {
       final int NETWORK_CLIENT_POLL_TIMEOUT = routerConfig.routerRequestTimeoutMs / 10;
       try {
         while (isOpen.get()) {
-          List<RequestInfo> requestInfoList = pollForRequests();
-          List<ResponseInfo> responseInfoList = networkClient.sendAndPoll(requestInfoList, NETWORK_CLIENT_POLL_TIMEOUT);
+          List<RequestInfo> requestsToSend = new ArrayList<>();
+          Set<Integer> requestsToDrop = new HashSet<>();
+          pollForRequests(requestsToSend, requestsToDrop);
+          List<ResponseInfo> responseInfoList = networkClient.sendAndPoll(requestsToSend,
+              routerConfig.routerDropRequestOnTimeout ? requestsToDrop : Collections.emptySet(),
+              NETWORK_CLIENT_POLL_TIMEOUT);
           onResponse(responseInfoList);
+          responseInfoList.forEach(ResponseInfo::release);
         }
       } catch (Throwable e) {
         logger.error("Aborting, as requestResponseHandlerThread received an unexpected error: ", e);
@@ -925,16 +975,14 @@ class NonBlockingRouter implements Router {
      * {@inheritDoc}
      */
     @Override
-    protected List<RequestInfo> pollForRequests() {
-      List<RequestInfo> requests = new ArrayList<>();
+    protected void pollForRequests(List<RequestInfo> requestsToSend, Set<Integer> requestsToDrop) {
       try {
-        getManager.poll(requests);
-        deleteManager.poll(requests);
+        getManager.poll(requestsToSend, requestsToDrop);
+        deleteManager.poll(requestsToSend, requestsToDrop);
       } catch (Exception e) {
         logger.error("Background Deleter Operation Manager poll received an unexpected error: ", e);
         routerMetrics.operationManagerPollErrorCount.inc();
       }
-      return requests;
     }
   }
 }

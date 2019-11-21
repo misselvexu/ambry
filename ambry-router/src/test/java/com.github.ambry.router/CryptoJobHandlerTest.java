@@ -69,7 +69,7 @@ public class CryptoJobHandlerTest {
     cryptoService = new GCMCryptoServiceFactory(verifiableProperties, REGISTRY).getCryptoService();
     cryptoJobHandler = new CryptoJobHandler(DEFAULT_THREAD_COUNT);
     referenceClusterMap = new MockClusterMap();
-    routerMetrics = new NonBlockingRouterMetrics(referenceClusterMap);
+    routerMetrics = new NonBlockingRouterMetrics(referenceClusterMap, null);
   }
 
   @After
@@ -542,7 +542,7 @@ public class CryptoJobHandlerTest {
     BlobId.BlobIdType type = TestUtils.RANDOM.nextBoolean() ? BlobId.BlobIdType.NATIVE : BlobId.BlobIdType.CRAFTED;
     return new BlobId(CommonTestUtils.getCurrentBlobIdVersion(), type, dc, getRandomShort(TestUtils.RANDOM),
         getRandomShort(TestUtils.RANDOM),
-        referenceClusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS).get(0), false,
+        referenceClusterMap.getRandomWritablePartition(MockClusterMap.DEFAULT_PARTITION_CLASS, null), false,
         BlobId.BlobDataType.DATACHUNK);
   }
 

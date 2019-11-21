@@ -13,8 +13,6 @@
  */
 package com.github.ambry.router;
 
-import com.codahale.metrics.Counter;
-import com.codahale.metrics.Histogram;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.ReplicaId;
@@ -53,9 +51,6 @@ abstract class GetOperation {
   protected final CryptoService cryptoService;
   protected final CryptoJobHandler cryptoJobHandler;
   protected final Time time;
-  private final Histogram localColoTracker;
-  private final Histogram crossColoTracker;
-  private final Counter pastDueCounter;
   protected volatile boolean operationCompleted = false;
   protected final AtomicReference<Exception> operationException = new AtomicReference<>();
   protected GetBlobResultInternal operationResult;
@@ -66,16 +61,13 @@ abstract class GetOperation {
 
   /**
    * Construct a GetOperation
-   * @param routerConfig the {@link RouterConfig} containing the configs for put operations.
+   * @param routerConfig the {@link RouterConfig} containing the configs for get operations.
    * @param routerMetrics The {@link NonBlockingRouterMetrics} to be used for reporting metrics.
    * @param clusterMap the {@link ClusterMap} of the cluster
    * @param responseHandler the {@link ResponseHandler} responsible for failure detection.
    * @param blobId the {@link BlobId} of the associated blob
    * @param options the {@link GetBlobOptionsInternal} associated with this operation.
    * @param getOperationCallback the callback that is to be called when the operation completes.
-   * @param localColoTracker the {@link Histogram} that tracks intra datacenter latencies for this class of requests.
-   * @param crossColoTracker the {@link Histogram} that tracks inter datacenter latencies for this class of requests.
-   * @param pastDueCounter the {@link Counter} that tracks the number of times a request is past due.
    * @param kms {@link KeyManagementService} to assist in fetching container keys for encryption or decryption
    * @param cryptoService {@link CryptoService} to assist in encryption or decryption
    * @param cryptoJobHandler {@link CryptoJobHandler} to assist in the execution of crypto jobs
@@ -84,18 +76,14 @@ abstract class GetOperation {
    */
   GetOperation(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics, ClusterMap clusterMap,
       ResponseHandler responseHandler, BlobId blobId, GetBlobOptionsInternal options,
-      Callback<GetBlobResultInternal> getOperationCallback, Histogram localColoTracker, Histogram crossColoTracker,
-      Counter pastDueCounter, KeyManagementService kms, CryptoService cryptoService, CryptoJobHandler cryptoJobHandler,
-      Time time, boolean isEncrypted) {
+      Callback<GetBlobResultInternal> getOperationCallback, KeyManagementService kms, CryptoService cryptoService,
+      CryptoJobHandler cryptoJobHandler, Time time, boolean isEncrypted) {
     this.routerConfig = routerConfig;
     this.routerMetrics = routerMetrics;
     this.clusterMap = clusterMap;
     this.responseHandler = responseHandler;
     this.options = options;
     this.getOperationCallback = getOperationCallback;
-    this.localColoTracker = localColoTracker;
-    this.crossColoTracker = crossColoTracker;
-    this.pastDueCounter = pastDueCounter;
     this.kms = kms;
     this.cryptoService = cryptoService;
     this.cryptoJobHandler = cryptoJobHandler;
@@ -196,7 +184,7 @@ abstract class GetOperation {
    * @param routerErrorCode The {@link RouterErrorCode} for which to get its precedence level.
    * @return The precedence level of the {@link RouterErrorCode}.
    */
-  private int getPrecedenceLevel(RouterErrorCode routerErrorCode) {
+  protected int getPrecedenceLevel(RouterErrorCode routerErrorCode) {
     switch (routerErrorCode) {
       case BlobAuthorizationFailure:
         return 1;
@@ -237,23 +225,22 @@ abstract class GetOperation {
   /**
    * Gets an {@link OperationTracker} based on the config and {@code partitionId}.
    * @param partitionId the {@link PartitionId} for which a tracker is required.
+   * @param datacenterId the id of datacenter in which the blob originated.
+   * @param routerOperation The type of router operation used by tracker.
    * @return an {@link OperationTracker} based on the config and {@code partitionId}.
    */
-  protected OperationTracker getOperationTracker(PartitionId partitionId, byte datacenterId) {
+  protected OperationTracker getOperationTracker(PartitionId partitionId, byte datacenterId,
+      RouterOperation routerOperation) {
     OperationTracker operationTracker;
     String trackerType = routerConfig.routerGetOperationTrackerType;
     String originatingDcName = clusterMap.getDatacenterName(datacenterId);
     if (trackerType.equals(SimpleOperationTracker.class.getSimpleName())) {
-      operationTracker = new SimpleOperationTracker(routerConfig.routerDatacenterName, partitionId,
-          routerConfig.routerGetCrossDcEnabled, originatingDcName,
-          routerConfig.routerGetIncludeNonOriginatingDcReplicas, routerConfig.routerGetReplicasRequired,
-          routerConfig.routerGetSuccessTarget, routerConfig.routerGetRequestParallelism);
+      operationTracker =
+          new SimpleOperationTracker(routerConfig, routerOperation, partitionId, originatingDcName, true);
     } else if (trackerType.equals(AdaptiveOperationTracker.class.getSimpleName())) {
-      operationTracker = new AdaptiveOperationTracker(routerConfig.routerDatacenterName, partitionId,
-          routerConfig.routerGetCrossDcEnabled, originatingDcName,
-          routerConfig.routerGetIncludeNonOriginatingDcReplicas, routerConfig.routerGetReplicasRequired,
-          routerConfig.routerGetSuccessTarget, routerConfig.routerGetRequestParallelism, time, localColoTracker,
-          crossColoTracker, pastDueCounter, routerConfig.routerLatencyToleranceQuantile);
+      operationTracker =
+          new AdaptiveOperationTracker(routerConfig, routerMetrics, routerOperation, partitionId, originatingDcName,
+              time);
     } else {
       throw new IllegalArgumentException("Unrecognized tracker type: " + trackerType);
     }

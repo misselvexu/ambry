@@ -14,7 +14,10 @@
 package com.github.ambry.router;
 
 import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.config.NetworkConfig;
+import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.network.BoundedByteBufferReceive;
+import com.github.ambry.network.BoundedNettyByteBufReceive;
 import com.github.ambry.network.NetworkMetrics;
 import com.github.ambry.network.NetworkReceive;
 import com.github.ambry.network.NetworkSend;
@@ -26,6 +29,7 @@ import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.atomic.AtomicReference;
 
 
@@ -55,7 +59,8 @@ class MockSelector extends Selector {
    * @throws IOException if {@link Selector} throws.
    */
   MockSelector(MockServerLayout serverLayout, AtomicReference<MockSelectorState> state, Time time) throws IOException {
-    super(new NetworkMetrics(new MetricRegistry()), time, null);
+    super(new NetworkMetrics(new MetricRegistry()), time, null,
+        new NetworkConfig(new VerifiableProperties(new Properties())));
     // we don't need the actual selector, close it.
     super.close();
     this.serverLayout = serverLayout;
@@ -69,7 +74,7 @@ class MockSelector extends Selector {
    * @param address The address to connect to
    * @param sendBufferSize not used.
    * @param receiveBufferSize not used.
-   * @param portType {@PortType} which represents the type of connection to establish
+   * @param portType {@link PortType} which represents the type of connection to establish
    * @return the connection id for the connection.
    */
   @Override
@@ -98,6 +103,11 @@ class MockSelector extends Selector {
   @Override
   public void poll(long timeoutMs, List<NetworkSend> sends) throws IOException {
     this.sends = sends;
+    disconnected.clear();
+    if (state.get() == MockSelectorState.FailConnectionInitiationOnPoll) {
+      disconnected.addAll(connected);
+      connected.clear();
+    }
     if (sends != null) {
       for (NetworkSend send : sends) {
         if (state.get() == MockSelectorState.ThrowExceptionOnSend) {
@@ -140,9 +150,7 @@ class MockSelector extends Selector {
    */
   @Override
   public List<String> disconnected() {
-    List<String> toReturn = disconnected;
-    disconnected = new ArrayList<String>();
-    return toReturn;
+    return this.disconnected;
   }
 
   /**
@@ -203,22 +211,31 @@ enum MockSelectorState {
   /**
    * The Good state.
    */
-  Good, /**
+  Good,
+  /**
    * A state that causes all connect calls to throw an IOException.
    */
-  ThrowExceptionOnConnect, /**
+  ThrowExceptionOnConnect,
+  /**
    * A state that causes disconnections of connections on which a send is attempted.
    */
-  DisconnectOnSend, /**
+  DisconnectOnSend,
+  /**
    * A state that causes all poll calls to throw an IOException if there is anything to send.
    */
-  ThrowExceptionOnSend, /**
+  ThrowExceptionOnSend,
+  /**
    * A state that causes all poll calls to throw an IOException regardless of whether there are sends to perform or
    * not.
    */
-  ThrowExceptionOnAllPoll, /**
+  ThrowExceptionOnAllPoll,
+  /**
    * Throw a throwable during poll that sends.
    */
   ThrowThrowableOnSend,
+  /**
+   * A state that causes all connections initiated to fail during poll.
+   */
+  FailConnectionInitiationOnPoll
 }
 

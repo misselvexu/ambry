@@ -26,14 +26,12 @@ import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.protocol.PutRequest;
 import com.github.ambry.protocol.PutResponse;
-import com.github.ambry.protocol.RequestOrResponse;
 import com.github.ambry.utils.ByteBufferChannel;
-import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.MockTime;
+import com.github.ambry.utils.NettyByteBufDataInputStream;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
-import java.io.DataInputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -50,24 +48,12 @@ import org.junit.Test;
 public class PutOperationTest {
   private final RouterConfig routerConfig;
   private final MockClusterMap mockClusterMap = new MockClusterMap();
-  private final NonBlockingRouterMetrics routerMetrics = new NonBlockingRouterMetrics(mockClusterMap);
+  private final NonBlockingRouterMetrics routerMetrics = new NonBlockingRouterMetrics(mockClusterMap, null);
   private final Time time;
   private final Map<Integer, PutOperation> correlationIdToPutOperation = new TreeMap<>();
   private final MockServer mockServer = new MockServer(mockClusterMap, "");
-
-  private class PutTestRequestRegistrationCallbackImpl implements RequestRegistrationCallback<PutOperation> {
-    private List<RequestInfo> requestListToFill;
-
-    @Override
-    public void registerRequestToSend(PutOperation putOperation, RequestInfo requestInfo) {
-      requestListToFill.add(requestInfo);
-      correlationIdToPutOperation.put(((RequestOrResponse) requestInfo.getRequest()).getCorrelationId(), putOperation);
-    }
-  }
-
-  private final PutTestRequestRegistrationCallbackImpl requestRegistrationCallback =
-      new PutTestRequestRegistrationCallbackImpl();
-
+  private final RequestRegistrationCallback<PutOperation> requestRegistrationCallback =
+      new RequestRegistrationCallback<>(correlationIdToPutOperation);
   private final int chunkSize = 10;
   private final int requestParallelism = 3;
   private final int successTarget = 1;
@@ -91,7 +77,7 @@ public class PutOperationTest {
    */
   @Test
   public void testSendIncomplete() throws Exception {
-    int numChunks = NonBlockingRouter.MAX_IN_MEM_CHUNKS + 1;
+    int numChunks = routerConfig.routerMaxInMemPutChunks + 1;
     BlobProperties blobProperties =
         new BlobProperties(-1, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
             Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), false, null);
@@ -108,16 +94,16 @@ public class PutOperationTest {
             MockClusterMap.DEFAULT_PARTITION_CLASS);
     op.startOperation();
     List<RequestInfo> requestInfos = new ArrayList<>();
-    requestRegistrationCallback.requestListToFill = requestInfos;
+    requestRegistrationCallback.setRequestsToSend(requestInfos);
     // Since this channel is in memory, one call to fill chunks would end up filling the maximum number of PutChunks.
     op.fillChunks();
     Assert.assertTrue("ReadyForPollCallback should have been invoked as chunks were fully filled",
         mockNetworkClient.getAndClearWokenUpStatus());
     // A poll should therefore return requestParallelism number of requests from each chunk
     op.poll(requestRegistrationCallback);
-    Assert.assertEquals(NonBlockingRouter.MAX_IN_MEM_CHUNKS * requestParallelism, requestInfos.size());
+    Assert.assertEquals(routerConfig.routerMaxInMemPutChunks * requestParallelism, requestInfos.size());
 
-    // There are MAX_IN_MEM_CHUNKS + 1 data chunks for this blob (and a metadata chunk).
+    // There are routerMaxInMemPutChunks + 1 data chunks for this blob (and a metadata chunk).
     // Once the first chunk is completely sent out, the first PutChunk will be reused. What the test verifies is that
     // the buffer of the first PutChunk does not get reused. It does this as follows:
     // For the first chunk,
@@ -130,8 +116,9 @@ public class PutOperationTest {
     // 1.
     ResponseInfo responseInfo = getResponseInfo(requestInfos.get(0));
     PutResponse putResponse = responseInfo.getError() == null ? PutResponse.readFrom(
-        new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse()))) : null;
+        Utils.createDataInputStreamFromBuffer(responseInfo.getResponse())) : null;
     op.handleResponse(responseInfo, putResponse);
+    responseInfo.release();
     // 2.
     PutRequest putRequest = (PutRequest) requestInfos.get(1).getRequest();
     ByteBuffer buf = ByteBuffer.allocate((int) putRequest.sizeInBytes());
@@ -148,8 +135,9 @@ public class PutOperationTest {
     for (int i = 3; i < requestInfos.size(); i++) {
       responseInfo = getResponseInfo(requestInfos.get(i));
       putResponse = responseInfo.getError() == null ? PutResponse.readFrom(
-          new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse()))) : null;
+          Utils.createDataInputStreamFromBuffer(responseInfo.getResponse())) : null;
       op.handleResponse(responseInfo, putResponse);
+      responseInfo.release();
     }
     // fill the first PutChunk with the last chunk.
     op.fillChunks();
@@ -176,8 +164,9 @@ public class PutOperationTest {
     for (int i = 0; i < requestInfos.size(); i++) {
       responseInfo = getResponseInfo(requestInfos.get(i));
       putResponse = responseInfo.getError() == null ? PutResponse.readFrom(
-          new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse()))) : null;
+          Utils.createDataInputStreamFromBuffer(responseInfo.getResponse())) : null;
       op.handleResponse(responseInfo, putResponse);
+      responseInfo.release();
     }
     requestInfos.clear();
     // this should return requests for the metadata chunk
@@ -187,8 +176,9 @@ public class PutOperationTest {
     // once the metadata request succeeds, it should complete the operation.
     responseInfo = getResponseInfo(requestInfos.get(0));
     putResponse = responseInfo.getError() == null ? PutResponse.readFrom(
-        new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse()))) : null;
+        Utils.createDataInputStreamFromBuffer(responseInfo.getResponse())) : null;
     op.handleResponse(responseInfo, putResponse);
+    responseInfo.release();
     Assert.assertTrue("Operation should be complete at this time", op.isOperationComplete());
   }
 
@@ -199,7 +189,7 @@ public class PutOperationTest {
    */
   @Test
   public void testSetOperationExceptionAndComplete() throws Exception {
-    int numChunks = NonBlockingRouter.MAX_IN_MEM_CHUNKS + 1;
+    int numChunks = routerConfig.routerMaxInMemPutChunks + 1;
     BlobProperties blobProperties =
         new BlobProperties(-1, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
             Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), false, null);
@@ -289,7 +279,7 @@ public class PutOperationTest {
    */
   private ResponseInfo getResponseInfo(RequestInfo requestInfo) throws IOException {
     NetworkReceive networkReceive = new NetworkReceive(null, mockServer.send(requestInfo.getRequest()), time);
-    return new ResponseInfo(requestInfo, null, networkReceive.getReceivedBytes().getPayload());
+    return new ResponseInfo(requestInfo, null, networkReceive.getReceivedBytes().getAndRelease());
   }
 }
 

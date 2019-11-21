@@ -21,8 +21,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 import org.json.JSONObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 
 /**
@@ -31,9 +35,11 @@ import org.json.JSONObject;
  * and reports inconsistencies in the views from the two underlying cluster managers.
  */
 class CompositeClusterManager implements ClusterMap {
+  private static final Logger LOGGER = LoggerFactory.getLogger(CompositeClusterManager.class);
   final StaticClusterManager staticClusterManager;
   final HelixClusterManager helixClusterManager;
   final HelixClusterManagerMetrics helixClusterManagerMetrics;
+  private final Logger logger = LoggerFactory.getLogger(CompositeClusterManager.class);
 
   /**
    * Construct a CompositeClusterManager instance.
@@ -41,7 +47,8 @@ class CompositeClusterManager implements ClusterMap {
    * @param helixClusterManager the {@link HelixClusterManager} instance to use for comparison of views.
    */
   CompositeClusterManager(StaticClusterManager staticClusterManager, HelixClusterManager helixClusterManager) {
-    if (staticClusterManager.getLocalDatacenterId() != helixClusterManager.getLocalDatacenterId()) {
+    if (helixClusterManager != null
+        && staticClusterManager.getLocalDatacenterId() != helixClusterManager.getLocalDatacenterId()) {
       throw new IllegalStateException(
           "Datacenter ID in the static cluster map [" + staticClusterManager.getLocalDatacenterId()
               + "] does not match the one in helix [" + helixClusterManager.getLocalDatacenterId() + "]");
@@ -59,8 +66,13 @@ class CompositeClusterManager implements ClusterMap {
     PartitionId partitionIdStatic = staticClusterManager.getPartitionIdFromStream(duplicatingInputStream);
     if (helixClusterManager != null) {
       duplicatingInputStream.reset();
-      PartitionId partitionIdDynamic = helixClusterManager.getPartitionIdFromStream(duplicatingInputStream);
-      if (!partitionIdStatic.toString().equals(partitionIdDynamic.toString())) {
+      try {
+        PartitionId partitionIdDynamic = helixClusterManager.getPartitionIdFromStream(duplicatingInputStream);
+        if (!partitionIdStatic.toString().equals(partitionIdDynamic.toString())) {
+          helixClusterManagerMetrics.getPartitionIdFromStreamMismatchCount.inc();
+        }
+      } catch (IOException e) {
+        LOGGER.warn("HelixClusterManager could not deserialize partition ID that StaticClusterManager could", e);
         helixClusterManagerMetrics.getPartitionIdFromStreamMismatchCount.inc();
       }
     }
@@ -78,11 +90,42 @@ class CompositeClusterManager implements ClusterMap {
   public List<PartitionId> getWritablePartitionIds(String partitionClass) {
     List<PartitionId> staticWritablePartitionIds = staticClusterManager.getWritablePartitionIds(partitionClass);
     if (helixClusterManager != null) {
-      if (!areEqual(staticWritablePartitionIds, helixClusterManager.getWritablePartitionIds(partitionClass))) {
+      List<PartitionId> helixWritablePartitionIds = helixClusterManager.getWritablePartitionIds(partitionClass);
+      Set<String> staticWritablePartitionSet = new HashSet<>();
+      Set<String> helixWritablePartitionSet = new HashSet<>();
+      staticWritablePartitionIds.forEach(p -> staticWritablePartitionSet.add(p.toString()));
+      helixWritablePartitionIds.forEach(p -> helixWritablePartitionSet.add(p.toString()));
+      if (!staticWritablePartitionSet.equals(helixWritablePartitionSet)) {
         helixClusterManagerMetrics.getWritablePartitionIdsMismatchCount.inc();
+        Set<String> partitionsInBoth = new HashSet<>(staticWritablePartitionSet);
+        partitionsInBoth.retainAll(helixWritablePartitionSet);
+        staticWritablePartitionSet.removeAll(partitionsInBoth);
+        helixWritablePartitionSet.removeAll(partitionsInBoth);
+        staticWritablePartitionSet.forEach(
+            partition -> logger.debug("{} is writable partition in static clustermap only", partition));
+        helixWritablePartitionSet.forEach(
+            partition -> logger.debug("{} is writable partition in helix only", partition));
       }
     }
     return staticWritablePartitionIds;
+  }
+
+  /**
+   * Randomly select a writable partition from a list of writable partition ids obtained from both the underlying
+   * {@link StaticClusterManager} and the underlying {@link HelixClusterManager}. This implementation can add to put
+   * latency because getWritablePartitionIds called within this method, scans all the partitions to get writable paritions.
+   * However, since {@link CompositeClusterManager} is used only during migrations, when both static and helix cluster
+   * managers co-exist, the latency can be a acceptable trade off for the extra metrics obtained from
+   * getWritablePartitionIds.
+   * @param partitionClass the partition class whose writable partitions are required. Can be {@code null}
+   * @param partitionsToExclude A list of partitions that should be excluded from consideration.
+   * @return A writable partition id object. Can be {@code null}
+   */
+  @Override
+  public PartitionId getRandomWritablePartition(String partitionClass, List<PartitionId> partitionsToExclude) {
+    List<? extends PartitionId> partitions = getWritablePartitionIds(partitionClass);
+    partitions.removeAll(partitionsToExclude);
+    return partitions.isEmpty() ? null : partitions.get(ThreadLocalRandom.current().nextInt(partitions.size()));
   }
 
   /**
@@ -129,7 +172,7 @@ class CompositeClusterManager implements ClusterMap {
   @Override
   public String getDatacenterName(byte id) {
     String dcName = staticClusterManager.getDatacenterName(id);
-    if (helixClusterManager != null && !dcName.equals(helixClusterManager.getDatacenterName(id))) {
+    if (helixClusterManager != null && !Objects.equals(dcName, helixClusterManager.getDatacenterName(id))) {
       helixClusterManagerMetrics.getDatacenterNameMismatchCount.inc();
     }
     return dcName;
@@ -151,7 +194,8 @@ class CompositeClusterManager implements ClusterMap {
     DataNodeId staticDataNode = staticClusterManager.getDataNodeId(hostname, port);
     if (helixClusterManager != null) {
       DataNodeId helixDataNode = helixClusterManager.getDataNodeId(hostname, port);
-      if (!staticDataNode.toString().equals(helixDataNode.toString())) {
+      if (!Objects.equals(staticDataNode != null ? staticDataNode.toString() : null,
+          helixDataNode != null ? helixDataNode.toString() : null)) {
         helixClusterManagerMetrics.getDataNodeIdMismatchCount.inc();
       }
     }
@@ -241,6 +285,11 @@ class CompositeClusterManager implements ClusterMap {
     // returns the snapshot of the clustermap that will actually be used i.e. static. It is not required or correct to
     // expect the snapshots from static and helix to match
     return staticClusterManager.getSnapshot();
+  }
+
+  @Override
+  public ReplicaId getBootstrapReplica(String partitionIdStr, DataNodeId dataNodeId) {
+    return helixClusterManager.getBootstrapReplica(partitionIdStr, dataNodeId);
   }
 
   @Override

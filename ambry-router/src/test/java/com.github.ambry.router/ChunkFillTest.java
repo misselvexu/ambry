@@ -135,7 +135,7 @@ public class ChunkFillTest {
     VerifiableProperties vProps = getNonBlockingRouterProperties();
     MockClusterMap mockClusterMap = new MockClusterMap();
     RouterConfig routerConfig = new RouterConfig(vProps);
-    NonBlockingRouterMetrics routerMetrics = new NonBlockingRouterMetrics(mockClusterMap);
+    NonBlockingRouterMetrics routerMetrics = new NonBlockingRouterMetrics(mockClusterMap, routerConfig);
     short accountId = Utils.getRandomShort(random);
     short containerId = Utils.getRandomShort(random);
     BlobProperties putBlobProperties =
@@ -234,7 +234,7 @@ public class ChunkFillTest {
     VerifiableProperties vProps = getNonBlockingRouterProperties();
     MockClusterMap mockClusterMap = new MockClusterMap();
     RouterConfig routerConfig = new RouterConfig(vProps);
-    routerMetrics = new NonBlockingRouterMetrics(mockClusterMap);
+    routerMetrics = new NonBlockingRouterMetrics(mockClusterMap, routerConfig);
     ResponseHandler responseHandler = new ResponseHandler(mockClusterMap);
     short accountId = Utils.getRandomShort(random);
     short containerId = Utils.getRandomShort(random);
@@ -273,7 +273,7 @@ public class ChunkFillTest {
     int chunksLeftToBeFilled = numChunks;
     do {
       if (testEncryption) {
-        int chunksPerBatch = Math.min(NonBlockingRouter.MAX_IN_MEM_CHUNKS, chunksLeftToBeFilled);
+        int chunksPerBatch = Math.min(routerConfig.routerMaxInMemPutChunks, chunksLeftToBeFilled);
         CountDownLatch onPollLatch = new CountDownLatch(chunksPerBatch);
         routerCallback.setOnPollLatch(onPollLatch);
         op.fillChunks();

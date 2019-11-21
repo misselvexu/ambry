@@ -13,6 +13,8 @@
  */
 package com.github.ambry.network;
 
+import com.github.ambry.config.NetworkConfig;
+import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.Time;
 import java.io.IOException;
 import java.net.SocketAddress;
@@ -35,13 +37,16 @@ public abstract class Transmission {
   protected SelectionKey key = null;
   protected final Time time;
   protected final NetworkMetrics metrics;
+  protected long sendCompleteTime;
+  protected NetworkConfig config;
 
   public Transmission(String connectionId, SocketChannel socketChannel, SelectionKey key, Time time,
-      NetworkMetrics metrics) {
+      NetworkConfig config, NetworkMetrics metrics) {
     this.connectionId = connectionId;
     this.socketChannel = socketChannel;
     this.key = key;
     this.time = time;
+    this.config = config;
     this.metrics = metrics;
   }
 
@@ -67,6 +72,12 @@ public abstract class Transmission {
     this.networkSend = networkSend;
     metrics.sendInFlight.inc();
     key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
+  }
+
+  protected void initializeNetworkReceive() {
+    BoundedReceive boundedReceive =
+        config.networkUseNettyByteBuf ? new BoundedNettyByteBufReceive() : new BoundedByteBufferReceive();
+    networkReceive = new NetworkReceive(getConnectionId(), boundedReceive, time);
   }
 
   /**
@@ -100,12 +111,25 @@ public abstract class Transmission {
   /**
    * Actions to be taken on completion of {@link Send} in {@link NetworkSend}
    */
-  public abstract void onSendComplete();
+  public void onSendComplete() {
+    networkSend.updateServerResponseMetrics();
+    sendCompleteTime = time.milliseconds();
+    long sendTimeMs = sendCompleteTime - networkSend.getSendStartTimeInMs();
+    metrics.transmissionSendAllTime.update(sendTimeMs);
+    double sendBytesRate = networkSend.getPayload().sizeInBytes() / ((double) sendTimeMs / SystemTime.MsPerSec);
+    metrics.transmissionSendBytesRate.mark((long) sendBytesRate);
+  }
 
   /**
-   * Actions to be taken on completion of {@link BoundedByteBufferReceive} in {@link NetworkReceive}
+   * Actions to be taken on completion of {@link BoundedReceive} in {@link NetworkReceive}
    */
-  public abstract void onReceiveComplete();
+  public void onReceiveComplete() {
+    long receiveTimeMs = time.milliseconds() - networkReceive.getReceiveStartTimeInMs();
+    metrics.transmissionReceiveAllTime.update(receiveTimeMs);
+    double receiveBytesRate =
+        networkReceive.getReceivedBytes().sizeRead() / ((double) receiveTimeMs / SystemTime.MsPerSec);
+    metrics.transmissionReceiveBytesRate.mark((long) receiveBytesRate);
+  }
 
   /**
    * Returns true if {@link NetworkReceive} is read completely
@@ -152,6 +176,12 @@ public abstract class Transmission {
 
   public void clearReceive() {
     networkReceive = null;
+  }
+
+  protected void release() {
+    if (networkReceive != null) {
+      networkReceive.getReceivedBytes().getAndRelease();
+    }
   }
 
   public NetworkReceive getNetworkReceive() {

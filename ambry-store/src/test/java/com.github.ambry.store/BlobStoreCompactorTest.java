@@ -36,6 +36,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -45,6 +46,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
+import static com.github.ambry.store.StoreTestUtils.*;
 import static org.junit.Assert.*;
 
 
@@ -61,6 +63,7 @@ public class BlobStoreCompactorTest {
   private final File tempDir;
   private final String tempDirStr;
   private final boolean doDirectIO;
+  private final StoreConfig config;
 
   private CuratedLogIndexState state = null;
   private BlobStoreCompactor compactor = null;
@@ -93,6 +96,7 @@ public class BlobStoreCompactorTest {
   public BlobStoreCompactorTest(boolean doDirectIO) throws Exception {
     tempDir = StoreTestUtils.createTempDirectory("compactorDir-" + UtilsTest.getRandomString(10));
     tempDirStr = tempDir.getAbsolutePath();
+    config = new StoreConfig(new VerifiableProperties(new Properties()));
     this.doDirectIO = doDirectIO;
     if (doDirectIO) {
       Assume.assumeTrue(Utils.isLinux());
@@ -154,7 +158,7 @@ public class BlobStoreCompactorTest {
     }
 
     // create compaction log so that resumeCompaction() thinks there is a compaction in progress
-    try (CompactionLog cLog = new CompactionLog(tempDirStr, STORE_ID, state.time, details)) {
+    try (CompactionLog cLog = new CompactionLog(tempDirStr, STORE_ID, state.time, details, config)) {
       compactor.resumeCompaction(bundleReadBuffer);
       fail("Should have failed to do anything because compactor has not been initialized");
     } catch (IllegalStateException e) {
@@ -200,7 +204,7 @@ public class BlobStoreCompactorTest {
     CompactionDetails details = new CompactionDetails(0, segmentsUnderCompaction);
 
     // create a compaction log in order to mimic a compaction being in progress
-    CompactionLog cLog = new CompactionLog(tempDirStr, STORE_ID, state.time, details);
+    CompactionLog cLog = new CompactionLog(tempDirStr, STORE_ID, state.time, details, config);
     compactor = getCompactor(state.log, DISK_IO_SCHEDULER);
     compactor.initialize(state.index);
     try {
@@ -225,7 +229,7 @@ public class BlobStoreCompactorTest {
     compactor = getCompactor(state.log, DISK_IO_SCHEDULER);
     compactor.initialize(state.index);
     assertFalse("Compaction should not be in progress", CompactionLog.isCompactionInProgress(tempDirStr, STORE_ID));
-    assertEquals("Temp log segment should not be found", 0, compactor.getSwapSegmentsInUse());
+    assertEquals("Temp log segment should not be found", 0, compactor.getSwapSegmentsInUse().length);
     try {
       compactor.resumeCompaction(bundleReadBuffer);
       fail("Should have failed because there is no compaction in progress");
@@ -1209,7 +1213,7 @@ public class BlobStoreCompactorTest {
     }
 
     assertFalse("No compaction should be in progress", CompactionLog.isCompactionInProgress(tempDirStr, STORE_ID));
-    assertEquals("Swap segments should not be found", 0, compactor.getSwapSegmentsInUse());
+    assertEquals("Swap segments should not be found", 0, compactor.getSwapSegmentsInUse().length);
     long logSegmentSizeAfterCompaction = getSumOfLogSegmentEndOffsets();
     long logSegmentCountAfterCompaction = state.index.getLogSegmentCount();
     long indexSegmentCountAfterCompaction = state.index.getIndexSegments().size();
@@ -1286,7 +1290,7 @@ public class BlobStoreCompactorTest {
     state.initIndex(null);
     compactor.initialize(state.index);
     assertEquals("Wrong number of swap segments in use",
-        tempDir.list(BlobStoreCompactor.TEMP_LOG_SEGMENTS_FILTER).length, compactor.getSwapSegmentsInUse());
+        tempDir.list(BlobStoreCompactor.TEMP_LOG_SEGMENTS_FILTER).length, compactor.getSwapSegmentsInUse().length);
     try {
       if (CompactionLog.isCompactionInProgress(tempDirStr, STORE_ID)) {
         compactor.resumeCompaction(bundleReadBuffer);
@@ -2255,8 +2259,8 @@ public class BlobStoreCompactorTest {
      */
     InterruptionInducingLog(int addSegmentCallCountToInterruptAt, int dropSegmentCallCountToInterruptAt)
         throws StoreException {
-      super(tempDirStr, state.log.getCapacityInBytes(), state.log.getSegmentCapacity(),
-          StoreTestUtils.DEFAULT_DISK_SPACE_ALLOCATOR, new StoreMetrics(new MetricRegistry()));
+      super(tempDirStr, state.log.getCapacityInBytes(), StoreTestUtils.DEFAULT_DISK_SPACE_ALLOCATOR,
+          createStoreConfig(state.log.getSegmentCapacity(), true), new StoreMetrics(new MetricRegistry()));
       // set end offsets correctly
       LogSegment original = state.log.getFirstSegment();
       while (original != null) {

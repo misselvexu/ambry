@@ -19,6 +19,7 @@ import com.github.ambry.commons.CopyingAsyncWritableChannel;
 import com.github.ambry.config.FrontendConfig;
 import com.github.ambry.messageformat.BlobInfo;
 import com.github.ambry.messageformat.BlobProperties;
+import com.github.ambry.rest.RequestPath;
 import com.github.ambry.rest.RestRequest;
 import com.github.ambry.rest.RestResponseChannel;
 import com.github.ambry.rest.RestServiceErrorCode;
@@ -33,6 +34,7 @@ import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +75,7 @@ class PostBlobHandler {
   private final Time time;
   private final FrontendConfig frontendConfig;
   private final FrontendMetrics frontendMetrics;
+  private final String clusterName;
 
   /**
    * Constructs a handler for handling requests for uploading or stitching blobs.
@@ -84,10 +87,11 @@ class PostBlobHandler {
    * @param time the {@link Time} instance to use.
    * @param frontendConfig the {@link FrontendConfig} to use.
    * @param frontendMetrics {@link FrontendMetrics} instance where metrics should be recorded.
+   * @param clusterName the name of the storage cluster that the router communicates with
    */
   PostBlobHandler(SecurityService securityService, IdConverter idConverter, IdSigningService idSigningService,
       Router router, AccountAndContainerInjector accountAndContainerInjector, Time time, FrontendConfig frontendConfig,
-      FrontendMetrics frontendMetrics) {
+      FrontendMetrics frontendMetrics, String clusterName) {
     this.securityService = securityService;
     this.idConverter = idConverter;
     this.idSigningService = idSigningService;
@@ -96,6 +100,7 @@ class PostBlobHandler {
     this.time = time;
     this.frontendConfig = frontendConfig;
     this.frontendMetrics = frontendMetrics;
+    this.clusterName = clusterName;
   }
 
   /**
@@ -137,8 +142,7 @@ class PostBlobHandler {
     private void start() {
       // Metrics initialization. Can potentially be updated after parsing blob properties.
       restRequest.getMetricsTracker()
-          .injectMetrics(
-              frontendMetrics.postRequestMetricsGroup.getRestRequestMetrics(restRequest.isSslUsed(), false));
+          .injectMetrics(frontendMetrics.postBlobMetricsGroup.getRestRequestMetrics(restRequest.isSslUsed(), false));
       try {
         // Start the callback chain by parsing blob info headers and performing request security processing.
         BlobInfo blobInfo = getBlobInfoFromRequest();
@@ -213,7 +217,7 @@ class PostBlobHandler {
      */
     private Callback<String> routerPutBlobCallback(BlobInfo blobInfo) {
       return buildCallback(frontendMetrics.postRouterPutBlobMetrics, blobId -> {
-        setSignedIdMetadataIfRequired(blobInfo.getBlobProperties());
+        setSignedIdMetadataAndBlobSize(blobInfo.getBlobProperties());
         idConverter.convert(restRequest, blobId, idConverterCallback(blobInfo));
       }, uri, LOGGER, finalCallback);
     }
@@ -248,7 +252,8 @@ class PostBlobHandler {
      */
     private BlobInfo getBlobInfoFromRequest() throws RestServiceException {
       long propsBuildStartTime = System.currentTimeMillis();
-      accountAndContainerInjector.injectAccountAndContainerForPostRequest(restRequest);
+      accountAndContainerInjector.injectAccountAndContainerForPostRequest(restRequest,
+          frontendMetrics.postBlobMetricsGroup);
       BlobProperties blobProperties = RestUtils.buildBlobProperties(restRequest.getArgs());
       Container container = RestUtils.getContainerFromArgs(restRequest.getArgs());
       if (blobProperties.getTimeToLiveInSeconds() + TimeUnit.MILLISECONDS.toSeconds(
@@ -274,8 +279,7 @@ class PostBlobHandler {
       // inject encryption frontendMetrics if applicable
       if (blobProperties.isEncrypted()) {
         restRequest.getMetricsTracker()
-            .injectMetrics(
-                frontendMetrics.postRequestMetricsGroup.getRestRequestMetrics(restRequest.isSslUsed(), true));
+            .injectMetrics(frontendMetrics.postBlobMetricsGroup.getRestRequestMetrics(restRequest.isSslUsed(), true));
       }
       byte[] userMetadata = RestUtils.buildUserMetadata(restRequest.getArgs());
       frontendMetrics.blobPropsBuildTimeInMs.update(System.currentTimeMillis() - propsBuildStartTime);
@@ -302,16 +306,18 @@ class PostBlobHandler {
      * @param blobProperties the {@link BlobProperties} from the request.
      * @throws RestServiceException
      */
-    private void setSignedIdMetadataIfRequired(BlobProperties blobProperties) throws RestServiceException {
+    private void setSignedIdMetadataAndBlobSize(BlobProperties blobProperties) throws RestServiceException {
       if (RestUtils.isChunkUpload(restRequest.getArgs())) {
         Map<String, String> metadata = new HashMap<>(2);
-        metadata.put(RestUtils.Headers.BLOB_SIZE, Long.toString(restRequest.getBytesReceived()));
+        metadata.put(RestUtils.Headers.BLOB_SIZE, Long.toString(restRequest.getBlobBytesReceived()));
         metadata.put(RestUtils.Headers.SESSION,
             RestUtils.getHeader(restRequest.getArgs(), RestUtils.Headers.SESSION, true));
         metadata.put(EXPIRATION_TIME_MS_KEY,
             Long.toString(Utils.addSecondsToEpochTime(time.milliseconds(), blobProperties.getTimeToLiveInSeconds())));
         restRequest.setArg(RestUtils.InternalKeys.SIGNED_ID_METADATA_KEY, metadata);
       }
+      //the actual blob size is the number of bytes read
+      restResponseChannel.setHeader(RestUtils.Headers.BLOB_SIZE, restRequest.getBlobBytesReceived());
     }
 
     /**
@@ -349,7 +355,11 @@ class PostBlobHandler {
       }
       List<ChunkInfo> chunksToStitch = new ArrayList<>(signedChunkIds.size());
       String expectedSession = null;
+      long totalStitchedBlobSize = 0;
       for (String signedChunkId : signedChunkIds) {
+        signedChunkId =
+            RequestPath.parse(signedChunkId, Collections.emptyMap(), frontendConfig.pathPrefixesToRemove, clusterName)
+                .getOperationOrBlobId(false);
         if (!idSigningService.isIdSigned(signedChunkId)) {
           throw new RestServiceException("All chunks IDs must be signed: " + signedChunkId,
               RestServiceErrorCode.BadRequest);
@@ -361,6 +371,8 @@ class PostBlobHandler {
         expectedSession = verifyChunkUploadSession(metadata, expectedSession);
         @SuppressWarnings("ConstantConditions")
         long chunkSizeBytes = RestUtils.getLongHeader(metadata, RestUtils.Headers.BLOB_SIZE, true);
+
+        totalStitchedBlobSize += chunkSizeBytes;
         // Expiration time is sent to the router, but not verified in this handler. The router is responsible for making
         // checks related to internal ambry requirements, like making sure that the chunks do not expire before the
         // metadata blob.
@@ -370,6 +382,8 @@ class PostBlobHandler {
 
         chunksToStitch.add(new ChunkInfo(blobId, chunkSizeBytes, expirationTimeMs));
       }
+      //the actual blob size for stitched blob is the sum of all the chunk sizes
+      restResponseChannel.setHeader(RestUtils.Headers.BLOB_SIZE, totalStitchedBlobSize);
       return chunksToStitch;
     }
 

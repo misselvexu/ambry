@@ -15,7 +15,7 @@ package com.github.ambry.clustermap;
 
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.commons.ResponseHandler;
-import com.github.ambry.commons.ServerErrorCode;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.VerifiableProperties;
 import java.net.InetAddress;
@@ -669,6 +669,17 @@ public class TestUtils {
 
     public boolean isRackAware() {
       return rackAware;
+    }
+
+    /**
+     * @return all existing nodes in hardware layout when this method is being invoked.
+     */
+    public List<DataNode> getAllExistingDataNodes() {
+      List<DataNode> dataNodes = new ArrayList<>();
+      for (Datacenter dcObj : hardwareLayout.getDatacenters()) {
+        dataNodes.addAll(dcObj.getDataNodes());
+      }
+      return Collections.unmodifiableList(dataNodes);
     }
 
     public Datacenter getRandomDatacenter() {

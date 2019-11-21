@@ -19,6 +19,8 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -32,7 +34,15 @@ public class MockDataNodeId implements DataNodeId {
   private final String datacenter;
   private List<String> sslEnabledDataCenters = new ArrayList<String>();
   private int portNum;
+  private AtomicBoolean isTimedout = new AtomicBoolean(false);
 
+  /**
+   * Create a {@link MockDataNodeId} object for disk based datanode.
+   * @param hostname Hostname of the node.
+   * @param ports Ports associated with server on node.
+   * @param mountPaths Mount paths for replicas on node.
+   * @param dataCenter Name of datacenter.
+   */
   public MockDataNodeId(String hostname, List<Port> ports, List<String> mountPaths, String dataCenter) {
     this.hostname = hostname;
     this.mountPaths = mountPaths;
@@ -41,6 +51,12 @@ public class MockDataNodeId implements DataNodeId {
     populatePorts(ports);
   }
 
+  /**
+   * Create a {@link MockDataNodeId} object from given {@code ports}, {@code mountPaths}, {@code dataCenter}.
+   * @param ports Ports associated with server on node.
+   * @param mountPaths Mount paths for replicas on node.
+   * @param dataCenter Name of datacenter.
+   */
   public MockDataNodeId(List<Port> ports, List<String> mountPaths, String dataCenter) {
     this("localhost", ports, mountPaths, dataCenter);
   }
@@ -89,11 +105,7 @@ public class MockDataNodeId implements DataNodeId {
 
   @Override
   public boolean hasSSLPort() {
-    if (ports.containsKey(PortType.SSL)) {
-      return true;
-    } else {
-      return false;
-    }
+    return ports.containsKey(PortType.SSL);
   }
 
   @Override
@@ -150,6 +162,14 @@ public class MockDataNodeId implements DataNodeId {
     return mountPaths;
   }
 
+  /**
+   * Add new mount paths to current datanode.
+   * @param pathsToAdd a list of mount paths to be added onto current node
+   */
+  public void addMountPaths(List<String> pathsToAdd) {
+    mountPaths.addAll(pathsToAdd);
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) {
@@ -174,26 +194,16 @@ public class MockDataNodeId implements DataNodeId {
     return result;
   }
 
-  @Override
-  public int compareTo(DataNodeId o) {
-    if (o == null) {
-      throw new NullPointerException("input argument null");
-    }
-
-    MockDataNodeId other = (MockDataNodeId) o;
-    int compare = (portNum < other.portNum) ? -1 : ((portNum == other.portNum) ? 0 : 1);
-    if (compare == 0) {
-      compare = hostname.compareTo(other.hostname);
-    }
-    return compare;
-  }
-
   public void onNodeTimeout() {
-    /* no-op for now */
+    isTimedout.set(true);
   }
 
   public void onNodeResponse() {
-    /* no-op for now */
+    isTimedout.set(false);
+  }
+
+  public boolean isTimedOut() {
+    return isTimedout.get();
   }
 
   @Override

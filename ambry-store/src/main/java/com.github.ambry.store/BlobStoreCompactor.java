@@ -179,7 +179,7 @@ class BlobStoreCompactor {
     }
     checkSanity(details);
     logger.info("Compaction of {} started with details {}", storeId, details);
-    compactionLog = new CompactionLog(dataDir.getAbsolutePath(), storeId, time, details);
+    compactionLog = new CompactionLog(dataDir.getAbsolutePath(), storeId, time, details, config);
     resumeCompaction(bundleReadBuffer);
   }
 
@@ -253,15 +253,15 @@ class BlobStoreCompactor {
   }
 
   /**
-   * @return the number of temporary log segment files this compactor is currently using.
+   * @return an array of temporary log segment files this compactor is currently using.
    */
-  int getSwapSegmentsInUse() throws StoreException {
+  String[] getSwapSegmentsInUse() throws StoreException {
     String[] tempSegments = dataDir.list(TEMP_LOG_SEGMENTS_FILTER);
     if (tempSegments == null) {
       throw new StoreException("Error occurred while listing files in data dir:" + dataDir.getAbsolutePath(),
           StoreErrorCodes.IOError);
     }
-    return tempSegments.length;
+    return tempSegments;
   }
 
   /**
@@ -273,7 +273,7 @@ class BlobStoreCompactor {
    */
   private void fixStateIfRequired() throws IOException, StoreException {
     if (CompactionLog.isCompactionInProgress(dataDir.getAbsolutePath(), storeId)) {
-      compactionLog = new CompactionLog(dataDir.getAbsolutePath(), storeId, storeKeyFactory, time);
+      compactionLog = new CompactionLog(dataDir.getAbsolutePath(), storeId, storeKeyFactory, time, config);
       CompactionLog.Phase phase = compactionLog.getCompactionPhase();
       logger.info("Fixing compaction state for {} (phase is {})", storeId, phase);
       switch (phase) {
@@ -339,11 +339,10 @@ class BlobStoreCompactor {
    * <p/>
    * Splits the compaction into two cycles if there aren't enough swap spaces and completes the copy for the current
    * cycle.
-   * @throws InterruptedException if the compaction was interrupted
    * @throws IOException if there were I/O errors during copying.
    * @throws StoreException if there were exceptions reading to writing to store components.
    */
-  private void copy() throws InterruptedException, IOException, StoreException {
+  private void copy() throws IOException, StoreException {
     setupState();
     List<String> logSegmentsUnderCompaction = compactionLog.getCompactionDetails().getLogSegmentsUnderCompaction();
     FileSpan duplicateSearchSpan = null;
@@ -386,8 +385,8 @@ class BlobStoreCompactor {
       long savedBytes = srcLog.getSegmentCapacity() * segmentCountDiff;
       srcMetrics.compactionBytesReclaimedCount.inc(savedBytes);
     }
-    tgtIndex.close();
-    tgtLog.close();
+    tgtIndex.close(false);
+    tgtLog.close(false);
     // persist the bloom of the "latest" index segment if it exists
     if (numSwapsUsed > 0) {
       tgtIndex.getIndexSegments().lastEntry().getValue().seal();
@@ -405,10 +404,9 @@ class BlobStoreCompactor {
    * 2. Adding them to the log segments maintained by the application log.
    * 3. Atomically switching the old set of index segments for the new ones (if not recovering).
    * @param recovering {@code true} if this function was called in the context of recovery. {@code false} otherwise.
-   * @throws IOException if there were I/O errors during committing.
    * @throws StoreException if there were exceptions reading to writing to store components.
    */
-  private void commit(boolean recovering) throws IOException, StoreException {
+  private void commit(boolean recovering) throws StoreException {
     List<String> logSegmentNames = getTargetLogSegmentNames();
     logger.debug("Target log segments are {} for {}", logSegmentNames, storeId);
     renameLogSegments(logSegmentNames);
@@ -441,11 +439,10 @@ class BlobStoreCompactor {
   /**
    * Sets up the state required for copying data by populating all the data structures, creating a log and index that
    * wraps the swap spaces and pausing hard delete in the application log.
-   * @throws InterruptedException if hard delete could not be paused.
    * @throws IOException if logs and indexes could not be set up.
    * @throws StoreException if there were exceptions reading to writing to store components.
    */
-  private void setupState() throws InterruptedException, IOException, StoreException {
+  private void setupState() throws IOException, StoreException {
     CompactionDetails details = compactionLog.getCompactionDetails();
     long highestGeneration = 0;
     for (String segmentName : details.getLogSegmentsUnderCompaction()) {
@@ -461,7 +458,7 @@ class BlobStoreCompactor {
           LogSegmentNameHelper.nameToFilename(targetSegmentName) + TEMP_LOG_SEGMENT_NAME_SUFFIX;
       File targetSegmentFile = new File(dataDir, targetSegmentFileName);
       if (targetSegmentFile.exists()) {
-        existingTargetLogSegments.add(new LogSegment(targetSegmentName, targetSegmentFile, tgtMetrics));
+        existingTargetLogSegments.add(new LogSegment(targetSegmentName, targetSegmentFile, config, tgtMetrics));
       } else {
         targetSegmentNamesAndFilenames.add(new Pair<>(targetSegmentName, targetSegmentFileName));
       }
@@ -470,8 +467,8 @@ class BlobStoreCompactor {
     long targetLogTotalCapacity = srcLog.getSegmentCapacity();
     logger.debug("Target log capacity is {} for {}. Existing log segments are {}. Future names and files are {}",
         targetLogTotalCapacity, storeId, existingTargetLogSegments, targetSegmentNamesAndFilenames);
-    tgtLog = new Log(dataDir.getAbsolutePath(), targetLogTotalCapacity, srcLog.getSegmentCapacity(), diskSpaceAllocator,
-        tgtMetrics, true, existingTargetLogSegments, targetSegmentNamesAndFilenames.iterator());
+    tgtLog = new Log(dataDir.getAbsolutePath(), targetLogTotalCapacity, diskSpaceAllocator, config, tgtMetrics, true,
+        existingTargetLogSegments, targetSegmentNamesAndFilenames.iterator());
     Journal journal = new Journal(dataDir.getAbsolutePath(), 2 * config.storeIndexMaxNumberOfInmemElements,
         config.storeMaxNumberOfEntriesToReturnFromJournal);
     tgtIndex =
@@ -1031,7 +1028,7 @@ class BlobStoreCompactor {
               } else {
                 IndexValue tgtValue = new IndexValue(srcValue.getSize(), fileSpan.getStartOffset(), srcValue.getFlags(),
                     srcValue.getExpiresAtMs(), srcValue.getOperationTimeInMs(), srcValue.getAccountId(),
-                    srcValue.getContainerId());
+                    srcValue.getContainerId(), srcValue.getLifeVersion());
                 tgtValue.setFlag(IndexValue.Flags.Delete_Index);
                 tgtValue.clearOriginalMessageOffset();
                 tgtIndex.addToIndex(new IndexEntry(srcIndexEntry.getKey(), tgtValue), fileSpan);
@@ -1042,7 +1039,7 @@ class BlobStoreCompactor {
               } else {
                 IndexValue tgtValue = new IndexValue(srcValue.getSize(), fileSpan.getStartOffset(), srcValue.getFlags(),
                     srcValue.getExpiresAtMs(), srcValue.getOperationTimeInMs(), srcValue.getAccountId(),
-                    srcValue.getContainerId());
+                    srcValue.getContainerId(), srcValue.getLifeVersion());
                 tgtValue.setFlag(IndexValue.Flags.Ttl_Update_Index);
                 tgtValue.clearOriginalMessageOffset();
                 tgtIndex.addToIndex(new IndexEntry(srcIndexEntry.getKey(), tgtValue), fileSpan);
@@ -1158,7 +1155,7 @@ class BlobStoreCompactor {
     logger.debug("Adding {} in {} to the application log", logSegmentNames, storeId);
     for (String logSegmentName : logSegmentNames) {
       File segmentFile = new File(dataDir, LogSegmentNameHelper.nameToFilename(logSegmentName));
-      LogSegment segment = new LogSegment(logSegmentName, segmentFile, srcMetrics);
+      LogSegment segment = new LogSegment(logSegmentName, segmentFile, config, srcMetrics);
       srcLog.addSegment(segment, recovering);
     }
   }

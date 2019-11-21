@@ -33,7 +33,9 @@ import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -166,6 +168,12 @@ class IndexSegment {
       endOffset = new AtomicReference<>(startOffset);
       indexSegmentFilenamePrefix = generateIndexSegmentFilenamePrefix(startOffset);
       bloomFile = new File(indexFile.getParent(), indexSegmentFilenamePrefix + BLOOM_FILE_NAME_SUFFIX);
+      if (bloomFile.exists() && config.storeIndexRebuildBloomFilterEnabled) {
+        if (!bloomFile.delete()) {
+          throw new StoreException("Could not delete bloom file named " + bloomFile, StoreErrorCodes.Unknown_Error);
+        }
+        logger.info(bloomFile + " is successfully deleted and will be rebuilt based on index segment");
+      }
       if (sealed) {
         map();
         if (!bloomFile.exists()) {
@@ -186,6 +194,9 @@ class IndexSegment {
                 bloomFile.getAbsolutePath());
           }
           stream.close();
+        }
+        if (config.storeSetFilePermissionEnabled) {
+          Utils.setFilesPermission(Arrays.asList(this.indexFile, bloomFile), config.storeDataFilePermission);
         }
       } else {
         index = new ConcurrentSkipListMap<>();
@@ -284,10 +295,17 @@ class IndexSegment {
   }
 
   /**
-   * @return the version of the {@link PersistentIndex} that this {@link IndexSegment} is based on
+   * @return the format version of the {@link PersistentIndex} that this {@link IndexSegment} is based on
    */
   short getVersion() {
     return version;
+  }
+
+  /**
+   * set the format version of the {@link PersistentIndex} that this {@link IndexSegment} is based on
+   */
+  void setVersion(short version) {
+    this.version = version;
   }
 
   /**
@@ -319,7 +337,7 @@ class IndexSegment {
         if (bloomFilter != null) {
           metrics.bloomAccessedCount.inc();
         }
-        if (bloomFilter == null || bloomFilter.isPresent(ByteBuffer.wrap(keyToFind.toBytes()))) {
+        if (bloomFilter == null || bloomFilter.isPresent(getStoreKeyBytes(keyToFind))) {
           if (bloomFilter == null) {
             logger.trace("IndexSegment {} bloom filter empty. Searching file with start offset {} and for key {}",
                 indexFile.getAbsolutePath(), startOffset, keyToFind);
@@ -328,16 +346,19 @@ class IndexSegment {
             logger.trace("IndexSegment {} found in bloom filter for index with start offset {} and for key {} ",
                 indexFile.getAbsolutePath(), startOffset, keyToFind);
           }
-          // binary search on the mapped file
-          if (!(serEntries instanceof MappedByteBuffer) || ((MappedByteBuffer) serEntries).isLoaded()) {
+          if (config.storeIndexMemState == IndexMemState.MMAP_WITH_FORCE_LOAD
+              || config.storeIndexMemState == IndexMemState.MMAP_WITHOUT_FORCE_LOAD) {
             // isLoaded() will be true only if the entire buffer is in memory - so it being false does not necessarily
             // mean that the pages in the scope of the search need to be loaded from disk.
             // Secondly, even if it returned true (or false), by the time the actual lookup is done,
             // the situation may be different.
-            metrics.mappedSegmentIsLoadedDuringFindCount.inc();
-          } else {
-            metrics.mappedSegmentIsNotLoadedDuringFindCount.inc();
+            if (((MappedByteBuffer) serEntries).isLoaded()) {
+              metrics.mappedSegmentIsLoadedDuringFindCount.inc();
+            } else {
+              metrics.mappedSegmentIsNotLoadedDuringFindCount.inc();
+            }
           }
+          // binary search on the mapped file
           ByteBuffer duplicate = serEntries.duplicate();
           int low = 0;
           int totalEntries = numberOfEntries(duplicate);
@@ -374,15 +395,30 @@ class IndexSegment {
   }
 
   /**
+   * According to config, get the {@link ByteBuffer} of {@link StoreKey} for bloom filter. The store config specifies
+   * whether to populate bloom filter with key's UUID only.
+   * @param key the store key to use in bloom filter.
+   * @return required {@link ByteBuffer} associated with the key.
+   */
+  private ByteBuffer getStoreKeyBytes(StoreKey key) {
+    return config.storeUuidBasedBloomFilterEnabled ? ByteBuffer.wrap(key.getUuidBytesArray())
+        : ByteBuffer.wrap(key.toBytes());
+  }
+
+  /**
    * Generate bloom filter by walking through all index entries in this segment and persist it.
    * @throws StoreException
    */
   private void generateBloomFilterAndPersist() throws StoreException {
     int numOfIndexEntries = numberOfEntries(serEntries);
-    bloomFilter = FilterFactory.getFilter(numOfIndexEntries, config.storeIndexBloomMaxFalsePositiveProbability);
+    // This is a workaround since we found higher than intended false positive rates with small bloom filter sizes. Note
+    // that the number of entries in each index segment varies (from hundreds to thousands), the workaround ensures bloom
+    // filter uses at least storeIndexMaxNumberOfInmemElements for creation to achieve decent performance.
+    bloomFilter = FilterFactory.getFilter(Math.max(numOfIndexEntries, config.storeIndexMaxNumberOfInmemElements),
+        config.storeIndexBloomMaxFalsePositiveProbability);
     for (int i = 0; i < numOfIndexEntries; i++) {
       StoreKey key = getKeyAt(serEntries, i);
-      bloomFilter.add(ByteBuffer.wrap(key.toBytes()));
+      bloomFilter.add(getStoreKeyBytes(key));
     }
     persistBloomFilter();
   }
@@ -399,9 +435,11 @@ class IndexSegment {
       long crcValue = crcStream.getValue();
       stream.writeLong(crcValue);
       stream.close();
+      if (config.storeSetFilePermissionEnabled) {
+        Files.setPosixFilePermissions(bloomFile.toPath(), config.storeDataFilePermission);
+      }
     } catch (IOException e) {
-      StoreErrorCodes errorCode =
-          e.getMessage().equals(StoreException.IO_ERROR_STR) ? StoreErrorCodes.IOError : StoreErrorCodes.Unknown_Error;
+      StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
       throw new StoreException(errorCode.toString() + " while trying to persist bloom filter", e, errorCode);
     }
   }
@@ -448,14 +486,11 @@ class IndexSegment {
       mmap.position(firstKeyRelativeOffset + index * persistedEntrySize);
       storeKey = factory.getStoreKey(new DataInputStream(new ByteBufferInputStream(mmap)));
     } catch (InternalError e) {
-      throw e.getMessage().equals(StoreException.INTERNAL_ERROR_STR) ? new StoreException(
-          "Internal error occurred due to unsafe memory access", e, StoreErrorCodes.IOError)
-          : new StoreException("Unknown internal error while trying to get store key", e,
-              StoreErrorCodes.Unknown_Error);
+      StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
+      throw new StoreException("Internal " + errorCode.toString() + " while trying to get store key", e, errorCode);
     } catch (IOException e) {
-      throw e.getMessage().equals(StoreException.IO_ERROR_STR) ? new StoreException(
-          "IO error while trying to get store key", e, StoreErrorCodes.IOError)
-          : new StoreException("Unknown IO error while trying to get store key", e, StoreErrorCodes.Unknown_Error);
+      StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
+      throw new StoreException(errorCode.toString() + " while trying to get store key", e, errorCode);
     } catch (Throwable t) {
       throw new StoreException("Unknown error while trying to get store key ", t, StoreErrorCodes.Unknown_Error);
     }
@@ -503,7 +538,7 @@ class IndexSegment {
       boolean isPresent = index.containsKey(entry.getKey());
       index.computeIfAbsent(entry.getKey(), key -> new ConcurrentSkipListSet<>()).add(entry.getValue());
       if (!isPresent) {
-        bloomFilter.add(ByteBuffer.wrap(entry.getKey().toBytes()));
+        bloomFilter.add(getStoreKeyBytes(entry.getKey()));
       }
       if (resetKey == null) {
         PersistentIndex.IndexEntryType type = PersistentIndex.IndexEntryType.PUT;
@@ -531,7 +566,7 @@ class IndexSegment {
       if (persistedEntrySize == ENTRY_SIZE_INVALID_VALUE) {
         StoreKey key = entry.getKey();
         persistedEntrySize =
-            getVersion() == PersistentIndex.VERSION_2 ? Math.max(config.storeIndexPersistedEntryMinBytes,
+            getVersion() >= PersistentIndex.VERSION_2 ? Math.max(config.storeIndexPersistedEntryMinBytes,
                 key.sizeInBytes() + valueSize) : key.sizeInBytes() + valueSize;
         logger.info("IndexSegment : {} setting persisted entry size to {} of key {} for index with start offset {}",
             indexFile.getAbsolutePath(), persistedEntrySize, key.getLongForm(), startOffset);
@@ -576,7 +611,7 @@ class IndexSegment {
   /**
    * Writes the index to a persistent file.
    *
-   * Those that are written in version 2 have the following format:
+   * Those that are written in version 2 and 1 have the following format:
    *
    *  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
    * | version | entrysize | valuesize | fileendpointer |  last modified time(in secs) | Reset key | Reset key type  ...
@@ -658,7 +693,7 @@ class IndexSegment {
       rwLock.readLock().lock();
       try (DataOutputStream writer = new DataOutputStream(crc)) {
         writer.writeShort(getVersion());
-        if (getVersion() == PersistentIndex.VERSION_2) {
+        if (getVersion() >= PersistentIndex.VERSION_2) {
           writer.writeInt(getPersistedEntrySize());
         } else {
           // write the key size
@@ -674,7 +709,7 @@ class IndexSegment {
         }
 
         byte[] maxPaddingBytes = null;
-        if (getVersion() == PersistentIndex.VERSION_2) {
+        if (getVersion() >= PersistentIndex.VERSION_2) {
           maxPaddingBytes = new byte[persistedEntrySize - valueSize];
         }
         for (Map.Entry<StoreKey, ConcurrentSkipListSet<IndexValue>> entry : index.entrySet()) {
@@ -682,7 +717,7 @@ class IndexSegment {
             if (value.getOffset().getOffset() + value.getSize() <= safeEndPoint.getOffset()) {
               writer.write(entry.getKey().toBytes());
               writer.write(value.getBytes().array());
-              if (getVersion() == PersistentIndex.VERSION_2) {
+              if (getVersion() >= PersistentIndex.VERSION_2) {
                 // Add padding if necessary
                 writer.write(maxPaddingBytes, 0, persistedEntrySize - (entry.getKey().sizeInBytes() + valueSize));
               }
@@ -699,9 +734,11 @@ class IndexSegment {
         fileStream.getChannel().force(true);
         // swap temp file with the original file
         temp.renameTo(getFile());
+        if (config.storeSetFilePermissionEnabled) {
+          Files.setPosixFilePermissions(getFile().toPath(), config.storeDataFilePermission);
+        }
       } catch (IOException e) {
-        StoreErrorCodes errorCode = e.getMessage().equals(StoreException.IO_ERROR_STR) ? StoreErrorCodes.IOError
-            : StoreErrorCodes.Unknown_Error;
+        StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
         throw new StoreException(
             "IndexSegment : " + indexFile.getAbsolutePath() + " encountered " + errorCode.toString()
                 + " while persisting index to disk", e, errorCode);
@@ -730,25 +767,27 @@ class IndexSegment {
   private void map() throws StoreException {
     rwLock.writeLock().lock();
     try (RandomAccessFile raf = new RandomAccessFile(indexFile, "r")) {
-      if (config.storeIndexMemState.equals(IndexMemState.IN_HEAP_MEM)) {
-        if (indexFile.length() > Integer.MAX_VALUE) {
-          throw new IllegalStateException("Configured to keep indexes in memory but index file length > IntegerMax");
-        }
-        serEntries = ByteBuffer.allocate((int) indexFile.length());
-        raf.getChannel().read(serEntries);
-      } else {
-        MappedByteBuffer buf = raf.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, indexFile.length());
-        if (config.storeIndexMemState.equals(IndexMemState.FORCE_LOAD_MMAP)) {
-          buf.load();
-        }
-        serEntries = buf;
+      switch (config.storeIndexMemState) {
+        case IN_DIRECT_MEM:
+          serEntries = readFileIntoBuffer(raf, true);
+          break;
+        case IN_HEAP_MEM:
+          serEntries = readFileIntoBuffer(raf, false);
+          break;
+        default:
+          MappedByteBuffer buf = raf.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, indexFile.length());
+          if (config.storeIndexMemState == IndexMemState.MMAP_WITH_FORCE_LOAD) {
+            buf.load();
+          }
+          serEntries = buf;
+          break;
       }
       serEntries.position(0);
-      version = serEntries.getShort();
+      setVersion(serEntries.getShort());
       StoreKey storeKey;
       int keySize;
       short resetKeyType;
-      switch (version) {
+      switch (getVersion()) {
         case PersistentIndex.VERSION_0:
           indexSizeExcludingEntries = VERSION_FIELD_LENGTH + KEY_OR_ENTRY_SIZE_FIELD_LENGTH + VALUE_SIZE_FIELD_LENGTH
               + LOG_END_OFFSET_FIELD_LENGTH + CRC_FIELD_LENGTH;
@@ -774,6 +813,7 @@ class IndexSegment {
           firstKeyRelativeOffset = indexSizeExcludingEntries - CRC_FIELD_LENGTH;
           break;
         case PersistentIndex.VERSION_2:
+        case PersistentIndex.VERSION_3:
           persistedEntrySize = serEntries.getInt();
           valueSize = serEntries.getInt();
           endOffset.set(new Offset(startOffset.getName(), serEntries.getLong()));
@@ -794,8 +834,7 @@ class IndexSegment {
     } catch (FileNotFoundException e) {
       throw new StoreException("File not found while mapping the segment of index", e, StoreErrorCodes.File_Not_Found);
     } catch (IOException e) {
-      StoreErrorCodes errorCode =
-          e.getMessage().equals(StoreException.IO_ERROR_STR) ? StoreErrorCodes.IOError : StoreErrorCodes.Unknown_Error;
+      StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
       throw new StoreException(errorCode.toString() + " while mapping the segment of index", e, errorCode);
     } finally {
       rwLock.writeLock().unlock();
@@ -814,8 +853,8 @@ class IndexSegment {
     index.clear();
     CrcInputStream crcStream = new CrcInputStream(new FileInputStream(fileToRead));
     try (DataInputStream stream = new DataInputStream(crcStream)) {
-      version = stream.readShort();
-      switch (version) {
+      setVersion(stream.readShort());
+      switch (getVersion()) {
         case PersistentIndex.VERSION_0:
         case PersistentIndex.VERSION_1:
           int keySize = stream.readInt();
@@ -825,6 +864,7 @@ class IndexSegment {
               + LOG_END_OFFSET_FIELD_LENGTH + CRC_FIELD_LENGTH;
           break;
         case PersistentIndex.VERSION_2:
+        case PersistentIndex.VERSION_3:
           persistedEntrySize = stream.readInt();
           valueSize = stream.readInt();
           indexSizeExcludingEntries = VERSION_FIELD_LENGTH + KEY_OR_ENTRY_SIZE_FIELD_LENGTH + VALUE_SIZE_FIELD_LENGTH
@@ -835,7 +875,7 @@ class IndexSegment {
               StoreErrorCodes.Index_Version_Error);
       }
       long logEndOffset = stream.readLong();
-      if (version == PersistentIndex.VERSION_0) {
+      if (getVersion() == PersistentIndex.VERSION_0) {
         lastModifiedTimeSec.set(indexFile.lastModified() / 1000);
       } else {
         lastModifiedTimeSec.set(stream.readLong());
@@ -853,10 +893,10 @@ class IndexSegment {
         StoreKey key = factory.getStoreKey(stream);
         byte[] value = new byte[valueSize];
         stream.readFully(value);
-        if (version == PersistentIndex.VERSION_2) {
+        if (getVersion() >= PersistentIndex.VERSION_2) {
           stream.readFully(padding, 0, persistedEntrySize - (key.sizeInBytes() + valueSize));
         }
-        IndexValue blobValue = new IndexValue(startOffset.getName(), ByteBuffer.wrap(value), version);
+        IndexValue blobValue = new IndexValue(startOffset.getName(), ByteBuffer.wrap(value), getVersion());
         long offsetInLogSegment = blobValue.getOffset().getOffset();
         // ignore entries that have offsets outside the log end offset that this index represents
         if (offsetInLogSegment + blobValue.getSize() <= logEndOffset) {
@@ -866,7 +906,7 @@ class IndexSegment {
               blobValue.getOffset(), blobValue.getSize());
           // regenerate the bloom filter for index segments that are not sealed
           if (!isPresent) {
-            bloomFilter.add(ByteBuffer.wrap(key.toBytes()));
+            bloomFilter.add(getStoreKeyBytes(key));
           }
           // add to the journal
           long oMsgOff = blobValue.getOriginalMessageOffset();
@@ -906,8 +946,7 @@ class IndexSegment {
             StoreErrorCodes.Index_Creation_Failure);
       }
     } catch (IOException e) {
-      StoreErrorCodes errorCode =
-          e.getMessage().equals(StoreException.IO_ERROR_STR) ? StoreErrorCodes.IOError : StoreErrorCodes.Unknown_Error;
+      StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
       throw new StoreException("IndexSegment : " + indexFile.getAbsolutePath() + " encountered " + errorCode.toString()
           + " while reading from file ", e, errorCode);
     }
@@ -1033,6 +1072,23 @@ class IndexSegment {
         iterator.remove();
       }
     }
+  }
+
+  /**
+   * Read a full {@link RandomAccessFile} into a buffer.
+   * @param file the file to read.
+   * @param useDirect {@code true} to allocate a direct buffer instead of a heap buffer.
+   * @return the buffer containing the contents of {@code file}
+   * @throws IOException on read failure.
+   */
+  private static ByteBuffer readFileIntoBuffer(RandomAccessFile file, boolean useDirect) throws IOException {
+    if (file.length() > Integer.MAX_VALUE) {
+      throw new IllegalStateException("Configured to keep indexes in memory but index file length > IntegerMax");
+    }
+    ByteBuffer buf =
+        useDirect ? ByteBuffer.allocateDirect((int) file.length()) : ByteBuffer.allocate((int) file.length());
+    file.getChannel().read(buf);
+    return buf;
   }
 
   /**

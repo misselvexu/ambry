@@ -13,8 +13,11 @@
  */
 package com.github.ambry.cloud;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.utils.Utils;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 
@@ -31,6 +34,7 @@ public class CloudBlobMetadata {
   public static final String FIELD_ENCRYPTION_ORIGIN = "encryptionOrigin";
   public static final String FIELD_VCR_KMS_CONTEXT = "vcrKmsContext";
   public static final String FIELD_CRYPTO_AGENT_FACTORY = "cryptoAgentFactory";
+  public static final String FIELD_CLOUD_BLOB_NAME = "cloudBlobName";
 
   private String id;
   private String partitionId;
@@ -44,6 +48,12 @@ public class CloudBlobMetadata {
   private EncryptionOrigin encryptionOrigin;
   private String vcrKmsContext;
   private String cryptoAgentFactory;
+  private String cloudBlobName;
+  private long encryptedSize;
+  // this field is derived from the system generated last Update Time in the cloud db
+  // and hence shouldn't be serializable.
+  @JsonIgnore
+  private long lastUpdateTime;
 
   /**
    * Possible values of encryption origin for cloud stored blobs.
@@ -57,7 +67,6 @@ public class CloudBlobMetadata {
     ROUTER,
     /** Encrypted by VCR */
     VCR
-
   }
 
   /**
@@ -73,12 +82,27 @@ public class CloudBlobMetadata {
    * @param expirationTime The blob expiration time.
    * @param size The blob size.
    * @param encryptionOrigin The blob's encryption origin.
+   */
+  public CloudBlobMetadata(BlobId blobId, long creationTime, long expirationTime, long size,
+      EncryptionOrigin encryptionOrigin) {
+    this(blobId, creationTime, expirationTime, size, encryptionOrigin, null, null, -1);
+  }
+
+  /**
+   * Constructor from {@link BlobId}.
+   * @param blobId The BlobId for metadata record.
+   * @param creationTime The blob creation time.
+   * @param expirationTime The blob expiration time.
+   * @param size The blob size.
+   * @param encryptionOrigin The blob's encryption origin.
    * @param vcrKmsContext The KMS context used to encrypt the blob.  Only used when encryptionOrigin = VCR.
    * @param cryptoAgentFactory The class name of the {@link CloudBlobCryptoAgentFactory} used to encrypt the blob.
    *                         Only used when encryptionOrigin = VCR.
+   * @param encryptedSize The size of the uploaded blob if it was encrypted and then uploaded.
+   *                      Only used when encryptionOrigin = VCR.
    */
   public CloudBlobMetadata(BlobId blobId, long creationTime, long expirationTime, long size,
-      EncryptionOrigin encryptionOrigin, String vcrKmsContext, String cryptoAgentFactory) {
+      EncryptionOrigin encryptionOrigin, String vcrKmsContext, String cryptoAgentFactory, long encryptedSize) {
     this.id = blobId.getID();
     this.partitionId = blobId.getPartition().toPathString();
     this.accountId = blobId.getAccountId();
@@ -91,6 +115,9 @@ public class CloudBlobMetadata {
     this.encryptionOrigin = encryptionOrigin;
     this.vcrKmsContext = vcrKmsContext;
     this.cryptoAgentFactory = cryptoAgentFactory;
+    this.cloudBlobName = blobId.getID();
+    this.encryptedSize = encryptedSize;
+    this.lastUpdateTime = System.currentTimeMillis();
   }
 
   /**
@@ -277,6 +304,23 @@ public class CloudBlobMetadata {
   }
 
   /**
+   * @return the blob's name in cloud.
+   */
+  public String getCloudBlobName() {
+    return cloudBlobName;
+  }
+
+  /**
+   * Sets blob's name in cloud.
+   * @param cloudBlobName the blob's name in cloud.
+   * @return this instance.
+   */
+  public CloudBlobMetadata setCloudBlobName(String cloudBlobName) {
+    this.cloudBlobName = cloudBlobName;
+    return this;
+  }
+
+  /**
    * @return the VCR crypto agent factory class name.
    */
   public String getCryptoAgentFactory() {
@@ -291,6 +335,62 @@ public class CloudBlobMetadata {
   public CloudBlobMetadata setCryptoAgentFactory(String cryptoAgentFactory) {
     this.cryptoAgentFactory = cryptoAgentFactory;
     return this;
+  }
+
+  /**
+   * @return the encrypted size of the blob if the blob was encrypted and uploaded to cloud, -1 otherwise
+   */
+  public long getEncryptedSize() {
+    return encryptedSize;
+  }
+
+  /**
+   * Sets the encrypted size of the blob
+   * @param encryptedSize
+   */
+  public CloudBlobMetadata setEncryptedSize(long encryptedSize) {
+    this.encryptedSize = encryptedSize;
+    return this;
+  }
+
+  /**
+   * @return the last update time of the blob.
+   */
+  public long getLastUpdateTime() {
+    return lastUpdateTime;
+  }
+
+  /**
+   * Sets the last update time of the blob.
+   * @param lastUpdateTime last update time.
+   */
+  public void setLastUpdateTime(long lastUpdateTime) {
+    this.lastUpdateTime = lastUpdateTime;
+  }
+
+  /**
+   * Utility to cap specified {@link CloudBlobMetadata} list by specified size of its blobs.
+   * Always returns at least one metadata object irrespective of size.
+   * @param originalList List of {@link CloudBlobMetadata}.
+   * @param size total size of metadata's blobs.
+   * @return {@link List} of {@link CloudBlobMetadata} capped by size.
+   */
+  public static List<CloudBlobMetadata> capMetadataListBySize(List<CloudBlobMetadata> originalList, long size) {
+    long totalSize = 0;
+    List<CloudBlobMetadata> cappedList = new ArrayList<>();
+    for (CloudBlobMetadata metadata : originalList) {
+      // Cap results at max size
+      if (totalSize + metadata.getSize() > size) {
+        if (cappedList.isEmpty()) {
+          // We must add at least one regardless of size
+          cappedList.add(metadata);
+        }
+        break;
+      }
+      cappedList.add(metadata);
+      totalSize += metadata.getSize();
+    }
+    return cappedList;
   }
 
   @Override

@@ -16,28 +16,37 @@ package com.github.ambry.network;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.commons.SSLFactory;
 import com.github.ambry.commons.TestSSLUtils;
+import com.github.ambry.config.NetworkConfig;
 import com.github.ambry.config.SSLConfig;
+import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Time;
+import io.netty.buffer.ByteBuf;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Properties;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicReference;
+import org.conscrypt.Conscrypt;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import static java.util.Arrays.*;
 import static org.junit.Assert.*;
 
 
+@RunWith(Parameterized.class)
 public class SSLSelectorTest {
 
   private static final int DEFAULT_SOCKET_BUF_SIZE = 4 * 1024;
@@ -46,13 +55,42 @@ public class SSLSelectorTest {
   private final EchoServer server;
   private Selector selector;
   private final File trustStoreFile;
+  private final NetworkConfig networkConfig;
 
-  public SSLSelectorTest() throws Exception {
+  @Parameterized.Parameters
+  public static List<Object[]> data() {
+    List<Object[]> params = new ArrayList<>();
+    List<String> supportedProviders = new ArrayList<>();
+    supportedProviders.add("SunJSSE");
+    if (Conscrypt.isAvailable()) {
+      supportedProviders.add("Conscrypt");
+    }
+    for (String provider : supportedProviders) {
+      for (int poolSize : new int[]{0, 2}) {
+        for (boolean useDirectBuffers : TestUtils.BOOLEAN_VALUES) {
+          params.add(new Object[]{provider, poolSize, useDirectBuffers});
+        }
+      }
+    }
+    return params;
+  }
+
+  /**
+   * @param sslContextProvider the name of the SSL library provider to use.
+   * @param poolSize the size of the worker pool for reading/writing/connecting to sockets.
+   * @param useDirectBuffers true to allocate direct buffers in {@link SSLTransmission}.
+   * @throws Exception
+   */
+  public SSLSelectorTest(String sslContextProvider, int poolSize, boolean useDirectBuffers) throws Exception {
     trustStoreFile = File.createTempFile("truststore", ".jks");
-    SSLConfig sslConfig =
-        new SSLConfig(TestSSLUtils.createSslProps("DC1,DC2,DC3", SSLFactory.Mode.SERVER, trustStoreFile, "server"));
-    SSLConfig clientSSLConfig =
-        new SSLConfig(TestSSLUtils.createSslProps("DC1,DC2,DC3", SSLFactory.Mode.CLIENT, trustStoreFile, "client"));
+    Properties serverProps = new Properties();
+    TestSSLUtils.addSSLProperties(serverProps, "DC1,DC2,DC3", SSLFactory.Mode.SERVER, trustStoreFile, "server",
+        sslContextProvider);
+    SSLConfig sslConfig = new SSLConfig(new VerifiableProperties(serverProps));
+    Properties clientProps = new Properties();
+    TestSSLUtils.addSSLProperties(clientProps, "DC1,DC2,DC3", SSLFactory.Mode.CLIENT, trustStoreFile, "client",
+        sslContextProvider);
+    SSLConfig clientSSLConfig = new SSLConfig(new VerifiableProperties(clientProps));
     SSLFactory serverSSLFactory = SSLFactory.getNewInstance(sslConfig);
     clientSSLFactory = SSLFactory.getNewInstance(clientSSLConfig);
     server = new EchoServer(serverSSLFactory, 18383);
@@ -60,7 +98,13 @@ public class SSLSelectorTest {
     applicationBufferSize = clientSSLFactory.createSSLEngine("localhost", server.port, SSLFactory.Mode.CLIENT)
         .getSession()
         .getApplicationBufferSize();
-    selector = new Selector(new NetworkMetrics(new MetricRegistry()), SystemTime.getInstance(), clientSSLFactory);
+    Properties props = new Properties();
+    props.setProperty("selector.executor.pool.size", Integer.toString(poolSize));
+    props.setProperty("selector.use.direct.buffers", Boolean.toString(useDirectBuffers));
+    VerifiableProperties vprops = new VerifiableProperties(props);
+    networkConfig = new NetworkConfig(vprops);
+    selector = new Selector(new NetworkMetrics(new MetricRegistry()), SystemTime.getInstance(), clientSSLFactory,
+        networkConfig);
   }
 
   @After
@@ -163,16 +207,17 @@ public class SSLSelectorTest {
     while (responseCount < conns) {
       // do the i/o
       selector.poll(0L, sends);
+      Thread.sleep(100);
 
       assertEquals("No disconnects should have occurred.", 0, selector.disconnected().size());
 
       // handle any responses we may have gotten
       for (NetworkReceive receive : selector.completedReceives()) {
-        String[] pieces = SelectorTest.asString(receive).split("&");
+        ByteBuffer payload = (ByteBuffer) (receive.getReceivedBytes().getAndRelease());
+        String[] pieces = SelectorTest.asString(payload).split("&");
         assertEquals("Should be in the form 'conn-counter'", 2, pieces.length);
         assertEquals("Check the source", receive.getConnectionId(), pieces[0]);
-        assertEquals("Check that the receive has kindly been rewound", 0,
-            receive.getReceivedBytes().getPayload().position());
+        assertEquals("Check that the receive has kindly been rewound", 0, payload.position());
         assertTrue("Received connectionId is as expected ", connectionIds.contains(receive.getConnectionId()));
         assertEquals("Check the request counter", 0, Integer.parseInt(pieces[1]));
         responseCount++;
@@ -291,7 +336,8 @@ public class SSLSelectorTest {
       selector.poll(1000L);
       for (NetworkReceive receive : selector.completedReceives()) {
         if (receive.getConnectionId().equals(connectionId)) {
-          return SelectorTest.asString(receive);
+          ByteBuffer payload = (ByteBuffer) (receive.getReceivedBytes().getAndRelease());
+          return SelectorTest.asString(payload);
         }
       }
     }
@@ -327,7 +373,7 @@ public class SSLSelectorTest {
     selector.close();
     NetworkMetrics metrics = new NetworkMetrics(new MetricRegistry());
     Time time = SystemTime.getInstance();
-    selector = new Selector(metrics, time, clientSSLFactory) {
+    selector = new Selector(metrics, time, clientSSLFactory, networkConfig) {
       @Override
       protected Transmission createTransmission(String connectionId, SelectionKey key, String hostname, int port,
           PortType portType, SSLFactory.Mode mode) throws IOException {
@@ -335,7 +381,7 @@ public class SSLSelectorTest {
         AtomicReference<Integer> netWriteBufSizeOverride = new AtomicReference<>(netWriteBufSizeStart);
         AtomicReference<Integer> appReadBufSizeOverride = new AtomicReference<>(appReadBufSizeStart);
         return new SSLTransmission(clientSSLFactory, connectionId, (SocketChannel) key.channel(), key, hostname, port,
-            time, metrics, mode) {
+            time, metrics, mode, networkConfig) {
           @Override
           protected int netReadBufferSize() {
             // netReadBufferSize() is invoked in SSLTransportLayer.read() prior to the read

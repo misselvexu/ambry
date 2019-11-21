@@ -23,7 +23,7 @@ import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.ByteBufferAsyncWritableChannel;
 import com.github.ambry.commons.CommonTestUtils;
-import com.github.ambry.commons.ServerErrorCode;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.utils.TestUtils;
 import java.nio.ByteBuffer;
@@ -226,8 +226,8 @@ class RouterTestHelpers {
    * @throws Exception
    */
   static void assertTtl(Router router, Collection<String> blobIds, long expectedTtlSecs) throws Exception {
-    GetBlobOptions options[] = {new GetBlobOptionsBuilder().build(), new GetBlobOptionsBuilder().operationType(
-        GetBlobOptions.OperationType.BlobInfo).build()};
+    GetBlobOptions options[] = {new GetBlobOptionsBuilder().build(),
+        new GetBlobOptionsBuilder().operationType(GetBlobOptions.OperationType.BlobInfo).build()};
     for (String blobId : blobIds) {
       for (GetBlobOptions option : options) {
         GetBlobResult result = router.getBlob(blobId, option).get(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
@@ -310,9 +310,31 @@ class RouterTestHelpers {
    * @return a new blob ID with the specified {@link BlobId.BlobDataType} and a random UUID.
    */
   private static String getRandomBlobId(ClusterMap clusterMap, BlobId.BlobDataType blobDataType) {
-    PartitionId partitionId = clusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS).get(0);
+    PartitionId partitionId = clusterMap.getRandomWritablePartition(MockClusterMap.DEFAULT_PARTITION_CLASS, null);
     return new BlobId(BLOB_ID_VERSION, BlobId.BlobIdType.NATIVE, clusterMap.getLocalDatacenterId(),
         Account.UNKNOWN_ACCOUNT_ID, Container.UNKNOWN_CONTAINER_ID, partitionId, false, blobDataType).getID();
+  }
+
+  /**
+   * Get any of the replicas from local DC or remote DC (based on the given parameter).
+   * @param blobId the id of blob that sits on the replica
+   * @param fromLocal whether to get replica from local datacenter
+   * @param localDcName the name of local datacenter
+   * @return any {@link ReplicaId} that satisfies requirement
+   */
+  static ReplicaId getAnyReplica(BlobId blobId, boolean fromLocal, String localDcName) {
+    ReplicaId replicaToReturn = null;
+    for (ReplicaId replicaId : blobId.getPartition().getReplicaIds()) {
+      if (fromLocal && replicaId.getDataNodeId().getDatacenterName().equals(localDcName)) {
+        replicaToReturn = replicaId;
+        break;
+      }
+      if (!fromLocal && !replicaId.getDataNodeId().getDatacenterName().equals(localDcName)) {
+        replicaToReturn = replicaId;
+        break;
+      }
+    }
+    return replicaToReturn;
   }
 
   /**

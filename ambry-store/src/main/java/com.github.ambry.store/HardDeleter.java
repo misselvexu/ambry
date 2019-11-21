@@ -15,6 +15,8 @@ package com.github.ambry.store;
 
 import com.codahale.metrics.Timer;
 import com.github.ambry.config.StoreConfig;
+import com.github.ambry.replication.FindToken;
+import com.github.ambry.replication.FindTokenType;
 import com.github.ambry.utils.CrcInputStream;
 import com.github.ambry.utils.CrcOutputStream;
 import com.github.ambry.utils.Time;
@@ -26,6 +28,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.channels.ReadableByteChannel;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.Iterator;
@@ -53,6 +56,7 @@ public class HardDeleter implements Runnable {
   final AtomicBoolean enabled = new AtomicBoolean(true);
   private volatile boolean awaitingAfterCaughtUp = false;
 
+  private final StoreConfig config;
   private final StoreMetrics metrics;
   private final String dataDir;
   private final Log log;
@@ -99,6 +103,7 @@ public class HardDeleter implements Runnable {
 
   HardDeleter(StoreConfig config, StoreMetrics metrics, String dataDir, Log log, PersistentIndex index,
       MessageStoreHardDelete hardDelete, StoreKeyFactory factory, DiskIOScheduler diskIOScheduler, Time time) {
+    this.config = config;
     this.metrics = metrics;
     this.dataDir = dataDir;
     this.log = log;
@@ -234,8 +239,7 @@ public class HardDeleter implements Runnable {
       }
     } catch (IOException e) {
       metrics.hardDeleteExceptionsCount.inc();
-      StoreErrorCodes errorCode =
-          e.getMessage().equals(StoreException.IO_ERROR_STR) ? StoreErrorCodes.IOError : StoreErrorCodes.Unknown_Error;
+      StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
       throw new StoreException(errorCode.toString() + " occurred while performing hard delete ", e, errorCode);
     }
       /* Now that all the blobs in the range were successfully hard deleted, the next time hard deletes can be resumed
@@ -256,7 +260,7 @@ public class HardDeleter implements Runnable {
    */
   void pruneHardDeleteRecoveryRange() {
     StoreFindToken logFlushedTillToken = (StoreFindToken) startTokenSafeToPersist;
-    if (logFlushedTillToken != null && !logFlushedTillToken.getType().equals(StoreFindToken.Type.Uninitialized)) {
+    if (logFlushedTillToken != null && !logFlushedTillToken.getType().equals(FindTokenType.Uninitialized)) {
       if (logFlushedTillToken.equals(endToken)) {
         hardDeleteRecoveryRange.clear();
       } else if (logFlushedTillToken.getStoreKey() != null) {
@@ -303,7 +307,7 @@ public class HardDeleter implements Runnable {
         FindInfo info =
             index.findDeletedEntriesSince(startToken, scanSizeInBytes, time.seconds() - messageRetentionSeconds);
         endToken = info.getFindToken();
-        logger.trace("New range for hard deletes : startToken {}, endToken for {}", startToken, info.getFindToken(),
+        logger.trace("New range for hard deletes : startToken {}, endToken {} for {}", startToken, info.getFindToken(),
             dataDir);
         pruneHardDeleteRecoveryRange();
         if (hardDeleteRecoveryRange.getSize() > 0) {
@@ -357,7 +361,7 @@ public class HardDeleter implements Runnable {
    */
   long getProgress() {
     StoreFindToken token = (StoreFindToken) startToken;
-    return token.getType().equals(StoreFindToken.Type.Uninitialized) ? 0
+    return token.getType().equals(FindTokenType.Uninitialized) ? 0
         : index.getAbsolutePositionInLogForOffset(token.getOffset());
   }
 
@@ -459,6 +463,9 @@ public class HardDeleter implements Runnable {
               "Crc check does not match for cleanup token file for dataDir " + dataDir + " aborting. ",
               StoreErrorCodes.Illegal_Index_State);
         }
+        if (config.storeSetFilePermissionEnabled) {
+          Files.setPosixFilePermissions(cleanupTokenFile.toPath(), config.storeDataFilePermission);
+        }
       } catch (IOException e) {
         hardDeleteRecoveryRange.clear();
         metrics.hardDeleteIncompleteRecoveryCount.inc();
@@ -539,9 +546,11 @@ public class HardDeleter implements Runnable {
       writer.writeLong(crcValue);
       fileStream.getChannel().force(true);
       tempFile.renameTo(actual);
+      if (config.storeSetFilePermissionEnabled) {
+        Files.setPosixFilePermissions(actual.toPath(), config.storeDataFilePermission);
+      }
     } catch (IOException e) {
-      StoreErrorCodes errorCode =
-          e.getMessage().equals(StoreException.IO_ERROR_STR) ? StoreErrorCodes.IOError : StoreErrorCodes.Unknown_Error;
+      StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
       throw new StoreException(
           errorCode.toString() + " while persisting cleanup tokens to disk " + tempFile.getAbsoluteFile(), errorCode);
     } finally {
@@ -621,8 +630,7 @@ public class HardDeleter implements Runnable {
         diskIOScheduler.getSlice(HARD_DELETE_CLEANUP_JOB_NAME, HARD_DELETE_CLEANUP_JOB_NAME, logWriteInfo.size);
       }
     } catch (IOException e) {
-      StoreErrorCodes errorCode =
-          e.getMessage().equals(StoreException.IO_ERROR_STR) ? StoreErrorCodes.IOError : StoreErrorCodes.Unknown_Error;
+      StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
       throw new StoreException(errorCode.toString() + " while performing hard delete ", e, errorCode);
     }
     logger.trace("Performed hard deletes from {} to {} for {}", startToken, endToken, dataDir);

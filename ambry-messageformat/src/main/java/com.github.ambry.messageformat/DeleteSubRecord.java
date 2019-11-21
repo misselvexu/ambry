@@ -16,6 +16,10 @@ package com.github.ambry.messageformat;
 /**
  * Contains the delete sub-record info
  */
-public class DeleteSubRecord {
+public class DeleteSubRecord implements SubRecord {
 
+  @Override
+  public Type getType() {
+    return SubRecord.Type.DELETE;
+  }
 }

@@ -16,24 +16,18 @@ package com.github.ambry.router;
 import com.codahale.metrics.Meter;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.ClusterMapUtils;
-import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.BlobIdFactory;
 import com.github.ambry.commons.ResponseHandler;
-import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.RouterConfig;
-import com.github.ambry.network.NetworkClientErrorCode;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.protocol.GetRequest;
 import com.github.ambry.protocol.GetResponse;
-import com.github.ambry.protocol.RequestOrResponse;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.store.StoreKey;
-import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Time;
-import java.io.DataInputStream;
 import java.io.IOException;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -59,7 +53,7 @@ class GetManager {
   // Requests are added before they are sent out and get cleaned up as and when responses come in.
   // Because there is a guaranteed response from the NetworkClient for every request sent out, entries
   // get cleaned up periodically.
-  private final Map<Integer, GetOperation> correlationIdToGetOperation = new HashMap<Integer, GetOperation>();
+  private final Map<Integer, GetOperation> correlationIdToGetOperation;
 
   // shared by all GetOperations
   private final ClusterMap clusterMap;
@@ -69,20 +63,9 @@ class GetManager {
   private final NonBlockingRouterMetrics routerMetrics;
   private final RouterCallback routerCallback;
 
-  private class GetRequestRegistrationCallbackImpl implements RequestRegistrationCallback<GetOperation> {
-    private List<RequestInfo> requestListToFill;
-
-    @Override
-    public void registerRequestToSend(GetOperation getOperation, RequestInfo requestInfo) {
-      requestListToFill.add(requestInfo);
-      correlationIdToGetOperation.put(((RequestOrResponse) requestInfo.getRequest()).getCorrelationId(), getOperation);
-    }
-  }
-
   // A single callback as this will never get called concurrently. The list of request to fill will be set as
   // appropriate before the callback is passed on to GetOperations, every time.
-  private final GetRequestRegistrationCallbackImpl requestRegistrationCallback =
-      new GetRequestRegistrationCallbackImpl();
+  private final RequestRegistrationCallback<GetOperation> requestRegistrationCallback;
 
   /**
    * Create a GetManager
@@ -109,7 +92,9 @@ class GetManager {
     this.cryptoService = cryptoService;
     this.cryptoJobHandler = cryptoJobHandler;
     this.time = time;
-    getOperations = Collections.newSetFromMap(new ConcurrentHashMap<GetOperation, Boolean>());
+    getOperations = ConcurrentHashMap.newKeySet();
+    correlationIdToGetOperation = new HashMap<>();
+    requestRegistrationCallback = new RequestRegistrationCallback<>(correlationIdToGetOperation);
   }
 
   /**
@@ -169,6 +154,11 @@ class GetManager {
           : routerMetrics.getBlobWithRangeOperationRate;
       blobWithRangeOperationRate.mark();
     }
+    if (options.hasBlobSegmentIdx()) {
+      Meter blobWithRangeOperationRate = isEncrypted ? routerMetrics.getEncryptedBlobWithSegmentOperationRate
+          : routerMetrics.getBlobWithSegmentOperationRate;
+      blobWithRangeOperationRate.mark();
+    }
   }
 
   /**
@@ -192,11 +182,13 @@ class GetManager {
    * thread in the {@link NonBlockingRouter} ({@link #handleResponse} gets called only if a
    * response is received for a get operation), any error handling or operation completion and cleanup also usually
    * gets done in the context of this method.
-   * @param requestListToFill list to be filled with the requests created
+   * @param requestsToSend list to be filled with the requests created
+   * @param requestsToDrop list to be filled with the requests to drop.
    */
-  void poll(List<RequestInfo> requestListToFill) {
+  void poll(List<RequestInfo> requestsToSend, Set<Integer> requestsToDrop) {
     long startTime = time.milliseconds();
-    requestRegistrationCallback.requestListToFill = requestListToFill;
+    requestRegistrationCallback.setRequestsToSend(requestsToSend);
+    requestRegistrationCallback.setRequestsToDrop(requestsToDrop);
     for (GetOperation op : getOperations) {
       try {
         op.poll(requestRegistrationCallback);
@@ -217,8 +209,16 @@ class GetManager {
    */
   void handleResponse(ResponseInfo responseInfo) {
     long startTime = time.milliseconds();
-    GetResponse getResponse = extractGetResponseAndNotifyResponseHandler(responseInfo);
-    RouterRequestInfo routerRequestInfo = (RouterRequestInfo) responseInfo.getRequestInfo();
+    GetResponse getResponse =
+        RouterUtils.extractResponseAndNotifyResponseHandler(responseHandler, routerMetrics, responseInfo,
+            stream -> GetResponse.readFrom(stream, clusterMap), response -> {
+              ServerErrorCode serverError = response.getError();
+              if (serverError == ServerErrorCode.No_Error) {
+                serverError = response.getPartitionResponseInfoList().get(0).getErrorCode();
+              }
+              return serverError;
+            }, routerConfig.routerGetBlobOperationShareMemory);
+    RequestInfo routerRequestInfo = responseInfo.getRequestInfo();
     GetRequest getRequest = (GetRequest) routerRequestInfo.getRequest();
     GetOperation getOperation = correlationIdToGetOperation.remove(getRequest.getCorrelationId());
     if (getOperations.contains(getOperation)) {
@@ -235,35 +235,6 @@ class GetManager {
     } else {
       routerMetrics.ignoredResponseCount.inc();
     }
-  }
-
-  /**
-   * Extract the {@link GetResponse} from the given {@link ResponseInfo}
-   * @param responseInfo the {@link ResponseInfo} from which the {@link GetResponse} is to be extracted.
-   * @return the extracted {@link GetResponse} if there is one; null otherwise.
-   */
-  private GetResponse extractGetResponseAndNotifyResponseHandler(ResponseInfo responseInfo) {
-    GetResponse getResponse = null;
-    ReplicaId replicaId = ((RouterRequestInfo) responseInfo.getRequestInfo()).getReplicaId();
-    NetworkClientErrorCode networkClientErrorCode = responseInfo.getError();
-    if (networkClientErrorCode == null) {
-      try {
-        getResponse = GetResponse.readFrom(new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())),
-            clusterMap);
-        ServerErrorCode serverError = getResponse.getError();
-        if (serverError == ServerErrorCode.No_Error) {
-          serverError = getResponse.getPartitionResponseInfoList().get(0).getErrorCode();
-        }
-        responseHandler.onEvent(replicaId, serverError);
-      } catch (Exception e) {
-        // Ignore. There is no value in notifying the response handler.
-        logger.error("Response deserialization received unexpected error", e);
-        routerMetrics.responseDeserializationErrorCount.inc();
-      }
-    } else {
-      responseHandler.onEvent(replicaId, networkClientErrorCode);
-    }
-    return getResponse;
   }
 
   /**

@@ -15,6 +15,7 @@ package com.github.ambry.router;
 
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.ReplicaId;
+import com.github.ambry.config.RouterConfig;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
@@ -57,40 +58,71 @@ import java.util.NoSuchElementException;
  *
  */
 class SimpleOperationTracker implements OperationTracker {
+  protected final String datacenterName;
+  protected final String originatingDcName;
   protected final int successTarget;
   protected final int parallelism;
-  protected final LinkedList<ReplicaId> replicaPool = new LinkedList<ReplicaId>();
+  protected final LinkedList<ReplicaId> replicaPool = new LinkedList<>();
 
   protected int totalReplicaCount = 0;
   protected int inflightCount = 0;
   protected int succeededCount = 0;
   protected int failedCount = 0;
 
+  // How many NotFound responses from originating dc will terminate the operation.
+  // It's decided by the success target of each mutation operations, including put, delete, update ttl etc.
+  protected int originatingDcNotFoundFailureThreshold = 0;
+  protected int originatingDcNotFoundCount = 0;
+
   private final OpTrackerIterator otIterator;
   private Iterator<ReplicaId> replicaIterator;
 
   /**
    * Constructor for an {@code SimpleOperationTracker}.
-   *
-   * @param datacenterName The datacenter where the router is located.
+   * @param routerConfig The {@link RouterConfig} containing the configs for operation tracker.
+   * @param routerOperation The {@link RouterOperation} which {@link SimpleOperationTracker} is associated with.
    * @param partitionId The partition on which the operation is performed.
-   * @param crossColoEnabled {@code true} if requests can be sent to remote replicas, {@code false}
-   *                                otherwise.
    * @param originatingDcName The original DC where blob was put.
-   * @param includeNonOriginatingDcReplicas if take the option to include remote non originating DC replicas.
-   * @param replicasRequired The number of replicas required for the operation.
-   * @param successTarget The number of successful responses required to succeed the operation.
-   * @param parallelism The maximum number of inflight requests at any point of time.
    * @param shuffleReplicas Indicates if the replicas need to be shuffled.
    */
-  SimpleOperationTracker(String datacenterName, PartitionId partitionId, boolean crossColoEnabled,
-      String originatingDcName, boolean includeNonOriginatingDcReplicas, int replicasRequired, int successTarget,
-      int parallelism, boolean shuffleReplicas) {
+  SimpleOperationTracker(RouterConfig routerConfig, RouterOperation routerOperation, PartitionId partitionId,
+      String originatingDcName, boolean shuffleReplicas) {
+    // populate tracker parameters based on operation type
+    boolean crossColoEnabled = false;
+    boolean includeNonOriginatingDcReplicas = true;
+    int numOfReplicasRequired = Integer.MAX_VALUE;
+    switch (routerOperation) {
+      case GetBlobOperation:
+      case GetBlobInfoOperation:
+        successTarget = routerConfig.routerGetSuccessTarget;
+        parallelism = routerConfig.routerGetRequestParallelism;
+        crossColoEnabled = routerConfig.routerGetCrossDcEnabled;
+        includeNonOriginatingDcReplicas = routerConfig.routerGetIncludeNonOriginatingDcReplicas;
+        numOfReplicasRequired = routerConfig.routerGetReplicasRequired;
+        break;
+      case PutOperation:
+        successTarget = routerConfig.routerPutSuccessTarget;
+        parallelism = routerConfig.routerPutRequestParallelism;
+        break;
+      case DeleteOperation:
+        successTarget = routerConfig.routerDeleteSuccessTarget;
+        parallelism = routerConfig.routerDeleteRequestParallelism;
+        crossColoEnabled = true;
+        break;
+      case TtlUpdateOperation:
+        successTarget = routerConfig.routerTtlUpdateSuccessTarget;
+        parallelism = routerConfig.routerTtlUpdateRequestParallelism;
+        crossColoEnabled = true;
+        break;
+      default:
+        throw new IllegalArgumentException("Unsupported operation: " + routerOperation);
+    }
     if (parallelism < 1) {
       throw new IllegalArgumentException("Parallelism has to be > 0. Configured to be " + parallelism);
     }
-    this.successTarget = successTarget;
-    this.parallelism = parallelism;
+    datacenterName = routerConfig.routerDatacenterName;
+    this.originatingDcName = originatingDcName;
+
     // Order the replicas so that local healthy replicas are ordered and returned first,
     // then the remote healthy ones, and finally the possibly down ones.
     List<? extends ReplicaId> replicas = partitionId.getReplicaIds();
@@ -99,13 +131,21 @@ class SimpleOperationTracker implements OperationTracker {
     if (shuffleReplicas) {
       Collections.shuffle(replicas);
     }
+    // While iterating through the replica list, count the number of replicas from the originating DC. And subtract
+    // the success target of each mutation operation to get the not found failure threshold.
+    int numReplicasInOriginatingDc = 0;
+
     // The priority here is local dc replicas, originating dc replicas, other dc replicas, down replicas.
     // To improve read-after-write performance across DC, we prefer to take local and originating replicas only,
     // which can be done by setting includeNonOriginatingDcReplicas False.
     List<ReplicaId> examinedReplicas = new ArrayList<>();
+
     for (ReplicaId replicaId : replicas) {
       examinedReplicas.add(replicaId);
       String replicaDcName = replicaId.getDataNodeId().getDatacenterName();
+      if (replicaDcName.equals(originatingDcName)) {
+        numReplicasInOriginatingDc++;
+      }
       if (!replicaId.isDown()) {
         if (replicaDcName.equals(datacenterName)) {
           replicaPool.addFirst(replicaId);
@@ -132,10 +172,10 @@ class SimpleOperationTracker implements OperationTracker {
       // Please note replicasRequired is 6 because total number of local and originating replicas is always <= 6.
       // This may no longer be true with partition classes and flexible replication.
       // Don't do this if originatingDcName is unknown.
-      while (replicaPool.size() < replicasRequired && backupReplicas.size() > 0) {
+      while (replicaPool.size() < numOfReplicasRequired && backupReplicas.size() > 0) {
         replicaPool.add(backupReplicas.pollFirst());
       }
-      while (replicaPool.size() < replicasRequired && downReplicas.size() > 0) {
+      while (replicaPool.size() < numOfReplicasRequired && downReplicas.size() > 0) {
         replicaPool.add(downReplicas.pollFirst());
       }
     }
@@ -146,26 +186,11 @@ class SimpleOperationTracker implements OperationTracker {
       throw new IllegalArgumentException(
           generateErrorMessage(partitionId, examinedReplicas, replicaPool, backupReplicasToCheck, downReplicasToCheck));
     }
+    if (routerConfig.routerOperationTrackerTerminateOnNotFoundEnabled && numReplicasInOriginatingDc > 0) {
+      this.originatingDcNotFoundFailureThreshold =
+          Math.max(numReplicasInOriginatingDc - routerConfig.routerPutSuccessTarget + 1, 0);
+    }
     this.otIterator = new OpTrackerIterator();
-  }
-
-  /**
-   * Constructor for an {@code SimpleOperationTracker}, which shuffles replicas.
-   *
-   * @param datacenterName The datacenter where the router is located.
-   * @param partitionId The partition on which the operation is performed.
-   * @param crossColoEnabled {@code true} if requests can be sent to remote replicas, {@code false} otherwise.
-   * @param originatingDcName The original DC where blob was put. null if DC unknown.
-   * @param includeNonOriginatingDcReplicas if take the option to include remote non originating DC replicas.
-   * @param replicasRequired The number of replicas required for the operation.
-   * @param successTarget The number of successful responses required to succeed the operation.
-   * @param parallelism The maximum number of inflight requests at any point of time.
-   */
-  SimpleOperationTracker(String datacenterName, PartitionId partitionId, boolean crossColoEnabled,
-      String originatingDcName, boolean includeNonOriginatingDcReplicas, int replicasRequired, int successTarget,
-      int parallelism) {
-    this(datacenterName, partitionId, crossColoEnabled, originatingDcName, includeNonOriginatingDcReplicas,
-        replicasRequired, successTarget, parallelism, true);
   }
 
   @Override
@@ -174,17 +199,30 @@ class SimpleOperationTracker implements OperationTracker {
   }
 
   @Override
+  public boolean hasFailedOnNotFound() {
+    return originatingDcNotFoundFailureThreshold > 0
+        && originatingDcNotFoundCount >= originatingDcNotFoundFailureThreshold;
+  }
+
+  @Override
   public boolean isDone() {
     return hasSucceeded() || hasFailed();
   }
 
   @Override
-  public void onResponse(ReplicaId replicaId, boolean isSuccessFul) {
+  public void onResponse(ReplicaId replicaId, TrackedRequestFinalState trackedRequestFinalState) {
     inflightCount--;
-    if (isSuccessFul) {
+    if (trackedRequestFinalState == TrackedRequestFinalState.SUCCESS) {
       succeededCount++;
     } else {
       failedCount++;
+      // NOT_FOUND is a special error. When tracker sees more than 2 NOT_FOUND from the originating DC, we can
+      // be sure the operation will end up with a NOT_FOUND error.
+      if (trackedRequestFinalState == TrackedRequestFinalState.NOT_FOUND && replicaId.getDataNodeId()
+          .getDatacenterName()
+          .equals(originatingDcName)) {
+        originatingDcNotFoundCount++;
+      }
     }
   }
 
@@ -216,11 +254,18 @@ class SimpleOperationTracker implements OperationTracker {
   }
 
   private boolean hasFailed() {
-    return (totalReplicaCount - failedCount) < successTarget;
+    return (totalReplicaCount - failedCount) < successTarget || hasFailedOnNotFound();
   }
 
   /**
-   * Helper function to catch a potential race condition in {@link SimpleOperationTracker#SimpleOperationTracker(String, PartitionId, boolean, String, boolean, int, int, int, boolean)}.
+   * @return the success target number of this operation tracker.
+   */
+  public int getSuccessTarget() {
+    return successTarget;
+  }
+
+  /**
+   * Helper function to catch a potential race condition in {@link SimpleOperationTracker#SimpleOperationTracker(RouterConfig, RouterOperation, PartitionId, String, boolean)}.
    *
    * @param partitionId The partition on which the operation is performed.
    * @param examinedReplicas All replicas examined.

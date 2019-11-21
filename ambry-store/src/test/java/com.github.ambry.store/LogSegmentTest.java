@@ -14,6 +14,8 @@
 package com.github.ambry.store;
 
 import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.config.StoreConfig;
+import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.TestUtils;
@@ -28,12 +30,18 @@ import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.file.Files;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Arrays;
+import java.util.Properties;
 import java.util.Random;
+import java.util.Set;
 import org.junit.After;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 import static org.junit.Assert.*;
+import static org.mockito.Mockito.*;
 
 
 /**
@@ -44,6 +52,7 @@ public class LogSegmentTest {
   private static final int BIG_SEGMENT_SIZE = 3 * LogSegment.BYTE_BUFFER_SIZE_FOR_APPEND;
 
   private final File tempDir;
+  private final StoreConfig config;
   private final StoreMetrics metrics;
 
   /**
@@ -53,6 +62,9 @@ public class LogSegmentTest {
   public LogSegmentTest() throws IOException {
     tempDir = Files.createTempDirectory("logSegmentDir-" + UtilsTest.getRandomString(10)).toFile();
     tempDir.deleteOnExit();
+    Properties props = new Properties();
+    props.setProperty("store.set.file.permission.enabled", Boolean.toString(true));
+    config = new StoreConfig(new VerifiableProperties(props));
     MetricRegistry metricRegistry = new MetricRegistry();
     metrics = new StoreMetrics(metricRegistry);
   }
@@ -69,6 +81,30 @@ public class LogSegmentTest {
       }
     }
     assertTrue("The directory [" + tempDir.getAbsolutePath() + "] could not be deleted", tempDir.delete());
+    validateMockitoUsage();
+  }
+
+  /**
+   * Test that the file permissions are correctly set based on permissions specified in {@link StoreConfig}.
+   * @throws Exception
+   */
+  @Test
+  public void setFilePermissionsTest() throws Exception {
+    Properties props = new Properties();
+    props.setProperty("store.set.file.permission.enabled", Boolean.toString(true));
+    props.setProperty("store.data.file.permission", "rw-rw-r--");
+    StoreConfig initialConfig = new StoreConfig(new VerifiableProperties(props));
+    File segmentFile = new File(tempDir, "test_segment");
+    assertTrue("Fail to create segment file", segmentFile.createNewFile());
+    segmentFile.deleteOnExit();
+    // create log segment instance by writing into brand new file (using initialConfig, file permission = "rw-rw-r--")
+    new LogSegment(segmentFile.getName(), segmentFile, STANDARD_SEGMENT_SIZE, initialConfig, metrics, true);
+    Set<PosixFilePermission> filePerm = Files.getPosixFilePermissions(segmentFile.toPath());
+    assertEquals("File permissions are not expected", "rw-rw-r--", PosixFilePermissions.toString(filePerm));
+    // create log segment instance by reading from existing file (using default store config, file permission = "rw-rw----")
+    new LogSegment(segmentFile.getName(), segmentFile, config, metrics);
+    filePerm = Files.getPosixFilePermissions(segmentFile.toPath());
+    assertEquals("File permissions are not expected", "rw-rw----", PosixFilePermissions.toString(filePerm));
   }
 
   /**
@@ -125,8 +161,8 @@ public class LogSegmentTest {
       // ensure flush doesn't throw any errors.
       segment.flush();
       // close and reopen segment and ensure persistence.
-      segment.close();
-      segment = new LogSegment(segmentName, new File(tempDir, segmentName), metrics);
+      segment.close(false);
+      segment = new LogSegment(segmentName, new File(tempDir, segmentName), config, metrics);
       segment.setEndOffset(writeStartOffset + buf.length);
       readAndEnsureMatch(segment, writeStartOffset, buf);
     } finally {
@@ -319,7 +355,7 @@ public class LogSegmentTest {
         }
       }
 
-      segment.close();
+      segment.close(false);
       // read after close
       buffer = ByteBuffer.allocate(1);
       try {
@@ -409,7 +445,7 @@ public class LogSegmentTest {
         }
       }
 
-      segment.close();
+      segment.close(false);
       // ensure that writeFrom fails.
       try {
         segment.writeFrom(Channels.newChannel(new ByteBufferInputStream(buffer)), writeStartOffset, buffer.remaining());
@@ -420,6 +456,72 @@ public class LogSegmentTest {
     } finally {
       closeSegmentAndDeleteFile(segment);
     }
+  }
+
+  /**
+   * Test a normal shutdown of log segment. Verify that disk flush operation is invoked.
+   * @throws Exception
+   */
+  @Test
+  public void closeLogSegmentTest() throws Exception {
+    Pair<LogSegment, FileChannel> segmentAndFileChannel = getSegmentAndFileChannel("log_current1");
+    LogSegment segment = segmentAndFileChannel.getFirst();
+    FileChannel mockFileChannel = segmentAndFileChannel.getSecond();
+
+    // test that log segment is closed successfully, ensure that the flush method is invoked
+    segment.close(false);
+    verify(mockFileChannel).force(true);
+    assertFalse("File channel is not closed", segment.getView().getSecond().isOpen());
+    assertTrue("File couldn't be deleted.", (new File(tempDir, segment.getName()).delete()));
+  }
+
+  /**
+   * Test that closing log segment and skip any disk flush operation. Verify that flush method is never invoked.
+   * @throws Exception
+   */
+  @Test
+  public void closeLogSegmentAndSkipFlushTest() throws Exception {
+    Pair<LogSegment, FileChannel> segmentAndFileChannel = getSegmentAndFileChannel("log_current2");
+    LogSegment segment = segmentAndFileChannel.getFirst();
+    FileChannel mockFileChannel = segmentAndFileChannel.getSecond();
+
+    // test that log segment is being closed due to disk I/O error and flush operation should be skipped
+    segment.close(true);
+    verify(mockFileChannel, times(0)).force(true);
+    assertFalse("File channel is not closed", segment.getView().getSecond().isOpen());
+    assertTrue("File couldn't be deleted.", (new File(tempDir, segment.getName()).delete()));
+  }
+
+  /**
+   * Test that closing log segment (skip disk flush) and exception occurs. The shutdown process should continue.
+   */
+  @Test
+  public void closeLogSegmentWithExceptionTest() throws Exception {
+    Pair<LogSegment, FileChannel> segmentAndFileChannel = getSegmentAndFileChannel("log_current3");
+    LogSegment segment = segmentAndFileChannel.getFirst();
+    FileChannel mockFileChannel = segmentAndFileChannel.getSecond();
+
+    // test that log segment is being closed due to disk I/O error (shouldSkipDiskFlush = true) and exception occurs
+    // when closing file channel
+    doThrow(new IOException("close channel failure")).when(mockFileChannel).close();
+    segment.close(true);
+    verify(mockFileChannel, times(0)).force(true);
+    assertTrue("File couldn't be deleted.", (new File(tempDir, segment.getName()).delete()));
+
+    segmentAndFileChannel = getSegmentAndFileChannel("log_current4");
+    segment = segmentAndFileChannel.getFirst();
+    mockFileChannel = segmentAndFileChannel.getSecond();
+
+    // test that log segment is being closed during normal shutdown (shouldSkipDiskFlush = false) and exception occurs
+    doThrow(new IOException("close channel failure")).when(mockFileChannel).close();
+    try {
+      segment.close(false);
+      fail("should fail because IOException occurred");
+    } catch (IOException e) {
+      //expected
+    }
+    verify(mockFileChannel).force(true);
+    assertTrue("File couldn't be deleted.", (new File(tempDir, segment.getName()).delete()));
   }
 
   /**
@@ -442,16 +544,16 @@ public class LogSegmentTest {
     String name = "log_non_existent";
     File file = new File(tempDir, name);
     try {
-      new LogSegment(name, file, STANDARD_SEGMENT_SIZE, metrics, true);
+      new LogSegment(name, file, STANDARD_SEGMENT_SIZE, config, metrics, true);
       fail("Construction should have failed because the backing file does not exist");
-    } catch (IllegalArgumentException e) {
+    } catch (StoreException e) {
       // expected. Nothing to do.
     }
 
     try {
-      new LogSegment(name, file, metrics);
+      new LogSegment(name, file, config, metrics);
       fail("Construction should have failed because the backing file does not exist");
-    } catch (IllegalArgumentException e) {
+    } catch (StoreException e) {
       // expected. Nothing to do.
     }
 
@@ -459,18 +561,18 @@ public class LogSegmentTest {
     name = tempDir.getName();
     file = new File(tempDir.getParent(), name);
     try {
-      new LogSegment(name, file, STANDARD_SEGMENT_SIZE, metrics, true);
+      new LogSegment(name, file, STANDARD_SEGMENT_SIZE, config, metrics, true);
       fail("Construction should have failed because the backing file does not exist");
-    } catch (IllegalArgumentException e) {
+    } catch (StoreException e) {
       // expected. Nothing to do.
     }
 
     name = tempDir.getName();
     file = new File(tempDir.getParent(), name);
     try {
-      new LogSegment(name, file, metrics);
+      new LogSegment(name, file, config, metrics);
       fail("Construction should have failed because the backing file does not exist");
-    } catch (IllegalArgumentException e) {
+    } catch (StoreException e) {
       // expected. Nothing to do.
     }
 
@@ -483,7 +585,7 @@ public class LogSegmentTest {
     header[0] = (byte) (header[0] + 10);
     writeHeader(segment, header);
     try {
-      new LogSegment(name, file, metrics);
+      new LogSegment(name, file, config, metrics);
       fail("Construction should have failed because version is unknown");
     } catch (IllegalArgumentException e) {
       // expected. Nothing to do.
@@ -495,7 +597,7 @@ public class LogSegmentTest {
     header[2] = header[2] == (byte) 1 ? (byte) 0 : (byte) 1;
     writeHeader(segment, header);
     try {
-      new LogSegment(name, file, metrics);
+      new LogSegment(name, file, config, metrics);
       fail("Construction should have failed because crc check should have failed");
     } catch (IllegalStateException e) {
       // expected. Nothing to do.
@@ -539,8 +641,27 @@ public class LogSegmentTest {
     assertTrue("Segment file could not be created at path " + file.getAbsolutePath(), file.createNewFile());
     file.deleteOnExit();
     try (RandomAccessFile raf = new RandomAccessFile(tempDir + File.separator + segmentName, "rw")) {
-      return new LogSegment(segmentName, file, capacityInBytes, metrics, writeHeaders);
+      return new LogSegment(segmentName, file, capacityInBytes, config, metrics, writeHeaders);
     }
+  }
+
+  /**
+   * Create a {@link LogSegment} and a mock file channel associated with it for testing.
+   * @param name the name of log segment
+   * @return a pair that contains log segment and mock file channel
+   * @throws Exception
+   */
+  private Pair<LogSegment, FileChannel> getSegmentAndFileChannel(String name) throws Exception {
+    File file = new File(tempDir, name);
+    if (file.exists()) {
+      assertTrue(file.getAbsolutePath() + " already exists and could not be deleted", file.delete());
+    }
+    assertTrue("Segment file could not be created at path " + file.getAbsolutePath(), file.createNewFile());
+    file.deleteOnExit();
+    FileChannel fileChannel = Utils.openChannel(file, true);
+    FileChannel mockFileChannel = Mockito.spy(fileChannel);
+    LogSegment segment = new LogSegment(file, STANDARD_SEGMENT_SIZE, config, metrics, mockFileChannel);
+    return new Pair<>(segment, mockFileChannel);
   }
 
   /**
@@ -591,7 +712,7 @@ public class LogSegmentTest {
    * @throws IOException
    */
   private void closeSegmentAndDeleteFile(LogSegment segment) throws IOException {
-    segment.close();
+    segment.close(false);
     assertFalse("File channel is not closed", segment.getView().getSecond().isOpen());
     File segmentFile = new File(tempDir, segment.getName());
     assertTrue("The segment file [" + segmentFile.getAbsolutePath() + "] could not be deleted", segmentFile.delete());
@@ -673,7 +794,7 @@ public class LogSegmentTest {
       readDirectlyAndEnsureMatch(segment, writeStartOffset + bufOne.length, bufTwo);
       readDirectlyAndEnsureMatch(segment, writeStartOffset + bufOne.length + bufTwo.length, bufThree);
 
-      segment.close();
+      segment.close(false);
       // ensure that append fails.
       ByteBuffer buffer = ByteBuffer.wrap(TestUtils.getRandomBytes(1));
       try {

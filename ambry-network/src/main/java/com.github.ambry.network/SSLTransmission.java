@@ -14,6 +14,7 @@
 package com.github.ambry.network;
 
 import com.github.ambry.commons.SSLFactory;
+import com.github.ambry.config.NetworkConfig;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
@@ -57,12 +58,19 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
   private long handshakeStartTime;
 
   public SSLTransmission(SSLFactory sslFactory, String connectionId, SocketChannel socketChannel, SelectionKey key,
-      String remoteHost, int remotePort, Time time, NetworkMetrics metrics, SSLFactory.Mode mode) throws IOException {
-    super(connectionId, socketChannel, key, time, metrics);
+      String remoteHost, int remotePort, Time time, NetworkMetrics metrics, SSLFactory.Mode mode, NetworkConfig config)
+      throws IOException {
+    super(connectionId, socketChannel, key, time, config, metrics);
     this.sslEngine = sslFactory.createSSLEngine(remoteHost, remotePort, mode);
-    this.netReadBuffer = ByteBuffer.allocate(netReadBufferSize());
-    this.netWriteBuffer = ByteBuffer.allocate(netWriteBufferSize());
-    this.appReadBuffer = ByteBuffer.allocate(appReadBufferSize());
+    if (config.selectorUseDirectBuffers) {
+      this.netReadBuffer = ByteBuffer.allocateDirect(netReadBufferSize());
+      this.netWriteBuffer = ByteBuffer.allocateDirect(netWriteBufferSize());
+      this.appReadBuffer = ByteBuffer.allocateDirect(appReadBufferSize());
+    } else {
+      this.netReadBuffer = ByteBuffer.allocate(netReadBufferSize());
+      this.netWriteBuffer = ByteBuffer.allocate(netWriteBufferSize());
+      this.appReadBuffer = ByteBuffer.allocate(appReadBufferSize());
+    }
     startHandshake();
   }
 
@@ -78,7 +86,7 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
     handshakeComplete = false;
     closing = false;
     //initiate handshake
-    handshakeStartTime = time.milliseconds();
+    handshakeStartTime = -1;
     sslEngine.beginHandshake();
     handshakeStatus = sslEngine.getHandshakeStatus();
   }
@@ -97,6 +105,9 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
    */
   @Override
   public void prepare() throws IOException {
+    if (handshakeStartTime == -1) {
+      handshakeStartTime = time.milliseconds();
+    }
     if (!ready()) {
       handshake();
     }
@@ -109,7 +120,6 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
 
   /**
    * Sends a SSL close message and closes socketChannel.
-   * @throws IOException if an I/O error occurs
    */
   @Override
   public void close() {
@@ -119,29 +129,40 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
     closing = true;
     sslEngine.closeOutbound();
     try {
-      if (!flush(netWriteBuffer)) {
-        throw new IOException("Remaining data in the network buffer, can't send SSL close message.");
+      if (socketChannel.isConnected()) {
+        if (!flush(netWriteBuffer)) {
+          throw new IOException("Remaining data in the network buffer, can't send SSL close message.");
+        }
+        //prep the buffer for the close message
+        netWriteBuffer.clear();
+        //perform the close, since we called sslEngine.closeOutbound
+        SSLEngineResult handshake = sslEngine.wrap(emptyBuf, netWriteBuffer);
+        //we should be in a close state
+        if (handshake.getStatus() != Status.CLOSED) {
+          throw new IOException("Invalid close state, will not send network data.");
+        }
+        netWriteBuffer.flip();
+        flush(netWriteBuffer);
       }
-      //prep the buffer for the close message
-      netWriteBuffer.clear();
-      //perform the close, since we called sslEngine.closeOutbound
-      SSLEngineResult handshake = sslEngine.wrap(emptyBuf, netWriteBuffer);
-      //we should be in a close state
-      if (handshake.getStatus() != Status.CLOSED) {
-        throw new IOException("Invalid close state, will not send network data.");
-      }
-      netWriteBuffer.flip();
-      flush(netWriteBuffer);
-      clearReceive();
-      clearSend();
-      socketChannel.socket().close();
-      socketChannel.close();
     } catch (IOException ie) {
       metrics.selectorCloseSocketErrorCount.inc();
-      logger.warn("Failed to send SSL close message ", ie);
+      logger.debug("Failed to send SSL close message ", ie);
+    } finally {
+      try {
+        release();
+        clearReceive();
+        clearSend();
+        clearBuffers();
+        socketChannel.socket().close();
+        socketChannel.close();
+      } catch (IOException ie) {
+        metrics.selectorCloseSocketErrorCount.inc();
+        logger.debug("Failed to close socket", ie);
+      } finally {
+        key.attach(null);
+        key.cancel();
+      }
     }
-    key.attach(null);
-    key.cancel();
   }
 
   /**
@@ -161,7 +182,9 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
   private boolean flush(ByteBuffer buf) throws IOException {
     int remaining = buf.remaining();
     if (remaining > 0) {
+      long startNs = SystemTime.getInstance().nanoseconds();
       int written = socketChannel.write(buf);
+      logger.trace("Flushed {} bytes in {} ns", written, SystemTime.getInstance().nanoseconds() - startNs);
       return written >= remaining;
     }
     return true;
@@ -326,7 +349,7 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
    * @return SSLEngineResult
    * @throws IOException
    */
-  private SSLEngineResult handshakeWrap(Boolean doWrite) throws IOException {
+  private SSLEngineResult handshakeWrap(boolean doWrite) throws IOException {
     logger.trace("SSLHandshake handshakeWrap {}", getConnectionId());
     if (netWriteBuffer.hasRemaining()) {
       throw new IllegalStateException("handshakeWrap called with netWriteBuffer not empty");
@@ -353,7 +376,7 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
    * @return SSLEngineResult
    * @throws IOException
    */
-  private SSLEngineResult handshakeUnwrap(Boolean doRead) throws IOException {
+  private SSLEngineResult handshakeUnwrap(boolean doRead) throws IOException {
     logger.trace("SSLHandshake handshakeUnwrap {}", getConnectionId());
     int read;
     if (doRead) {
@@ -383,15 +406,17 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
   @Override
   public boolean read() throws IOException {
     if (!hasReceive()) {
-      this.networkReceive = new NetworkReceive(getConnectionId(), new BoundedByteBufferReceive(), time);
+      initializeNetworkReceive();
+      metrics.transmissionRoundTripTime.update(time.milliseconds() - sendCompleteTime);
     }
-    long startTimeMs = SystemTime.getInstance().milliseconds();
+    long startTimeMs = time.milliseconds();
     long bytesRead = networkReceive.getReceivedBytes().readFrom(this);
-    long readTimeMs = SystemTime.getInstance().milliseconds() - startTimeMs;
-    logger.trace("Bytes read {} from {} using key {} Time: {}", bytesRead,
+    long readTimeMs = time.milliseconds() - startTimeMs;
+    logger.trace("Bytes read {} from {} using key {} Time: {} Ms.", bytesRead,
         socketChannel.socket().getRemoteSocketAddress(), getConnectionId(), readTimeMs);
     if (bytesRead > 0) {
-      metrics.sslReceiveTimeInUsPerKB.update(TimeUnit.MILLISECONDS.toMicros(readTimeMs) * 1024 / bytesRead);
+      metrics.transmissionReceiveTime.update(readTimeMs);
+      metrics.transmissionReceiveSize.update(bytesRead);
     }
     return networkReceive.getReceivedBytes().isReadComplete();
   }
@@ -434,12 +459,13 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
         long decryptionTimeMs = SystemTime.getInstance().milliseconds() - startTimeMs;
         logger.trace("SSL decryption time: {} ms for {} bytes", decryptionTimeMs, unwrapResult.bytesProduced());
         if (unwrapResult.bytesProduced() > 0) {
-          metrics.sslDecryptionTimeInUsPerKB.update(
+          metrics.sslDecryptionTimeInUsPerKB.mark(
               TimeUnit.MILLISECONDS.toMicros(decryptionTimeMs) * 1024 / unwrapResult.bytesProduced());
         }
         netReadBuffer.compact();
         // handle ssl renegotiation.
-        if (unwrapResult.getHandshakeStatus() != HandshakeStatus.NOT_HANDSHAKING) {
+        if (unwrapResult.getHandshakeStatus() != HandshakeStatus.NOT_HANDSHAKING
+            && unwrapResult.getStatus() == Status.OK) {
           logger.trace(
               "SSLChannel Read begin renegotiation getConnectionId() {}, appReadBuffer pos {}, netReadBuffer pos {}, netWriteBuffer pos {}",
               getConnectionId(), appReadBuffer.position(), netReadBuffer.position(), netWriteBuffer.position());
@@ -497,14 +523,17 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
         return false;
       }
     }
-    long startTimeMs = SystemTime.getInstance().milliseconds();
+    if (networkSend.maySetSendStartTimeInMs()) {
+      metrics.transmissionSendPendingTime.update(time.milliseconds() - networkSend.getSendCreateTimeInMs());
+    }
+    long startTimeMs = time.milliseconds();
     long bytesWritten = send.writeTo(this);
-    long writeTimeMs = SystemTime.getInstance().milliseconds() - startTimeMs;
-    logger.trace("Bytes written {} to {} using key {} Time: {}", bytesWritten,
+    long writeTimeMs = time.milliseconds() - startTimeMs;
+    logger.trace("Bytes written {} to {} using key {} Time: {} ms", bytesWritten,
         socketChannel.socket().getRemoteSocketAddress(), getConnectionId(), writeTimeMs);
     if (bytesWritten > 0) {
-      metrics.sslSendTimeInUsPerKB.update(TimeUnit.MILLISECONDS.toMicros(writeTimeMs) * 1024 / bytesWritten);
-      metrics.sslSendTime.update(writeTimeMs);
+      metrics.transmissionSendTime.update(writeTimeMs);
+      metrics.transmissionSendSize.update(bytesWritten);
     }
     return (send.isSendComplete() && netWriteBuffer.remaining() == 0);
   }
@@ -532,17 +561,16 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
     int written = 0;
     while (src.remaining() != 0) {
       netWriteBuffer.clear();
-      long startTimeMs = SystemTime.getInstance().milliseconds();
+      long startTimeNs = SystemTime.getInstance().nanoseconds();
       SSLEngineResult wrapResult = sslEngine.wrap(src, netWriteBuffer);
-      long encryptionTimeMs = SystemTime.getInstance().milliseconds() - startTimeMs;
-      logger.trace("SSL encryption time: {} ms for {} bytes", encryptionTimeMs, wrapResult.bytesConsumed());
+      long encryptionTimeNs = SystemTime.getInstance().nanoseconds() - startTimeNs;
+      logger.trace("SSL encryption time: {} ns for {} bytes", encryptionTimeNs, wrapResult.bytesConsumed());
       if (wrapResult.bytesConsumed() > 0) {
-        metrics.sslEncryptionTimeInUsPerKB.update(
-            TimeUnit.MILLISECONDS.toMicros(encryptionTimeMs) * 1024 / wrapResult.bytesConsumed());
+        metrics.sslEncryptionTimeInUsPerKB.mark(encryptionTimeNs / wrapResult.bytesConsumed());
       }
       netWriteBuffer.flip();
       //handle ssl renegotiation
-      if (wrapResult.getHandshakeStatus() != SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING) {
+      if (wrapResult.getHandshakeStatus() != HandshakeStatus.NOT_HANDSHAKING && wrapResult.getStatus() == Status.OK) {
         handshake();
         metrics.sslRenegotiationCount.inc();
         break;
@@ -629,9 +657,9 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
   private void handleUnwrapOverflow() {
     int currentAppReadBufferSize = appReadBufferSize();
     appReadBuffer = Utils.ensureCapacity(appReadBuffer, currentAppReadBufferSize);
-    if (appReadBuffer.position() >= currentAppReadBufferSize) {
+    if (appReadBuffer.position() > currentAppReadBufferSize) {
       throw new IllegalStateException(
-          "Buffer overflow when available data size (" + appReadBuffer.position() + ") >= application buffer size ("
+          "Buffer overflow when available data size (" + appReadBuffer.position() + ") > application buffer size ("
               + currentAppReadBufferSize + ")");
     }
   }
@@ -677,24 +705,11 @@ public class SSLTransmission extends Transmission implements ReadableByteChannel
   }
 
   /**
-   * Actions to be taken on completion of {@link Send} in {@link NetworkSend}
+   * Nullify buffers used for I/O with {@link SSLEngine}.
    */
-  @Override
-  public void onSendComplete() {
-    long sendTimeMs = SystemTime.getInstance().milliseconds() - networkSend.getSendStartTimeInMs();
-    networkSend.onSendComplete();
-    double sendBytesRate = networkSend.getPayload().sizeInBytes() / ((double) sendTimeMs / SystemTime.MsPerSec);
-    metrics.sslSendBytesRate.mark((long) sendBytesRate);
-  }
-
-  /**
-   * Actions to be taken on completion of {@link BoundedByteBufferReceive} in {@link NetworkReceive}
-   */
-  @Override
-  public void onReceiveComplete() {
-    long receiveTimeMs = SystemTime.getInstance().milliseconds() - networkReceive.getReceiveStartTimeInMs();
-    double receiveBytesRate =
-        networkReceive.getReceivedBytes().sizeRead() / ((double) receiveTimeMs / SystemTime.MsPerSec);
-    metrics.sslReceiveBytesRate.mark((long) receiveBytesRate);
+  private void clearBuffers() {
+    appReadBuffer = null;
+    netReadBuffer = null;
+    netWriteBuffer = null;
   }
 }

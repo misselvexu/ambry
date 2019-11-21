@@ -21,6 +21,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
+import java.util.Set;
 import org.apache.helix.ClusterMessagingService;
 import org.apache.helix.ConfigAccessor;
 import org.apache.helix.ControllerChangeListener;
@@ -44,11 +45,11 @@ import org.apache.helix.ZNRecord;
 import org.apache.helix.api.listeners.ClusterConfigChangeListener;
 import org.apache.helix.api.listeners.ConfigChangeListener;
 import org.apache.helix.api.listeners.ResourceConfigChangeListener;
+import org.apache.helix.controller.pipeline.Pipeline;
 import org.apache.helix.healthcheck.ParticipantHealthReportCollector;
 import org.apache.helix.messaging.handling.MessageHandler;
 import org.apache.helix.model.HelixConfigScope;
 import org.apache.helix.model.InstanceConfig;
-import org.apache.helix.model.LeaderStandbySMD;
 import org.apache.helix.model.Message;
 import org.apache.helix.participant.StateMachineEngine;
 import org.apache.helix.participant.statemachine.StateModel;
@@ -57,6 +58,8 @@ import org.apache.helix.store.zk.ZkHelixPropertyStore;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 import org.mockito.Mockito;
 
 import static com.github.ambry.clustermap.TestUtils.*;
@@ -67,13 +70,21 @@ import static org.mockito.Mockito.*;
 /**
  * Test for {@link HelixParticipant}
  */
+@RunWith(Parameterized.class)
 public class HelixParticipantTest {
   private final MockHelixManagerFactory helixManagerFactory;
   private final Properties props;
   private final String clusterName = "HelixParticipantTestCluster";
   private final JSONObject zkJson;
+  private final String stateModelDef;
 
-  public HelixParticipantTest() throws Exception {
+  @Parameterized.Parameters
+  public static List<Object[]> data() {
+    return Arrays.asList(
+        new Object[][]{{ClusterMapConfig.DEFAULT_STATE_MODEL_DEF}, {ClusterMapConfig.AMBRY_STATE_MODEL_DEF}});
+  }
+
+  public HelixParticipantTest(String stateModelDef) throws Exception {
     List<com.github.ambry.utils.TestUtils.ZkInfo> zkInfoList = new ArrayList<>();
     zkInfoList.add(new com.github.ambry.utils.TestUtils.ZkInfo(null, "DC0", (byte) 0, 2199, false));
     zkJson = constructZkLayoutJSON(zkInfoList);
@@ -83,6 +94,8 @@ public class HelixParticipantTest {
     props.setProperty("clustermap.cluster.name", clusterName);
     props.setProperty("clustermap.datacenter.name", "DC0");
     props.setProperty("clustermap.dcs.zk.connect.strings", zkJson.toString(2));
+    props.setProperty("clustermap.state.model.definition", stateModelDef);
+    this.stateModelDef = stateModelDef;
     helixManagerFactory = new MockHelixManagerFactory();
   }
 
@@ -272,6 +285,15 @@ public class HelixParticipantTest {
    */
   @Test
   public void testBadCases() throws IOException {
+    // Invalid state model def
+    props.setProperty("clustermap.state.model.definition", "InvalidStateModelDef");
+    try {
+      new ClusterMapConfig(new VerifiableProperties(props));
+      fail("should fail due to invalid state model definition");
+    } catch (IllegalArgumentException e) {
+      //expected and restore previous props
+      props.setProperty("clustermap.state.model.definition", stateModelDef);
+    }
     // Connect failure.
     ClusterMapConfig clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
     helixManagerFactory.helixManager.beBad = true;
@@ -315,7 +337,7 @@ public class HelixParticipantTest {
     participant.participate(Collections.emptyList());
     MockHelixManager helixManager = helixManagerFactory.helixManager;
     assertTrue(helixManager.isConnected());
-    assertEquals(LeaderStandbySMD.name, helixManager.stateModelDef);
+    assertEquals(stateModelDef, helixManager.stateModelDef);
     assertEquals(AmbryStateModelFactory.class, helixManager.stateModelFactory.getClass());
     participant.close();
     assertFalse(helixManager.isConnected());
@@ -343,7 +365,8 @@ public class HelixParticipantTest {
      * @return the {@link MockHelixManager}
      */
     @Override
-    HelixManager getZKHelixManager(String clusterName, String instanceName, InstanceType instanceType, String zkAddr) {
+    public HelixManager getZKHelixManager(String clusterName, String instanceName, InstanceType instanceType,
+        String zkAddr) {
       return helixManager;
     }
 
@@ -353,7 +376,7 @@ public class HelixParticipantTest {
      * @return the {@link MockHelixAdmin}
      */
     @Override
-    HelixAdmin getHelixAdmin(String zkAddr) {
+    public HelixAdmin getHelixAdmin(String zkAddr) {
       return new MockHelixAdmin();
     }
   }
@@ -488,6 +511,7 @@ public class HelixParticipantTest {
         org.apache.helix.api.listeners.IdealStateChangeListener idealStateChangeListener) throws Exception {
       throw new IllegalStateException("Not implemented");
     }
+
     @Override
     public void addLiveInstanceChangeListener(
         org.apache.helix.api.listeners.LiveInstanceChangeListener liveInstanceChangeListener) throws Exception {
@@ -519,7 +543,6 @@ public class HelixParticipantTest {
     public void addResourceConfigChangeListener(ResourceConfigChangeListener resourceConfigChangeListener)
         throws Exception {
       throw new IllegalStateException("Not implemented");
-
     }
 
     @Override
@@ -599,6 +622,11 @@ public class HelixParticipantTest {
 
     @Override
     public void addControllerMessageListener(MessageListener listener) {
+      throw new IllegalStateException("Not implemented");
+    }
+
+    @Override
+    public void setEnabledControlPipelineTypes(Set<Pipeline.Type> types) {
       throw new IllegalStateException("Not implemented");
     }
 

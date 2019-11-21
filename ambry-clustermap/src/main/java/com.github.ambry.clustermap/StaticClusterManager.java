@@ -82,6 +82,11 @@ class StaticClusterManager implements ClusterMap {
   }
 
   @Override
+  public PartitionId getRandomWritablePartition(String partitionClass, List<PartitionId> partitionsToExclude) {
+    return partitionLayout.getRandomWritablePartition(partitionClass, partitionsToExclude);
+  }
+
+  @Override
   public List<PartitionId> getAllPartitionIds(String partitionClass) {
     return partitionLayout.getPartitions(partitionClass);
   }
@@ -434,11 +439,8 @@ class StaticClusterManager implements ClusterMap {
             "Data center " + dataCenterName + " provided already contains replica for partition " + partitionId);
       }
       capacityOfReplicasInBytes = replicaId.getCapacityInBytes();
-      Integer numberOfReplicas = replicaCountByDatacenter.get(replicaId.getDataNodeId().getDatacenterName());
-      if (numberOfReplicas == null) {
-        numberOfReplicas = new Integer(0);
-      }
-      numberOfReplicas++;
+      int numberOfReplicas =
+          replicaCountByDatacenter.getOrDefault(replicaId.getDataNodeId().getDatacenterName(), 0) + 1;
       replicaCountByDatacenter.put(replicaId.getDataNodeId().getDatacenterName(), numberOfReplicas);
     }
     if (replicaCountByDatacenter.size() == 0) {
@@ -529,6 +531,12 @@ class StaticClusterManager implements ClusterMap {
     getAllPartitionIds(null).forEach(partitionId -> partitionsJsonArray.put(partitionId.getSnapshot()));
     snapshot.put(PARTITIONS, partitionsJsonArray);
     return snapshot;
+  }
+
+  @Override
+  public ReplicaId getBootstrapReplica(String partitionIdStr, DataNodeId dataNodeId) {
+    throw new UnsupportedOperationException(
+        "Adding new replica is currently not supported in static cluster manager.");
   }
 
   @Override

@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -28,7 +29,6 @@ import org.apache.helix.HelixManager;
 import org.apache.helix.InstanceType;
 import org.apache.helix.healthcheck.HealthReportProvider;
 import org.apache.helix.model.InstanceConfig;
-import org.apache.helix.model.LeaderStandbySMD;
 import org.apache.helix.participant.StateMachineEngine;
 import org.apache.helix.task.Task;
 import org.apache.helix.task.TaskCallbackContext;
@@ -43,15 +43,17 @@ import org.slf4j.LoggerFactory;
 /**
  * An implementation of {@link ClusterParticipant} that registers as a participant to a Helix cluster.
  */
-class HelixParticipant implements ClusterParticipant {
+class HelixParticipant implements ClusterParticipant, PartitionStateChangeListener {
   private final Logger logger = LoggerFactory.getLogger(getClass());
   private final String clusterName;
   private final String zkConnectStr;
   private final HelixFactory helixFactory;
   private final Object helixAdministrationLock = new Object();
+  private final ClusterMapConfig clusterMapConfig;
   private HelixManager manager;
   private String instanceName;
   private HelixAdmin helixAdmin;
+  private List<PartitionStateChangeListener> partitionStateChangeListeners;
 
   /**
    * Instantiate a HelixParticipant.
@@ -60,6 +62,7 @@ class HelixParticipant implements ClusterParticipant {
    * @throws IOException if there is an error in parsing the JSON serialized ZK connect string config.
    */
   HelixParticipant(ClusterMapConfig clusterMapConfig, HelixFactory helixFactory) throws IOException {
+    this.clusterMapConfig = clusterMapConfig;
     clusterName = clusterMapConfig.clusterMapClusterName;
     instanceName =
         ClusterMapUtils.getInstanceName(clusterMapConfig.clusterMapHostName, clusterMapConfig.clusterMapPort);
@@ -78,6 +81,7 @@ class HelixParticipant implements ClusterParticipant {
       throw new IOException("Received JSON exception while parsing ZKInfo json string", e);
     }
     manager = helixFactory.getZKHelixManager(clusterName, instanceName, InstanceType.PARTICIPANT, zkConnectStr);
+    partitionStateChangeListeners = new LinkedList<>();
   }
 
   /**
@@ -88,9 +92,11 @@ class HelixParticipant implements ClusterParticipant {
    */
   @Override
   public void participate(List<AmbryHealthReport> ambryHealthReports) throws IOException {
-    logger.info("Initiating the participation");
+    logger.info("Initiating the participation. The specified state model is {}",
+        clusterMapConfig.clustermapStateModelDefinition);
     StateMachineEngine stateMachineEngine = manager.getStateMachineEngine();
-    stateMachineEngine.registerStateModelFactory(LeaderStandbySMD.name, new AmbryStateModelFactory());
+    stateMachineEngine.registerStateModelFactory(clusterMapConfig.clustermapStateModelDefinition,
+        new AmbryStateModelFactory(clusterMapConfig.clustermapStateModelDefinition, this));
     registerHealthReportTasks(stateMachineEngine, ambryHealthReports);
     try {
       synchronized (helixAdministrationLock) {
@@ -108,6 +114,11 @@ class HelixParticipant implements ClusterParticipant {
     for (AmbryHealthReport ambryHealthReport : ambryHealthReports) {
       manager.getHealthReportCollector().addHealthReportProvider((HealthReportProvider) ambryHealthReport);
     }
+  }
+
+  @Override
+  public void registerPartitionStateChangeListener(PartitionStateChangeListener partitionStateChangeListener) {
+    partitionStateChangeListeners.add(partitionStateChangeListener);
   }
 
   @Override
@@ -146,16 +157,16 @@ class HelixParticipant implements ClusterParticipant {
     }
     boolean setStoppedResult;
     synchronized (helixAdministrationLock) {
-      logger.trace("Getting stopped replicas from instanceConfig");
+      logger.info("Getting stopped replicas from instanceConfig");
       List<String> stoppedListInHelix = getStoppedReplicas();
       Set<String> stoppedSet = new HashSet<>(stoppedListInHelix);
       boolean stoppedSetUpdated =
           markStop ? stoppedSet.addAll(replicasToUpdate) : stoppedSet.removeAll(replicasToUpdate);
       if (stoppedSetUpdated) {
-        logger.trace("Updating the stopped list in Helix InstanceConfig");
+        logger.info("Updating the stopped list in Helix InstanceConfig");
         setStoppedResult = setStoppedReplicas(new ArrayList<>(stoppedSet));
       } else {
-        logger.trace("No replicas should be added or removed, no need to update the stopped list");
+        logger.info("No replicas should be added or removed, no need to update the stopped list");
         setStoppedResult = true;
       }
     }
@@ -261,5 +272,19 @@ class HelixParticipant implements ClusterParticipant {
     logger.trace("Setting InstanceConfig with list of stopped replicas: {}", stoppedReplicas.toArray());
     instanceConfig.getRecord().setListField(ClusterMapUtils.STOPPED_REPLICAS_STR, stoppedReplicas);
     return helixAdmin.setInstanceConfig(clusterName, instanceName, instanceConfig);
+  }
+
+  @Override
+  public void onPartitionStateChangeToLeaderFromStandby(String partitionName) {
+    for (PartitionStateChangeListener partitionStateChangeListener : partitionStateChangeListeners) {
+      partitionStateChangeListener.onPartitionStateChangeToLeaderFromStandby(partitionName);
+    }
+  }
+
+  @Override
+  public void onPartitionStateChangeToStandbyFromLeader(String partitionName) {
+    for (PartitionStateChangeListener partitionStateChangeListener : partitionStateChangeListeners) {
+      partitionStateChangeListener.onPartitionStateChangeToStandbyFromLeader(partitionName);
+    }
   }
 }

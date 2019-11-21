@@ -30,6 +30,7 @@ import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
@@ -47,7 +48,6 @@ import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpObject;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponse;
-import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpUtil;
 import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
@@ -61,7 +61,9 @@ import java.nio.file.Paths;
 import java.security.GeneralSecurityException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -76,9 +78,11 @@ import joptsimple.OptionSet;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import static com.github.ambry.utils.Utils.*;
+
 
 /**
- * A Netty based client to evaluate performance of the front end.
+ * A Netty based client to evaluate performance of the front end(s).
  */
 public class NettyPerfClient {
   private static final String GET = "GET";
@@ -86,7 +90,7 @@ public class NettyPerfClient {
   private static final List<String> SUPPORTED_REQUEST_TYPES = Arrays.asList(GET, POST);
   private static final Logger logger = LoggerFactory.getLogger(NettyPerfClient.class);
 
-  private final String host;
+  private final List<String> hosts;
   private final int port;
   private final String path;
   private final List<String> pathList;
@@ -99,13 +103,18 @@ public class NettyPerfClient {
   private final String targetAccountName;
   private final String targetContainerName;
   private final List<Pair<String, String>> customHeaders = new ArrayList<>();
-  private final Bootstrap b = new Bootstrap();
   private final ChannelConnectListener channelConnectListener = new ChannelConnectListener();
   private final MetricRegistry metricRegistry = new MetricRegistry();
   private final JmxReporter reporter = JmxReporter.forRegistry(metricRegistry).build();
   private final PerfClientMetrics perfClientMetrics = new PerfClientMetrics(metricRegistry);
   private final CountDownLatch shutdownLatch = new CountDownLatch(1);
   private final AtomicLong totalRequestCount = new AtomicLong(0);
+  private final Map<String, AtomicLong> hostToRequestCount = new HashMap<>();
+  private final Map<String, Long> hostToSleepTime = new HashMap<>();
+  private final SleepTimeUpdater updater = new SleepTimeUpdater();
+  private final ScheduledExecutorService backgroundScheduler;
+  private final int targetQPS;
+  private long sleepTimeInMs = 0;
 
   private EventLoopGroup group;
   private long perfClientStartTime;
@@ -116,7 +125,7 @@ public class NettyPerfClient {
    * Abstraction class for all the parameters that are expected.
    */
   private static class ClientArgs {
-    final String host;
+    final List<String> hosts;
     final Integer port;
     final String path;
     final String pathFileName;
@@ -129,6 +138,7 @@ public class NettyPerfClient {
     final List<String> customHeaders;
     final String serviceId;
     final Integer testTime;
+    final Integer targetQPS;
     final String sslPropsFilePath;
     private final Logger logger = LoggerFactory.getLogger(getClass());
 
@@ -136,11 +146,12 @@ public class NettyPerfClient {
      * Parses the arguments provided and extracts them into variables that can be retrieved.
      * @param args the command line argument list.
      */
-    protected ClientArgs(String args[]) {
+    ClientArgs(String[] args) {
       OptionParser parser = new OptionParser();
-      ArgumentAcceptingOptionSpec<String> host = parser.accepts("host", "Front end host to contact")
+      ArgumentAcceptingOptionSpec<String> hosts = parser.accepts("hosts", "Front end hosts(s) to contact")
           .withOptionalArg()
-          .describedAs("host")
+          .describedAs("hosts")
+          .withValuesSeparatedBy(",")
           .ofType(String.class)
           .defaultsTo("localhost");
       ArgumentAcceptingOptionSpec<Integer> port = parser.accepts("port", "Front end port")
@@ -203,6 +214,11 @@ public class NettyPerfClient {
           .withOptionalArg()
           .describedAs("testTime")
           .ofType(Integer.class);
+      ArgumentAcceptingOptionSpec<Integer> targetQPS = parser.accepts("targetQPS", "The target QPS for each frontend.")
+          .withOptionalArg()
+          .describedAs("targetQPS")
+          .ofType(Integer.class)
+          .defaultsTo(0);
       ArgumentAcceptingOptionSpec<String> sslPropsFilePath =
           parser.accepts("sslPropsFilePath", "The path to the properties file with SSL settings. Set to enable SSL.")
               .withOptionalArg()
@@ -210,7 +226,7 @@ public class NettyPerfClient {
               .ofType(String.class);
 
       OptionSet options = parser.parse(args);
-      this.host = options.valueOf(host);
+      this.hosts = options.valuesOf(hosts);
       this.port = options.valueOf(port);
       this.path = options.valueOf(path);
       this.pathFileName = options.valueOf(pathFileName);
@@ -223,10 +239,11 @@ public class NettyPerfClient {
       this.customHeaders = options.valuesOf(customHeader);
       this.serviceId = options.valueOf(serviceId);
       this.testTime = options.valueOf(testTime);
+      this.targetQPS = options.valueOf(targetQPS);
       this.sslPropsFilePath = options.valueOf(sslPropsFilePath);
       validateArgs();
 
-      logger.info("Host: {}", this.host);
+      logger.info("Hosts: {}", this.hosts);
       logger.info("Port: {}", this.port);
       logger.info("Path: {}", this.path);
       logger.info("Path File Name: {}", this.pathFileName);
@@ -236,6 +253,7 @@ public class NettyPerfClient {
       logger.info("Post blob chunk size: {}", this.postBlobChunkSize);
       logger.info("SSL properties file path: {}", this.sslPropsFilePath);
       logger.info("Custom Headers: {}", this.customHeaders);
+      logger.info("Target QPS: {}", this.targetQPS);
     }
 
     /**
@@ -257,6 +275,9 @@ public class NettyPerfClient {
       if (serviceId == null || serviceId.isEmpty()) {
         throw new IllegalArgumentException("serviceId cannot be empty");
       }
+      if (targetQPS < 0) {
+        throw new IllegalArgumentException("Target QPS cannot be negative value");
+      }
     }
   }
 
@@ -268,10 +289,10 @@ public class NettyPerfClient {
     try {
       ClientArgs clientArgs = new ClientArgs(args);
       final NettyPerfClient nettyPerfClient =
-          new NettyPerfClient(clientArgs.host, clientArgs.port, clientArgs.path, clientArgs.pathFileName,
+          new NettyPerfClient(clientArgs.hosts, clientArgs.port, clientArgs.path, clientArgs.pathFileName,
               clientArgs.concurrency, clientArgs.postBlobTotalSize, clientArgs.postBlobChunkSize,
               clientArgs.sslPropsFilePath, clientArgs.serviceId, clientArgs.targetAccountName,
-              clientArgs.targetContainerName, clientArgs.customHeaders);
+              clientArgs.targetContainerName, clientArgs.customHeaders, clientArgs.targetQPS);
       // attach shutdown handler to catch control-c
       Runtime.getRuntime().addShutdownHook(new Thread(() -> {
         logger.info("Received shutdown signal. Requesting NettyPerfClient shutdown");
@@ -294,7 +315,7 @@ public class NettyPerfClient {
 
   /**
    * Creates an instance of NettyPerfClient
-   * @param host host to contact.
+   * @param hosts a list of hosts to contact.
    * @param port port to contact.
    * @param path resource path.
    * @param concurrency number of parallel requests.
@@ -305,13 +326,15 @@ public class NettyPerfClient {
    * @param targetAccountName target account name for POST
    * @param targetContainerName target container name for POST
    * @param customHeaders list of http headers name:value to be added.
+   * @param targetQPS the target QPS expected on single frontend. If not specified, targetQPS uses default value 0, which
+   *                  means the client attempts to issue request as fast as it can.
    * @throws IOException
    * @throws GeneralSecurityException
    */
-  private NettyPerfClient(String host, int port, String path, String pathFileName, int concurrency, Long totalSize,
-      Integer chunkSize, String sslPropsFilePath, String serviceId, String targetAccountName,
-      String targetContainerName, List<String> customHeaders) throws Exception {
-    this.host = host;
+  private NettyPerfClient(List<String> hosts, int port, String path, String pathFileName, int concurrency,
+      Long totalSize, Integer chunkSize, String sslPropsFilePath, String serviceId, String targetAccountName,
+      String targetContainerName, List<String> customHeaders, int targetQPS) throws Exception {
+    this.hosts = hosts;
     this.port = port;
     this.path = path;
     if (pathFileName != null) {
@@ -320,6 +343,8 @@ public class NettyPerfClient {
       this.pathList = null;
     }
     this.concurrency = concurrency;
+    this.targetQPS = targetQPS;
+    sleepTimeInMs = this.targetQPS > 0 ? 1000L * concurrency / this.targetQPS : 0;
     if (chunkSize != null) {
       this.totalSize = totalSize;
       chunk = new byte[chunkSize];
@@ -339,8 +364,10 @@ public class NettyPerfClient {
         this.customHeaders.add(new Pair<>(customHeaderNameValue[0], customHeaderNameValue[1]));
       }
     }
-    logger.info("Instantiated NettyPerfClient which will interact with host {}, port {}, path {} with concurrency {}",
-        this.host, this.port, this.pathList == null ? this.path : "has " + this.pathList.size() + "paths",
+    // only when target QPS is specified, the client would create background scheduler to update sleep time.
+    backgroundScheduler = targetQPS > 0 ? Utils.newScheduler(1, false) : null;
+    logger.info("Instantiated NettyPerfClient which will interact with hosts {}, port {}, path {} with concurrency {}",
+        this.hosts, this.port, this.pathList == null ? this.path : "has " + this.pathList.size() + "paths",
         this.concurrency);
   }
 
@@ -352,23 +379,38 @@ public class NettyPerfClient {
     logger.info("Starting NettyPerfClient");
     reporter.start();
     group = new NioEventLoopGroup(concurrency);
-    b.group(group).channel(NioSocketChannel.class).handler(new ChannelInitializer<SocketChannel>() {
-      @Override
-      public void initChannel(SocketChannel ch) throws Exception {
-        if (sslFactory != null) {
-          ch.pipeline().addLast(new SslHandler(sslFactory.createSSLEngine(host, port, SSLFactory.Mode.CLIENT)));
-        }
-        ch.pipeline().addLast(new HttpClientCodec()).addLast(new ChunkedWriteHandler()).addLast(new ResponseHandler());
-      }
-    });
-    logger.info("Connecting to {}:{}", host, port);
-    b.remoteAddress(host, port);
     perfClientStartTime = System.currentTimeMillis();
-    for (int i = 0; i < concurrency; i++) {
-      b.connect().addListener(channelConnectListener);
+    for (String host : hosts) {
+      logger.info("Connecting to {}:{}", host, port);
+      // create a new bootstrap with a fixed remote address for each host. This is the simplest way to support
+      // reconnection on failure. All bootstraps will share the same event loop group.
+      Bootstrap bootstrap = new Bootstrap().group(group).channel(NioSocketChannel.class).remoteAddress(host, port);
+      bootstrap.handler(new ChannelInitializer<SocketChannel>() {
+        @Override
+        public void initChannel(SocketChannel ch) {
+          logger.info("Initializing the channel to {}:{}", host, port);
+          if (sslFactory != null) {
+            ch.pipeline().addLast(new SslHandler(sslFactory.createSSLEngine(host, port, SSLFactory.Mode.CLIENT)));
+          }
+          ch.pipeline()
+              .addLast(new HttpClientCodec())
+              .addLast(new ChunkedWriteHandler())
+              .addLast(new ResponseHandler(bootstrap));
+        }
+      });
+      for (int i = 0; i < concurrency; i++) {
+        ChannelFuture future = bootstrap.connect();
+        future.addListener(channelConnectListener);
+      }
+      hostToRequestCount.put(host, new AtomicLong(0));
+      hostToSleepTime.put(host, sleepTimeInMs);
+    }
+    if (backgroundScheduler != null) {
+      backgroundScheduler.scheduleAtFixedRate(updater, 0, 1, TimeUnit.SECONDS);
+      logger.info("Background scheduler is instantiated to update sleep time.");
     }
     isRunning = true;
-    logger.info("Created {} channel(s)", concurrency);
+    logger.info("Created {} channel(s) per remote host", concurrency);
     logger.info("NettyPerfClient started");
   }
 
@@ -386,6 +428,9 @@ public class NettyPerfClient {
           logger.error("Netty worker did not shutdown within timeout");
         } else {
           logger.info("NettyPerfClient shutdown complete");
+        }
+        if (backgroundScheduler != null) {
+          shutDownExecutorService(backgroundScheduler, 5, TimeUnit.SECONDS);
         }
       } catch (InterruptedException e) {
         logger.error("NettyPerfClient shutdown interrupted", e);
@@ -409,16 +454,45 @@ public class NettyPerfClient {
    * Blocking function to wait on the NettyPerfClient shutting down.
    * @throws InterruptedException
    */
-  protected void awaitShutdown() throws InterruptedException {
+  private void awaitShutdown() throws InterruptedException {
     shutdownLatch.await();
   }
 
   /**
+   * A periodic updater that adjusts sleep time for connections based on current QPS and target QPS.
+   */
+  private class SleepTimeUpdater implements Runnable {
+    @Override
+    public void run() {
+      for (Map.Entry<String, AtomicLong> hostAndRequestCount : hostToRequestCount.entrySet()) {
+        String hostname = hostAndRequestCount.getKey();
+        AtomicLong requestCount = hostAndRequestCount.getValue();
+        Long hostSleepTime = hostToSleepTime.get(hostname);
+        long currentQPS = requestCount.get();
+        logger.info("For host {}, request count per sec is {}, current sleep time is {} ms", hostname, currentQPS,
+            hostSleepTime);
+        if (targetQPS > 0 && currentQPS > 0) {
+          // formula to update sleep time is: new sleep time = (currentQPS / targetQPS) * (current sleep time)
+          long newSleepTime = currentQPS * hostSleepTime / targetQPS;
+          // if currentQPS is already higher than target one and new sleep time still equals current sleep time, we
+          // explicitly plus one more millisecond.
+          newSleepTime = newSleepTime + ((currentQPS > targetQPS && newSleepTime == hostSleepTime) ? 1 : 0);
+          hostSleepTime = newSleepTime;
+          requestCount.set(0);
+          logger.info("Updated sleep time is {} ms for host {}", hostSleepTime, hostname);
+        }
+        hostToSleepTime.put(hostname, hostSleepTime);
+      }
+    }
+  }
+
+  /**
    * Custom handler that sends out the request and receives and processes the response.
+   * TODO support GET-after-POST and DELETE-after-POST operations for race condition testing.
    */
   private class ResponseHandler extends SimpleChannelInboundHandler<HttpObject> {
     private final Logger logger = LoggerFactory.getLogger(getClass());
-
+    private final Bootstrap bootstrap;
     private HttpRequest request;
     private HttpResponse response;
     private ChunkedInput<HttpContent> chunkedInput;
@@ -428,6 +502,10 @@ public class NettyPerfClient {
     private long lastChunkReceiveTime;
     private long requestStartTime;
     private long requestId = 0;
+
+    ResponseHandler(Bootstrap bootstrap) {
+      this.bootstrap = bootstrap;
+    }
 
     @Override
     public void channelActive(ChannelHandlerContext ctx) {
@@ -446,8 +524,15 @@ public class NettyPerfClient {
         perfClientMetrics.timeToFirstResponseChunkInMs.update(responseReceiveStart);
         logger.trace("Response receive has started on channel {}. Took {} ms", ctx.channel(), responseReceiveStart);
         response = (HttpResponse) in;
-        if (response.status() != HttpResponseStatus.OK) {
-          logger.error("Got Response code {} and headers were {}", response.status().code(), response.headers());
+        if (response.status().code() >= 200 && response.status().code() < 300) {
+          logger.trace("Request succeeded");
+          if (response.headers().contains("Location")) {
+            logger.info(response.headers().get("Location"));
+          }
+        } else if (response.status().code() >= 300 && response.status().code() < 400) {
+          logger.warn("Redirection code {} and headers were {}", response.status().code(), response.headers());
+        } else {
+          logger.error("Response error code {} and headers were {}", response.status().code(), response.headers());
         }
       }
       if (in instanceof HttpContent) {
@@ -492,7 +577,7 @@ public class NettyPerfClient {
       if (isRunning) {
         perfClientMetrics.unexpectedDisconnectionError.inc();
         logger.info("Creating a new channel to keep up concurrency");
-        b.connect().addListener(channelConnectListener);
+        bootstrap.connect().addListener(channelConnectListener);
       }
     }
 
@@ -510,10 +595,17 @@ public class NettyPerfClient {
     private void sendRequest(ChannelHandlerContext ctx) {
       requestId++;
       long globalId = totalRequestCount.incrementAndGet();
-      logger.trace("Sending request with global ID {} and local ID {} on channel {}", globalId, requestId,
-          ctx.channel());
+      Channel channel = ctx.channel();
+      String hostname = ((SocketChannel) channel).remoteAddress().getHostName();
+      hostToRequestCount.get(hostname).incrementAndGet();
+      logger.trace("Sending request with global ID {} and local ID {} on channel {}", globalId, requestId, channel);
       reset();
       perfClientMetrics.requestRate.mark();
+      try {
+        Thread.sleep(hostToSleepTime.get(hostname));
+      } catch (InterruptedException e) {
+        logger.error("Interrupted with exception:", e);
+      }
       ctx.writeAndFlush(request);
       if (request.method().equals(HttpMethod.POST)) {
         ctx.writeAndFlush(chunkedInput);
@@ -634,13 +726,14 @@ public class NettyPerfClient {
     public void operationComplete(ChannelFuture future) {
       if (!future.isSuccess()) {
         perfClientMetrics.connectError.inc();
-        logger.error("Channel {} to {}:{} could not be connected.", future.channel(), host, port, future.cause());
+        Channel channel = future.channel();
+        logger.error("Channel {} to {} could not be connected.", channel, channel.remoteAddress(), future.cause());
       }
     }
   }
 
   /**
-   * Metrics that track peformance.
+   * Metrics that track performance.
    */
   private static class PerfClientMetrics {
     public final Meter bytesReceiveRate;

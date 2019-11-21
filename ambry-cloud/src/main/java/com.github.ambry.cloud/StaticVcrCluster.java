@@ -13,10 +13,12 @@
  */
 package com.github.ambry.cloud;
 
+import com.github.ambry.clustermap.CloudDataNode;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.VirtualReplicatorCluster;
+import com.github.ambry.clustermap.VirtualReplicatorClusterListener;
 import com.github.ambry.config.CloudConfig;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.utils.Utils;
@@ -29,6 +31,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import org.apache.helix.InstanceType;
 
 
 /**
@@ -38,6 +41,7 @@ public class StaticVcrCluster implements VirtualReplicatorCluster {
 
   private final DataNodeId currentDataNode;
   private final List<PartitionId> assignedPartitionIds;
+  private final List<VirtualReplicatorClusterListener> listeners = new ArrayList<>();
 
   /**
    * Construct the static VCR cluster.
@@ -77,8 +81,22 @@ public class StaticVcrCluster implements VirtualReplicatorCluster {
   }
 
   @Override
+  public void participate(InstanceType role) throws Exception {
+    for (VirtualReplicatorClusterListener listener : listeners) {
+      for (PartitionId partitionId : assignedPartitionIds) {
+        listener.onPartitionAdded(partitionId);
+      }
+    }
+  }
+
+  @Override
   public List<? extends PartitionId> getAssignedPartitionIds() {
     return assignedPartitionIds;
+  }
+
+  @Override
+  public void addListener(VirtualReplicatorClusterListener listener) {
+    listeners.add(listener);
   }
 
   @Override

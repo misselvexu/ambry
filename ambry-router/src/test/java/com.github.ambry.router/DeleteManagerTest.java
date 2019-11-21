@@ -19,7 +19,8 @@ import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.LoggingNotificationSystem;
-import com.github.ambry.commons.ServerErrorCode;
+import com.github.ambry.network.SocketNetworkClient;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.router.RouterTestHelpers.*;
@@ -99,7 +100,7 @@ public class DeleteManagerTest {
     clusterMap = new MockClusterMap();
     serverLayout = new MockServerLayout(clusterMap);
     RouterConfig routerConfig = new RouterConfig(vProps);
-    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(clusterMap),
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(clusterMap, routerConfig),
         new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, serverLayout, mockTime), new LoggingNotificationSystem(), clusterMap, null, null, null,
         new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
@@ -193,7 +194,7 @@ public class DeleteManagerTest {
   @Test
   public void testBlobExpired() throws Exception {
     ServerErrorCode[] serverErrorCodes = new ServerErrorCode[9];
-    Arrays.fill(serverErrorCodes, ServerErrorCode.Blob_Not_Found);
+    Arrays.fill(serverErrorCodes, ServerErrorCode.Replica_Unavailable);
     serverErrorCodes[5] = ServerErrorCode.Blob_Expired;
     testWithErrorCodes(serverErrorCodes, partition, serverLayout, RouterErrorCode.BlobExpired, deleteErrorCodeChecker);
   }
@@ -360,7 +361,8 @@ public class DeleteManagerTest {
     Properties props = getNonBlockingRouterProperties();
     props.setProperty("router.delete.request.parallelism", "3");
     VerifiableProperties vProps = new VerifiableProperties(props);
-    router = new NonBlockingRouter(new RouterConfig(vProps), new NonBlockingRouterMetrics(clusterMap),
+    RouterConfig routerConfig = new RouterConfig(vProps);
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(clusterMap, routerConfig),
         new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, serverLayout, mockTime), new LoggingNotificationSystem(), clusterMap, null, null, null,
         new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
@@ -403,7 +405,7 @@ public class DeleteManagerTest {
   }
 
   /**
-   * Test the case when the {@link com.github.ambry.network.Selector} of {@link com.github.ambry.network.NetworkClient}
+   * Test the case when the {@link com.github.ambry.network.Selector} of {@link SocketNetworkClient}
    * experiences various exceptions. The order of received responses is the same as defined in {@code serverErrorCodes}.
    */
   @Test
@@ -417,7 +419,8 @@ public class DeleteManagerTest {
     errorCodeHashMap.put(MockSelectorState.ThrowExceptionOnSend, RouterErrorCode.OperationTimedOut);
     errorCodeHashMap.put(MockSelectorState.ThrowThrowableOnSend, RouterErrorCode.RouterClosed);
     for (MockSelectorState state : MockSelectorState.values()) {
-      if (state == MockSelectorState.Good) {
+      if (state == MockSelectorState.Good || state == MockSelectorState.FailConnectionInitiationOnPoll) {
+        // FailConnectionInitiationOnPoll is temporarily used for warm up failure test, skip it here
         continue;
       }
       mockSelectorState.set(state);
@@ -448,6 +451,36 @@ public class DeleteManagerTest {
             assertFailureAndCheckErrorCode(future, expectedError);
           }
         });
+  }
+
+  /**
+   * Test the case  when getting NOT_FOUND error from origin DC while termination on NOT_FOUND is enabled.
+   */
+  @Test
+  public void testOriginDcNotFoundError() throws Exception {
+    assertCloseCleanup(router);
+    Properties props = getNonBlockingRouterProperties();
+    props.setProperty("router.delete.request.parallelism", "1");
+    props.setProperty("router.operation.tracker.terminate.on.not.found.enabled", "true");
+    VerifiableProperties vProps = new VerifiableProperties(props);
+    RouterConfig routerConfig = new RouterConfig(vProps);
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(clusterMap, routerConfig),
+        new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
+            CHECKOUT_TIMEOUT_MS, serverLayout, mockTime), new LoggingNotificationSystem(), clusterMap, null, null, null,
+        new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
+    blobId = new BlobId(routerConfig.routerBlobidCurrentVersion, BlobId.BlobIdType.NATIVE, (byte) 0,
+        Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), partition, false,
+        BlobId.BlobDataType.DATACHUNK);
+    blobIdString = blobId.getID();
+    ServerErrorCode[] serverErrorCodes = new ServerErrorCode[9];
+    Arrays.fill(serverErrorCodes, ServerErrorCode.No_Error);
+    serverErrorCodes[0] = ServerErrorCode.Blob_Not_Found;
+    serverErrorCodes[1] = ServerErrorCode.Blob_Not_Found;
+    serverErrorCodes[2] = ServerErrorCode.Blob_Expired;
+    // The first two responses are blob not found and they are from the local dc and originating dc.
+    // So even if the rest of servers returns No_Error, router will not send any requests to them.
+    testWithErrorCodes(serverErrorCodes, partition, serverLayout, RouterErrorCode.BlobDoesNotExist,
+        deleteErrorCodeChecker);
   }
 
   /**

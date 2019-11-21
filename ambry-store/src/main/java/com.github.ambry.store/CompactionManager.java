@@ -42,7 +42,7 @@ class CompactionManager {
   private final String mountPath;
   private final StoreConfig storeConfig;
   private final Time time;
-  private final Collection<BlobStore> stores;
+  private final Set<BlobStore> stores = ConcurrentHashMap.newKeySet();
   private final CompactionExecutor compactionExecutor;
   private final StorageManagerMetrics metrics;
   private final CompactionPolicy compactionPolicy;
@@ -53,7 +53,7 @@ class CompactionManager {
   /**
    * Creates a CompactionManager that handles scheduling and executing compaction.
    * @param mountPath the mount path of all the stores for which compaction may be executed.
-   * @param storeConfig the {@link StoreConfig} that contains configurationd details.
+   * @param storeConfig the {@link StoreConfig} that contains configuration details.
    * @param stores the {@link Collection} of {@link BlobStore} that compaction needs to be executed for.
    * @param metrics the {@link StorageManagerMetrics} to use.
    * @param time the {@link Time} instance to use.
@@ -62,7 +62,7 @@ class CompactionManager {
       StorageManagerMetrics metrics, Time time) {
     this.mountPath = mountPath;
     this.storeConfig = storeConfig;
-    this.stores = stores;
+    this.stores.addAll(stores);
     this.time = time;
     this.metrics = metrics;
     if (!storeConfig.storeCompactionTriggers[0].isEmpty()) {
@@ -147,21 +147,62 @@ class CompactionManager {
    * Disable the given {@code store} for compaction.
    * @param store the {@link BlobStore} to be disabled or enabled.
    * @param enable whether to enable ({@code true}) or disable.
-   * @return {@code true} if the disabling was successful. {@code false} if not.
    */
-  boolean controlCompactionForBlobStore(BlobStore store, boolean enable) {
-    return compactionExecutor == null || compactionExecutor.controlCompactionForBlobStore(store, enable);
+  void controlCompactionForBlobStore(BlobStore store, boolean enable) {
+    if (compactionExecutor != null) {
+      compactionExecutor.controlCompactionForBlobStore(store, enable);
+    }
+  }
+
+  /**
+   * Remove store from compaction manager.
+   * @param store the {@link BlobStore} to remove
+   * @return {@code true} if store is removed successfully. {@code false} if not.
+   */
+  boolean removeBlobStore(BlobStore store) {
+    if (compactionExecutor == null) {
+      stores.remove(store);
+      return true;
+    } else if (!compactionExecutor.getStoresDisabledCompaction().contains(store)) {
+      logger.error("Fail to remove store ({}) from compaction manager because compaction is still enabled on it",
+          store);
+      return false;
+    }
+    // stores.remove(store) is invoked within compactionExecutor.removeBlobStore() because it requires lock
+    compactionExecutor.removeBlobStore(store);
+    return true;
   }
 
   /**
    * Get compaction details for a given {@link BlobStore} if any
-   * @param blobStore the {@link BlobStore} for which compation details are requested
+   * @param blobStore the {@link BlobStore} for which compaction details are requested
    * @return the {@link CompactionDetails} containing the details about log segments that needs to be compacted.
    * {@code null} if compaction is not required
    * @throws StoreException when {@link BlobStore} is not started
    */
   private CompactionDetails getCompactionDetails(BlobStore blobStore) throws StoreException {
     return blobStore.getCompactionDetails(compactionPolicy);
+  }
+
+  /**
+   * Add a new BlobStore into Compaction Manager.
+   * @param store the {@link BlobStore} which would be added.
+   */
+  void addBlobStore(BlobStore store) {
+    if (compactionExecutor == null) {
+      stores.add(store);
+    } else {
+      // we first disable compaction on new store and then add it into stores set
+      compactionExecutor.controlCompactionForBlobStore(store, false);
+      stores.add(store);
+    }
+  }
+
+  /**
+   * @return all stores in compaction manager.
+   */
+  Set<BlobStore> getAllStores() {
+    return stores;
   }
 
   /**
@@ -239,7 +280,7 @@ class CompactionManager {
                     compactionStarted = true;
                     store.compact(details, bundleReadBuffer);
                   } else {
-                    logger.info("{} is not eligible for compaction", store);
+                    logger.info("{} is not eligible for compaction due to empty compaction details", store);
                   }
                 }
               } catch (Exception e) {
@@ -332,18 +373,41 @@ class CompactionManager {
     }
 
     /**
-     * Disable the compaction on given blobstore
+     * Disable/Enable the compaction on given BlobStore
      * @param store the {@link BlobStore} on which the compaction is enabled or disabled.
      * @param enable whether to enable ({@code true}) or disable.
-     * @return {@code true} if the disabling was successful. {@code false} if not.
      */
-    boolean controlCompactionForBlobStore(BlobStore store, boolean enable) {
+    void controlCompactionForBlobStore(BlobStore store, boolean enable) {
       if (enable) {
         storesDisabledCompaction.remove(store);
       } else {
         storesDisabledCompaction.add(store);
       }
-      return true;
+    }
+
+    /**
+     * Remove store from compaction executor.
+     * @param store the {@link BlobStore} to remove
+     */
+    void removeBlobStore(BlobStore store) {
+      lock.lock();
+      try {
+        stores.remove(store);
+        // It's ok to remove store from "storesDisabledCompaction" and "storesToSkip" list while executor thread is
+        // going through each store to check compaction eligibility. Note that the executor will first check if store
+        // is started, which is guaranteed to be false before removeBlobStore() is invoked.
+        storesDisabledCompaction.remove(store);
+        storesToSkip.remove(store);
+      } finally {
+        lock.unlock();
+      }
+    }
+
+    /**
+     * @return a list of stores on which compaction is disabled.
+     */
+    Set<BlobStore> getStoresDisabledCompaction() {
+      return storesDisabledCompaction;
     }
   }
 }

@@ -16,7 +16,6 @@ package com.github.ambry.server;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.account.AccountService;
 import com.github.ambry.account.InMemAccountService;
-import com.github.ambry.cloud.CloudBackupManager;
 import com.github.ambry.cloud.CloudBlobMetadata;
 import com.github.ambry.cloud.CloudDestinationFactory;
 import com.github.ambry.cloud.LatchBasedInMemoryCloudDestination;
@@ -34,13 +33,13 @@ import com.github.ambry.clustermap.MockPartitionId;
 import com.github.ambry.clustermap.MockReplicaId;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.ReplicaId;
+import com.github.ambry.clustermap.ReplicaType;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.BlobIdFactory;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.CommonTestUtils;
 import com.github.ambry.commons.CopyingAsyncWritableChannel;
 import com.github.ambry.commons.SSLFactory;
-import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.ConnectionPoolConfig;
 import com.github.ambry.config.SSLConfig;
@@ -52,7 +51,8 @@ import com.github.ambry.messageformat.BlobType;
 import com.github.ambry.messageformat.MessageFormatException;
 import com.github.ambry.messageformat.MessageFormatFlags;
 import com.github.ambry.messageformat.MessageFormatRecord;
-import com.github.ambry.messageformat.UpdateRecord;
+import com.github.ambry.messageformat.PutMessageFormatInputStream;
+import com.github.ambry.messageformat.SubRecord;
 import com.github.ambry.network.BlockingChannel;
 import com.github.ambry.network.BlockingChannelConnectionPool;
 import com.github.ambry.network.ConnectedChannel;
@@ -64,6 +64,7 @@ import com.github.ambry.notification.UpdateType;
 import com.github.ambry.protocol.AdminRequest;
 import com.github.ambry.protocol.AdminRequestOrResponseType;
 import com.github.ambry.protocol.AdminResponse;
+import com.github.ambry.protocol.BlobStoreControlAction;
 import com.github.ambry.protocol.BlobStoreControlAdminRequest;
 import com.github.ambry.protocol.DeleteRequest;
 import com.github.ambry.protocol.DeleteResponse;
@@ -75,6 +76,7 @@ import com.github.ambry.protocol.PutRequest;
 import com.github.ambry.protocol.PutResponse;
 import com.github.ambry.protocol.TtlUpdateRequest;
 import com.github.ambry.protocol.TtlUpdateResponse;
+import com.github.ambry.replication.FindTokenFactory;
 import com.github.ambry.router.Callback;
 import com.github.ambry.router.GetBlobOptionsBuilder;
 import com.github.ambry.router.GetBlobResult;
@@ -82,12 +84,13 @@ import com.github.ambry.router.NonBlockingRouterFactory;
 import com.github.ambry.router.PutBlobOptionsBuilder;
 import com.github.ambry.router.ReadableStreamChannel;
 import com.github.ambry.router.Router;
-import com.github.ambry.store.FindTokenFactory;
 import com.github.ambry.store.MessageInfo;
 import com.github.ambry.store.Offset;
 import com.github.ambry.store.StoreFindToken;
 import com.github.ambry.store.StoreKeyFactory;
+import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.CrcInputStream;
+import com.github.ambry.utils.HelixControllerManager;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
@@ -116,7 +119,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.stream.Collectors;
 import javax.net.ssl.SSLSocketFactory;
 import org.junit.Assert;
 
@@ -401,7 +403,8 @@ final class ServerTestUtil {
       System.out.println("Begin to stop a BlobStore");
       AdminRequest adminRequest =
           new AdminRequest(AdminRequestOrResponseType.BlobStoreControl, partitionIds.get(0), 1, "clientid2");
-      BlobStoreControlAdminRequest controlRequest = new BlobStoreControlAdminRequest((short) 0, false, adminRequest);
+      BlobStoreControlAdminRequest controlRequest =
+          new BlobStoreControlAdminRequest((short) 0, BlobStoreControlAction.StopStore, adminRequest);
       channel.send(controlRequest);
       stream = channel.receive().getInputStream();
       AdminResponse adminResponse = AdminResponse.readFrom(new DataInputStream(stream));
@@ -442,7 +445,7 @@ final class ServerTestUtil {
       // start the store via AdminRequest
       System.out.println("Begin to restart the BlobStore");
       adminRequest = new AdminRequest(AdminRequestOrResponseType.BlobStoreControl, partitionIds.get(0), 1, "clientid2");
-      controlRequest = new BlobStoreControlAdminRequest((short) 0, true, adminRequest);
+      controlRequest = new BlobStoreControlAdminRequest((short) 0, BlobStoreControlAction.StartStore, adminRequest);
       channel.send(controlRequest);
       stream = channel.receive().getInputStream();
       adminResponse = AdminResponse.readFrom(new DataInputStream(stream));
@@ -488,6 +491,10 @@ final class ServerTestUtil {
       deleteResponse = DeleteResponse.readFrom(new DataInputStream(stream));
       assertEquals("Delete blob on restarted store should succeed", ServerErrorCode.No_Error,
           deleteResponse.getError());
+
+      // Bounce servers to make them read the persisted token file.
+      cluster.stopServers();
+      cluster.startServers();
 
       channel.disconnect();
     } catch (Exception e) {
@@ -549,19 +556,19 @@ final class ServerTestUtil {
   }
 
   /**
-   * Tests blobs put to dataNode can be backed up by {@link CloudBackupManager}.
+   * Tests blobs put to dataNode can be backed up by {@link com.github.ambry.cloud.VcrReplicationManager}.
    * @param cluster the {@link MockCluster} of dataNodes.
    * @param dataNode the datanode where blobs are originally put.
    * @param clientSSLConfig the {@link SSLConfig}.
    * @param clientSSLSocketFactory the {@link SSLSocketFactory}.
-   * @param testEncryption if encryption will be tested. Not used now.
    * @param notificationSystem the {@link MockNotificationSystem} to track blobs event in {@link MockCluster}.
-   * @param vcrSSLProps
+   * @param vcrSSLProps SSL related properties for VCR. Can be {@code null}.
+   * @param ttl The ttl of blobs in their original PUT.
+   * @param doTtlUpdate Do ttlUpdate request if {@true}.
    */
   static void endToEndCloudBackupTest(MockCluster cluster, DataNodeId dataNode, SSLConfig clientSSLConfig,
-      SSLSocketFactory clientSSLSocketFactory, boolean testEncryption, MockNotificationSystem notificationSystem,
-      Properties vcrSSLProps) throws Exception {
-    // TODO: test encryption
+      SSLSocketFactory clientSSLSocketFactory, MockNotificationSystem notificationSystem, Properties vcrSSLProps,
+      long ttl, boolean doTtlUpdate) throws Exception {
     int blobBackupCount = 10;
     int blobSize = 100;
     int userMetaDataSize = 100;
@@ -573,8 +580,7 @@ final class ServerTestUtil {
     short accountId = Utils.getRandomShort(TestUtils.RANDOM);
     short containerId = Utils.getRandomShort(TestUtils.RANDOM);
     BlobProperties properties =
-        new BlobProperties(blobSize, "serviceid1", null, null, false, Utils.Infinite_Time, accountId, containerId,
-            false, null);
+        new BlobProperties(blobSize, "serviceid1", null, null, false, ttl, accountId, containerId, false, null);
     TestUtils.RANDOM.nextBytes(userMetadata);
     TestUtils.RANDOM.nextBytes(data);
 
@@ -592,52 +598,47 @@ final class ServerTestUtil {
     List<BlobId> blobIds = runnable.getBlobIds();
     for (BlobId blobId : blobIds) {
       notificationSystem.awaitBlobCreations(blobId.getID());
+      if (doTtlUpdate) {
+        updateBlobTtl(channel, blobId);
+      }
     }
 
+    // Start Helix Controller and ZK Server.
+    int zkPort = 31999;
+    String zkConnectString = "localhost:" + zkPort;
+    String vcrClusterName = "vcrTestCluster";
+    TestUtils.ZkInfo zkInfo = new TestUtils.ZkInfo(TestUtils.getTempDir("helixVcr"), "DC1", (byte) 1, zkPort, true);
+    HelixControllerManager helixControllerManager =
+        VcrTestUtil.populateZkInfoAndStartController(zkConnectString, vcrClusterName, clusterMap);
     // Start the VCR and CloudBackupManager
-    Properties props = new Properties();
-    props.setProperty("connectionpool.read.timeout.ms", "15000");
-    props.setProperty("server.scheduler.num.of.threads", "1");
-    props.setProperty("num.io.threads", "1");
-    props.setProperty("clustermap.host.name", "localhost");
-    props.setProperty("clustermap.resolve.hostnames", "false");
-    props.setProperty("clustermap.cluster.name", "thisIsClusterName");
-    props.setProperty("clustermap.datacenter.name", dataNode.getDatacenterName());
-    props.setProperty("clustermap.port", "12309");
-    props.setProperty("vcr.cluster.name", "VCRCluster");
-    if (vcrSSLProps == null) {
-      props.setProperty("clustermap.ssl.enabled.datacenters", "");
-    } else {
-      props.putAll(vcrSSLProps);
-      props.setProperty("vcr.ssl.port", "12310");
-      props.setProperty("clustermap.ssl.enabled.datacenters", dataNode.getDatacenterName());
-    }
-    props.setProperty("vcr.cluster.name", "VCRCluster");
-    props.setProperty("kms.default.container.key", TestUtils.getRandomKey(32));
-    props.setProperty("vcr.assigned.partitions", String.join(",",
-        clusterMap.getAllPartitionIds(null).stream().map(p -> p.toPathString()).collect(Collectors.toList())));
-    VerifiableProperties vProps = new VerifiableProperties(props);
+    Properties props =
+        VcrTestUtil.createVcrProperties(dataNode.getDatacenterName(), vcrClusterName, zkConnectString, 12310, 12410,
+            vcrSSLProps);
     LatchBasedInMemoryCloudDestination latchBasedInMemoryCloudDestination =
         new LatchBasedInMemoryCloudDestination(blobIds);
     CloudDestinationFactory cloudDestinationFactory =
         new LatchBasedInMemoryCloudDestinationFactory(latchBasedInMemoryCloudDestination);
 
     VcrServer vcrServer =
-        VcrTestUtil.createVcrServer(vProps, clusterAgentsFactory, notificationSystem, cloudDestinationFactory);
+        VcrTestUtil.createVcrServer(new VerifiableProperties(props), clusterAgentsFactory, notificationSystem,
+            cloudDestinationFactory);
     vcrServer.startup();
 
     // Waiting for backup done
-    assertTrue("Did not backup all blobs in 2 minutes", latchBasedInMemoryCloudDestination.await(2, TimeUnit.MINUTES));
+    assertTrue("Did not backup all blobs in 2 minutes",
+        latchBasedInMemoryCloudDestination.awaitUpload(2, TimeUnit.MINUTES));
     Map<String, CloudBlobMetadata> cloudBlobMetadataMap = latchBasedInMemoryCloudDestination.getBlobMetadata(blobIds);
     for (BlobId blobId : blobIds) {
       CloudBlobMetadata cloudBlobMetadata = cloudBlobMetadataMap.get(blobId.toString());
-      assertNotNull("cloudBlobMetadata shold not be null", cloudBlobMetadata);
+      assertNotNull("cloudBlobMetadata should not be null", cloudBlobMetadata);
       assertEquals("AccountId mismatch", accountId, cloudBlobMetadata.getAccountId());
       assertEquals("ContainerId mismatch", containerId, cloudBlobMetadata.getContainerId());
       assertEquals("Expiration time mismatch", Utils.Infinite_Time, cloudBlobMetadata.getExpirationTime());
       // TODO: verify other metadata and blob data
     }
     vcrServer.shutdown();
+    helixControllerManager.syncStop();
+    zkInfo.shutdown();
   }
 
   static void endToEndReplicationWithMultiNodeMultiPartitionTest(int interestedDataNodePortNumber, Port dataNode1Port,
@@ -1344,7 +1345,8 @@ final class ServerTestUtil {
     System.out.println("Begin to stop a BlobStore");
     AdminRequest adminRequest =
         new AdminRequest(AdminRequestOrResponseType.BlobStoreControl, partitionId, 1, "clientid2");
-    BlobStoreControlAdminRequest controlRequest = new BlobStoreControlAdminRequest((short) 0, false, adminRequest);
+    BlobStoreControlAdminRequest controlRequest =
+        new BlobStoreControlAdminRequest((short) 0, BlobStoreControlAction.StopStore, adminRequest);
     channel.send(controlRequest);
     InputStream stream = channel.receive().getInputStream();
     AdminResponse adminResponse = AdminResponse.readFrom(new DataInputStream(stream));
@@ -1389,7 +1391,7 @@ final class ServerTestUtil {
     // start the store via AdminRequest
     System.out.println("Begin to restart the BlobStore");
     adminRequest = new AdminRequest(AdminRequestOrResponseType.BlobStoreControl, partitionId, 1, "clientId");
-    controlRequest = new BlobStoreControlAdminRequest((short) 0, true, adminRequest);
+    controlRequest = new BlobStoreControlAdminRequest((short) 0, BlobStoreControlAction.StartStore, adminRequest);
     channel.send(controlRequest);
     stream = channel.receive().getInputStream();
     adminResponse = AdminResponse.readFrom(new DataInputStream(stream));
@@ -1569,7 +1571,7 @@ final class ServerTestUtil {
       checkTtlUpdateStatus(channel3, clusterMap, blobIdFactory, blobIdList.get(5), dataList.get(5), false,
           getExpiryTimeMs(propertyList.get(5)));
       updateBlobTtl(channel3, blobIdList.get(5));
-      expectedTokenSize += getUpdateRecordSize(blobIdList.get(5), UpdateRecord.Type.TTL_UPDATE);
+      expectedTokenSize += getUpdateRecordSize(blobIdList.get(5), SubRecord.Type.TTL_UPDATE);
       checkTtlUpdateStatus(channel3, clusterMap, blobIdFactory, blobIdList.get(5), dataList.get(5), true,
           Utils.Infinite_Time);
       notificationSystem.awaitBlobUpdates(blobIdList.get(5).getID(), UpdateType.TTL_UPDATE);
@@ -1721,7 +1723,7 @@ final class ServerTestUtil {
 
       // delete a blob and ensure it is propagated
       DeleteRequest deleteRequest = new DeleteRequest(1, "reptest", blobIdList.get(0), System.currentTimeMillis());
-      expectedTokenSize += getUpdateRecordSize(blobIdList.get(0), UpdateRecord.Type.DELETE);
+      expectedTokenSize += getUpdateRecordSize(blobIdList.get(0), SubRecord.Type.DELETE);
       channel1.send(deleteRequest);
       InputStream deleteResponseStream = channel1.receive().getInputStream();
       DeleteResponse deleteResponse = DeleteResponse.readFrom(new DataInputStream(deleteResponseStream));
@@ -1744,7 +1746,7 @@ final class ServerTestUtil {
       // get the data node to inspect replication tokens on
       DataNodeId dataNodeId = clusterMap.getDataNodeId("localhost", interestedDataNodePortNumber);
       checkReplicaTokens(clusterMap, dataNodeId,
-          expectedTokenSize - getUpdateRecordSize(blobIdList.get(0), UpdateRecord.Type.DELETE), "0");
+          expectedTokenSize - getUpdateRecordSize(blobIdList.get(0), SubRecord.Type.DELETE), "0");
 
       // Shut down server 1
       cluster.getServers().get(0).shutdown();
@@ -1814,7 +1816,7 @@ final class ServerTestUtil {
       checkTtlUpdateStatus(channel2, clusterMap, blobIdFactory, blobIdList.get(10), dataList.get(10), false,
           getExpiryTimeMs(propertyList.get(10)));
       updateBlobTtl(channel2, blobIdList.get(10));
-      expectedTokenSize += getUpdateRecordSize(blobIdList.get(10), UpdateRecord.Type.TTL_UPDATE);
+      expectedTokenSize += getUpdateRecordSize(blobIdList.get(10), SubRecord.Type.TTL_UPDATE);
       checkTtlUpdateStatus(channel2, clusterMap, blobIdFactory, blobIdList.get(10), dataList.get(10), true,
           Utils.Infinite_Time);
 
@@ -1954,7 +1956,7 @@ final class ServerTestUtil {
    * @param updateType the type of update
    * @return the size of the update record in the log
    */
-  private static long getUpdateRecordSize(BlobId blobId, UpdateRecord.Type updateType) {
+  private static long getUpdateRecordSize(BlobId blobId, SubRecord.Type updateType) {
     return MessageFormatRecord.MessageHeader_Format_V2.getHeaderSize() + blobId.sizeInBytes()
         + MessageFormatRecord.Update_Format_V3.getRecordSize(updateType);
   }
@@ -2005,9 +2007,8 @@ final class ServerTestUtil {
           DataInputStream dataInputStream = new DataInputStream(crcStream);
           try {
             short version = dataInputStream.readShort();
-            assertEquals(0, version);
+            assertEquals(1, version);
 
-            System.out.println("setToCheck" + setToCheck.size());
             while (dataInputStream.available() > 8) {
               // read partition id
               PartitionId partitionId = clusterMap.getPartitionIdFromStream(dataInputStream);
@@ -2022,6 +2023,8 @@ final class ServerTestUtil {
               setToCheck.remove(partitionId.toString() + hostname + port);
               // read total bytes read from local store
               dataInputStream.readLong();
+              // read replica type
+              ReplicaType replicaType = ReplicaType.values()[dataInputStream.readShort()];
               // read replica token
               StoreFindToken token = (StoreFindToken) factory.getFindToken(dataInputStream);
               System.out.println(
@@ -2217,7 +2220,7 @@ final class ServerTestUtil {
    * @param hostName upon which connection has to be established
    * @return BlockingChannel
    */
-  static BlockingChannel getBlockingChannelBasedOnPortType(Port targetPort, String hostName,
+  public static BlockingChannel getBlockingChannelBasedOnPortType(Port targetPort, String hostName,
       SSLSocketFactory sslSocketFactory, SSLConfig sslConfig) {
     BlockingChannel channel = null;
     if (targetPort.getPortType() == PortType.PLAINTEXT) {
@@ -2238,5 +2241,44 @@ final class ServerTestUtil {
   static SSLFactory getSSLFactoryIfRequired(VerifiableProperties verifiableProperties) throws Exception {
     boolean requiresSSL = new ClusterMapConfig(verifiableProperties).clusterMapSslEnabledDatacenters.length() > 0;
     return requiresSSL ? SSLFactory.getNewInstance(new SSLConfig(verifiableProperties)) : null;
+  }
+
+  /**
+   * Create {@link PutMessageFormatInputStream} for a blob with given {@link BlobId} and update {@code blobIdToSizeMap}.
+   * @param blobId {@link BlobId} object.
+   * @param blobSize size of blob.
+   * @param blobIdToSizeMap {@link Map} of {@link BlobId} to size of blob uploaded.
+   * @return {@link PutMessageFormatInputStream} object.
+   * @throws Exception
+   */
+  static PutMessageFormatInputStream getPutMessageInputStreamForBlob(BlobId blobId, int blobSize,
+      Map<BlobId, Integer> blobIdToSizeMap, short accountId, short containerId) throws Exception {
+    int userMetaDataSize = 100;
+    byte[] userMetadata = new byte[userMetaDataSize];
+    TestUtils.RANDOM.nextBytes(userMetadata);
+    byte[] data = new byte[blobSize];
+    BlobProperties blobProperties =
+        new BlobProperties(blobSize, "serviceid1", null, null, false, Utils.Infinite_Time, accountId, containerId,
+            false, null);
+    TestUtils.RANDOM.nextBytes(data);
+    blobIdToSizeMap.put(blobId, blobSize);
+    return new PutMessageFormatInputStream(blobId, null, blobProperties, ByteBuffer.wrap(userMetadata),
+        new ByteBufferInputStream(ByteBuffer.wrap(data)), blobSize);
+  }
+
+  /**
+   * Create {@code blobCount} number of {@link BlobId}s.
+   * @param blobCount number of {@link BlobId}s to create.
+   * @return list of {@link BlobId}s
+   */
+  static List<BlobId> createBlobIds(int blobCount, ClusterMap clusterMap, short accountId, short containerId,
+      PartitionId partitionId) {
+    List<BlobId> blobIds = new ArrayList<>(blobCount);
+    for (int i = 0; i < blobCount; i++) {
+      BlobId blobId = new BlobId(CommonTestUtils.getCurrentBlobIdVersion(), BlobId.BlobIdType.NATIVE,
+          clusterMap.getLocalDatacenterId(), accountId, containerId, partitionId, false, BlobId.BlobDataType.DATACHUNK);
+      blobIds.add(blobId);
+    }
+    return blobIds;
   }
 }

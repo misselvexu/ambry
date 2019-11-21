@@ -14,17 +14,31 @@
 package com.github.ambry.router;
 
 import com.codahale.metrics.Counter;
+import com.codahale.metrics.ExponentiallyDecayingReservoir;
 import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Timer;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.DataNodeId;
+import com.github.ambry.clustermap.DiskId;
+import com.github.ambry.clustermap.PartitionId;
+import com.github.ambry.clustermap.ReplicaId;
+import com.github.ambry.clustermap.Resource;
+import com.github.ambry.config.RouterConfig;
 import com.github.ambry.utils.SystemTime;
+import com.github.ambry.utils.Utils;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import static com.github.ambry.utils.Utils.*;
 
 
 /**
@@ -34,6 +48,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public class NonBlockingRouterMetrics {
   private final MetricRegistry metricRegistry;
+  private static final Logger logger = LoggerFactory.getLogger(NonBlockingRouterMetrics.class);
 
   // Operation rate.
   public final Meter putBlobOperationRate;
@@ -41,6 +56,7 @@ public class NonBlockingRouterMetrics {
   public final Meter getBlobInfoOperationRate;
   public final Meter getBlobOperationRate;
   public final Meter getBlobWithRangeOperationRate;
+  public final Meter getBlobWithSegmentOperationRate;
   public final Meter deleteBlobOperationRate;
   public final Meter updateBlobTtlOperationRate;
   public final Meter putEncryptedBlobOperationRate;
@@ -48,6 +64,7 @@ public class NonBlockingRouterMetrics {
   public final Meter getEncryptedBlobInfoOperationRate;
   public final Meter getEncryptedBlobOperationRate;
   public final Meter getEncryptedBlobWithRangeOperationRate;
+  public final Meter getEncryptedBlobWithSegmentOperationRate;
   public final Meter operationQueuingRate;
   public final Meter operationDequeuingRate;
   public final Meter getBlobNotOriginateLocalOperationRate;
@@ -57,7 +74,7 @@ public class NonBlockingRouterMetrics {
   // Latency.
   public final Histogram putBlobOperationLatencyMs;
   public final Histogram stitchBlobOperationLatencyMs;
-  public final Histogram putChunkOperationLatencyMs;
+  public final Timer putChunkOperationLatencyMs;
   public final Histogram getBlobInfoOperationLatencyMs;
   public final Histogram getBlobOperationLatencyMs;
   public final Histogram getBlobOperationTotalTimeMs;
@@ -77,11 +94,13 @@ public class NonBlockingRouterMetrics {
   public final Counter getBlobInfoErrorCount;
   public final Counter getBlobErrorCount;
   public final Counter getBlobWithRangeErrorCount;
+  public final Counter getBlobWithSegmentErrorCount;
   public final Counter putEncryptedBlobErrorCount;
   public final Counter stitchEncryptedBlobErrorCount;
   public final Counter getEncryptedBlobInfoErrorCount;
   public final Counter getEncryptedBlobErrorCount;
   public final Counter getEncryptedBlobWithRangeErrorCount;
+  public final Counter getEncryptedBlobWithSegmentErrorCount;
   public final Counter deleteBlobErrorCount;
   public final Counter updateBlobTtlErrorCount;
   public final Counter operationAbortCount;
@@ -153,7 +172,9 @@ public class NonBlockingRouterMetrics {
   public final Histogram getBlobSizeBytes;
   public final Histogram getBlobChunkCount;
   public final Histogram getBlobWithRangeSizeBytes;
+  public final Histogram getBlobWithSegmentSizeBytes;
   public final Histogram getBlobWithRangeTotalBlobSizeBytes;
+  public final Histogram getBlobWithSegmentTotalBlobSizeBytes;
   public final Counter simpleBlobPutCount;
   public final Counter simpleBlobGetCount;
   public final Counter compositeBlobPutCount;
@@ -161,12 +182,12 @@ public class NonBlockingRouterMetrics {
   public final Counter rawBlobGetCount;
 
   // AdaptiveOperationTracker metrics
-  public final Histogram getBlobLocalColoLatencyMs;
-  public final Histogram getBlobCrossColoLatencyMs;
+  public final Histogram getBlobLocalDcLatencyMs;
+  public final Histogram getBlobCrossDcLatencyMs;
   public final Counter getBlobPastDueCount;
 
-  public final Histogram getBlobInfoLocalColoLatencyMs;
-  public final Histogram getBlobInfoCrossColoLatencyMs;
+  public final Histogram getBlobInfoLocalDcLatencyMs;
+  public final Histogram getBlobInfoCrossDcLatencyMs;
   public final Counter getBlobInfoPastDueCount;
 
   // Workload characteristics
@@ -178,11 +199,22 @@ public class NonBlockingRouterMetrics {
   public final CryptoJobMetrics encryptJobMetrics;
   public final CryptoJobMetrics decryptJobMetrics;
 
+  // Resource to latency histogram map. Here resource can be DataNode, Partition, Disk, Replica etc.
+  Map<Resource, Histogram> getBlobLocalDcResourceToLatency = new HashMap<>();
+  Map<Resource, Histogram> getBlobCrossDcResourceToLatency = new HashMap<>();
+
+  Map<Resource, Histogram> getBlobInfoLocalDcResourceToLatency = new HashMap<>();
+  Map<Resource, Histogram> getBlobInfoCrossDcResourceToLatency = new HashMap<>();
+
   // Map that stores dataNode-level metrics.
   private final Map<DataNodeId, NodeLevelMetrics> dataNodeToMetrics;
+  private final RouterConfig routerConfig;
+  private final HistogramDumper histogramDumper;
+  private ScheduledExecutorService scheduler = null;
 
-  public NonBlockingRouterMetrics(ClusterMap clusterMap) {
+  public NonBlockingRouterMetrics(ClusterMap clusterMap, RouterConfig routerConfig) {
     metricRegistry = clusterMap.getMetricRegistry();
+    this.routerConfig = routerConfig;
 
     // Operation Rate.
     putBlobOperationRate = metricRegistry.meter(MetricRegistry.name(PutOperation.class, "PutBlobOperationRate"));
@@ -192,6 +224,8 @@ public class NonBlockingRouterMetrics {
     getBlobOperationRate = metricRegistry.meter(MetricRegistry.name(GetBlobOperation.class, "GetBlobOperationRate"));
     getBlobWithRangeOperationRate =
         metricRegistry.meter(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithRangeOperationRate"));
+    getBlobWithSegmentOperationRate =
+        metricRegistry.meter(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithSegmentOperationRate"));
     putEncryptedBlobOperationRate =
         metricRegistry.meter(MetricRegistry.name(PutOperation.class, "PutEncryptedBlobOperationRate"));
     stitchEncryptedBlobOperationRate =
@@ -202,6 +236,8 @@ public class NonBlockingRouterMetrics {
         metricRegistry.meter(MetricRegistry.name(GetBlobOperation.class, "GetEncryptedBlobOperationRate"));
     getEncryptedBlobWithRangeOperationRate =
         metricRegistry.meter(MetricRegistry.name(GetBlobOperation.class, "GetEncryptedBlobWithRangeOperationRate"));
+    getEncryptedBlobWithSegmentOperationRate =
+        metricRegistry.meter(MetricRegistry.name(GetBlobOperation.class, "GetEncryptedBlobWithSegmentOperationRate"));
     deleteBlobOperationRate =
         metricRegistry.meter(MetricRegistry.name(DeleteOperation.class, "DeleteBlobOperationRate"));
     updateBlobTtlOperationRate =
@@ -222,7 +258,7 @@ public class NonBlockingRouterMetrics {
     stitchBlobOperationLatencyMs =
         metricRegistry.histogram(MetricRegistry.name(PutOperation.class, "StitchBlobOperationLatencyMs"));
     putChunkOperationLatencyMs =
-        metricRegistry.histogram(MetricRegistry.name(PutOperation.class, "PutChunkOperationLatencyMs"));
+        metricRegistry.timer(MetricRegistry.name(PutOperation.class, "PutChunkOperationLatencyMs"));
     getBlobInfoOperationLatencyMs =
         metricRegistry.histogram(MetricRegistry.name(GetBlobInfoOperation.class, "GetBlobInfoOperationLatencyMs"));
     getBlobOperationLatencyMs =
@@ -256,6 +292,8 @@ public class NonBlockingRouterMetrics {
     getBlobErrorCount = metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "GetBlobErrorCount"));
     getBlobWithRangeErrorCount =
         metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithRangeErrorCount"));
+    getBlobWithSegmentErrorCount =
+        metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithSegmentErrorCount"));
     putEncryptedBlobErrorCount =
         metricRegistry.counter(MetricRegistry.name(PutOperation.class, "PutEncryptedBlobErrorCount"));
     stitchEncryptedBlobErrorCount =
@@ -266,6 +304,8 @@ public class NonBlockingRouterMetrics {
         metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "GetEncryptedBlobErrorCount"));
     getEncryptedBlobWithRangeErrorCount =
         metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "GetEncryptedBlobWithRangeErrorCount"));
+    getEncryptedBlobWithSegmentErrorCount =
+        metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "GetEncryptedBlobWithSegmentErrorCount"));
     deleteBlobErrorCount = metricRegistry.counter(MetricRegistry.name(DeleteOperation.class, "DeleteBlobErrorCount"));
     updateBlobTtlErrorCount =
         metricRegistry.counter(MetricRegistry.name(TtlUpdateOperation.class, "UpdateBlobTtlErrorCount"));
@@ -367,8 +407,12 @@ public class NonBlockingRouterMetrics {
     getBlobChunkCount = metricRegistry.histogram(MetricRegistry.name(GetManager.class, "GetBlobChunkCount"));
     getBlobWithRangeSizeBytes =
         metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithRangeSizeBytes"));
+    getBlobWithSegmentSizeBytes =
+        metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithSegmentSizeBytes"));
     getBlobWithRangeTotalBlobSizeBytes =
         metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithRangeTotalBlobSizeBytes"));
+    getBlobWithSegmentTotalBlobSizeBytes =
+        metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "GetBlobWithSegmentTotalBlobSizeBytes"));
     simpleBlobPutCount = metricRegistry.counter(MetricRegistry.name(PutManager.class, "SimpleBlobPutCount"));
     simpleBlobGetCount = metricRegistry.counter(MetricRegistry.name(GetManager.class, "SimpleBlobGetCount"));
     compositeBlobPutCount = metricRegistry.counter(MetricRegistry.name(PutManager.class, "CompositeBlobPutCount"));
@@ -385,16 +429,14 @@ public class NonBlockingRouterMetrics {
     }
 
     // AdaptiveOperationTracker trackers
-    getBlobLocalColoLatencyMs =
-        metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "LocalColoLatencyMs"));
-    getBlobCrossColoLatencyMs =
-        metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "CrossColoLatencyMs"));
+    getBlobLocalDcLatencyMs = metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "LocalDcLatencyMs"));
+    getBlobCrossDcLatencyMs = metricRegistry.histogram(MetricRegistry.name(GetBlobOperation.class, "CrossDcLatencyMs"));
     getBlobPastDueCount = metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "PastDueCount"));
 
-    getBlobInfoLocalColoLatencyMs =
-        metricRegistry.histogram(MetricRegistry.name(GetBlobInfoOperation.class, "LocalColoLatencyMs"));
-    getBlobInfoCrossColoLatencyMs =
-        metricRegistry.histogram(MetricRegistry.name(GetBlobInfoOperation.class, "CrossColoLatencyMs"));
+    getBlobInfoLocalDcLatencyMs =
+        metricRegistry.histogram(MetricRegistry.name(GetBlobInfoOperation.class, "LocalDcLatencyMs"));
+    getBlobInfoCrossDcLatencyMs =
+        metricRegistry.histogram(MetricRegistry.name(GetBlobInfoOperation.class, "CrossDcLatencyMs"));
     getBlobInfoPastDueCount = metricRegistry.counter(MetricRegistry.name(GetBlobInfoOperation.class, "PastDueCount"));
 
     // Workload
@@ -405,6 +447,114 @@ public class NonBlockingRouterMetrics {
     // Encrypt/Decrypt job metrics
     encryptJobMetrics = new CryptoJobMetrics(PutOperation.class, "Encrypt", metricRegistry);
     decryptJobMetrics = new CryptoJobMetrics(GetOperation.class, "Decrypt", metricRegistry);
+
+    // Record type of adaptive tracker and configure custom percentiles
+    if (routerConfig != null) {
+      logger.info("The metric scope of adaptive tracker is {}", routerConfig.routerOperationTrackerMetricScope);
+      registerCustomPercentiles(GetBlobOperation.class, "LocalDcLatencyMs", getBlobLocalDcLatencyMs,
+          routerConfig.routerOperationTrackerCustomPercentiles);
+      registerCustomPercentiles(GetBlobOperation.class, "CrossDcLatencyMs", getBlobCrossDcLatencyMs,
+          routerConfig.routerOperationTrackerCustomPercentiles);
+      registerCustomPercentiles(GetBlobInfoOperation.class, "LocalDcLatencyMs", getBlobInfoLocalDcLatencyMs,
+          routerConfig.routerOperationTrackerCustomPercentiles);
+      registerCustomPercentiles(GetBlobInfoOperation.class, "CrossDcLatencyMs", getBlobInfoCrossDcLatencyMs,
+          routerConfig.routerOperationTrackerCustomPercentiles);
+    }
+
+    if (routerConfig != null && routerConfig.routerOperationTrackerMetricScope != OperationTrackerScope.Datacenter) {
+      // pre-populate all resource-to-histogram maps here to allow lock-free hashmap in adaptive operation tracker
+      initializeResourceToHistogramMap(clusterMap, routerConfig);
+    }
+
+    if (routerConfig != null && routerConfig.routerOperationTrackerHistogramDumpEnabled) {
+      histogramDumper = new HistogramDumper();
+      scheduler = Utils.newScheduler(1, false);
+      logger.info("Scheduling histogram dumper with a period of {} secs",
+          routerConfig.routerOperationTrackerHistogramDumpPeriod);
+      scheduler.scheduleAtFixedRate(histogramDumper, 0, routerConfig.routerOperationTrackerHistogramDumpPeriod,
+          TimeUnit.SECONDS);
+    } else {
+      histogramDumper = null;
+    }
+  }
+
+  /**
+   * Initialize resource-to-latency-histogram maps based on given resource type. Here resource can be {@link PartitionId},
+   * {@link DataNodeId}, etc. The resource type is defined by {@link RouterConfig#routerOperationTrackerMetricScope}.
+   * @param clusterMap the {@link ClusterMap} that contains info of all resources.
+   * @param routerConfig the {@link RouterConfig} that specifies histogram parameters.
+   */
+  private void initializeResourceToHistogramMap(ClusterMap clusterMap, RouterConfig routerConfig) {
+    int reservoirSize = routerConfig.routerOperationTrackerReservoirSize;
+    double decayFactor = routerConfig.routerOperationTrackerReservoirDecayFactor;
+    String localDatacenterName = clusterMap.getDatacenterName(clusterMap.getLocalDatacenterId());
+    switch (routerConfig.routerOperationTrackerMetricScope) {
+      case Partition:
+        for (PartitionId partitionId : clusterMap.getAllPartitionIds(null)) {
+          getBlobLocalDcResourceToLatency.put(partitionId, createHistogram(reservoirSize, decayFactor));
+          getBlobInfoLocalDcResourceToLatency.put(partitionId, createHistogram(reservoirSize, decayFactor));
+          getBlobCrossDcResourceToLatency.put(partitionId, createHistogram(reservoirSize, decayFactor));
+          getBlobInfoCrossDcResourceToLatency.put(partitionId, createHistogram(reservoirSize, decayFactor));
+        }
+        break;
+      case DataNode:
+        List<? extends DataNodeId> dataNodeIds = clusterMap.getDataNodeIds();
+        for (DataNodeId dataNodeId : dataNodeIds) {
+          if (dataNodeId.getDatacenterName().equals(localDatacenterName)) {
+            getBlobLocalDcResourceToLatency.put(dataNodeId, createHistogram(reservoirSize, decayFactor));
+            getBlobInfoLocalDcResourceToLatency.put(dataNodeId, createHistogram(reservoirSize, decayFactor));
+          } else {
+            getBlobCrossDcResourceToLatency.put(dataNodeId, createHistogram(reservoirSize, decayFactor));
+            getBlobInfoCrossDcResourceToLatency.put(dataNodeId, createHistogram(reservoirSize, decayFactor));
+          }
+        }
+        break;
+      case Disk:
+        for (PartitionId partitionId : clusterMap.getAllPartitionIds(null)) {
+          for (ReplicaId replicaId : partitionId.getReplicaIds()) {
+            DiskId diskId = replicaId.getDiskId();
+            if (getBlobLocalDcResourceToLatency.containsKey(diskId) || getBlobCrossDcResourceToLatency.containsKey(
+                diskId)) {
+              continue;
+            }
+            if (replicaId.getDataNodeId().getDatacenterName().equals(localDatacenterName)) {
+              getBlobLocalDcResourceToLatency.put(diskId, createHistogram(reservoirSize, decayFactor));
+              getBlobInfoLocalDcResourceToLatency.put(diskId, createHistogram(reservoirSize, decayFactor));
+            } else {
+              getBlobCrossDcResourceToLatency.put(diskId, createHistogram(reservoirSize, decayFactor));
+              getBlobInfoCrossDcResourceToLatency.put(diskId, createHistogram(reservoirSize, decayFactor));
+            }
+          }
+        }
+      default:
+        // if routerOperationTrackerMetricScope = Datacenter, do nothing in this method because datacenter-level
+        // histograms and pastDueCounter are always instantiated.
+    }
+  }
+
+  /**
+   * Create a histogram with given parameters.
+   * @param reservoirSize the maximum size of reservoir in histogram
+   * @param decayFactor the decay factor used by histogram
+   * @return a configured {@link Histogram}.
+   */
+  private Histogram createHistogram(int reservoirSize, double decayFactor) {
+    return new Histogram(new ExponentiallyDecayingReservoir(reservoirSize, decayFactor));
+  }
+
+  /**
+   * Register {@link Gauge} metric for each custom percentile of given {@link Histogram} with given class and name.
+   * @param ownerClass the {@link Class} that is supposed to own the metrics.
+   * @param name the name of metric that all percentiles belong to.
+   * @param histogram the {@link Histogram} to use.
+   * @param percentiles a list of interested percentiles (double value).
+   */
+  private void registerCustomPercentiles(Class ownerClass, String name, Histogram histogram, List<Double> percentiles) {
+    percentiles.forEach(p -> {
+      Gauge<Double> customPercentile = () -> histogram.getSnapshot().getValue(p);
+      metricRegistry.register(MetricRegistry.name(ownerClass, name, String.valueOf(p * 100), "thPercentile"),
+          customPercentile);
+    });
   }
 
   /**
@@ -415,12 +565,7 @@ public class NonBlockingRouterMetrics {
    *                                     to be monitored.
    */
   public void initializeOperationControllerMetrics(final Thread requestResponseHandlerThread) {
-    requestResponseHandlerThreadRunning = new Gauge<Long>() {
-      @Override
-      public Long getValue() {
-        return requestResponseHandlerThread.isAlive() ? 1L : 0L;
-      }
-    };
+    requestResponseHandlerThreadRunning = () -> requestResponseHandlerThread.isAlive() ? 1L : 0L;
     metricRegistry.register(
         MetricRegistry.name(NonBlockingRouter.class, requestResponseHandlerThread.getName() + "Running"),
         requestResponseHandlerThreadRunning);
@@ -432,12 +577,7 @@ public class NonBlockingRouterMetrics {
    * @param chunkFillerThread The {@code ChunkFillerThread} of which the status is to be monitored.
    */
   public void initializePutManagerMetrics(final Thread chunkFillerThread) {
-    chunkFillerThreadRunning = new Gauge<Long>() {
-      @Override
-      public Long getValue() {
-        return chunkFillerThread.isAlive() ? 1L : 0L;
-      }
-    };
+    chunkFillerThreadRunning = () -> chunkFillerThread.isAlive() ? 1L : 0L;
     metricRegistry.register(MetricRegistry.name(PutManager.class, chunkFillerThread.getName() + "Running"),
         chunkFillerThreadRunning);
   }
@@ -446,22 +586,22 @@ public class NonBlockingRouterMetrics {
    * Initializes a {@link Gauge} metric to monitor the number of running
    * {@link com.github.ambry.router.NonBlockingRouter.OperationController} of a {@link NonBlockingRouter}.
    * @param currentOperationsCount The counter of {@link com.github.ambry.router.NonBlockingRouter.OperationController}.
+   * @param currentBackgroundOperationsCount The counter of background operations submitted to the router that are not
+   *                                         yet completed.
    */
   public void initializeNumActiveOperationsMetrics(final AtomicInteger currentOperationsCount,
       final AtomicInteger currentBackgroundOperationsCount) {
-    metricRegistry.register(MetricRegistry.name(NonBlockingRouter.class, "NumActiveOperations"), new Gauge<Integer>() {
-      @Override
-      public Integer getValue() {
-        return currentOperationsCount.get();
-      }
-    });
+    metricRegistry.register(MetricRegistry.name(NonBlockingRouter.class, "NumActiveOperations"),
+        (Gauge<Integer>) currentOperationsCount::get);
     metricRegistry.register(MetricRegistry.name(NonBlockingRouter.class, "NumActiveBackgroundOperations"),
-        new Gauge<Integer>() {
-          @Override
-          public Integer getValue() {
-            return currentBackgroundOperationsCount.get();
-          }
-        });
+        (Gauge<Integer>) currentBackgroundOperationsCount::get);
+  }
+
+  /**
+   * @return the MetricRegistry being used in {@link NonBlockingRouterMetrics}
+   */
+  MetricRegistry getMetricRegistry() {
+    return metricRegistry;
   }
 
   /**
@@ -583,11 +723,18 @@ public class NonBlockingRouterMetrics {
     onError(e);
     Counter blobErrorCount = encrypted ? getEncryptedBlobErrorCount : getBlobErrorCount;
     Counter blobWithRangeErrorCount = encrypted ? getEncryptedBlobWithRangeErrorCount : getBlobWithRangeErrorCount;
+    Counter blobWithSegmentErrorCount =
+        encrypted ? getEncryptedBlobWithSegmentErrorCount : getBlobWithSegmentErrorCount;
     Meter operationErrorRateMeter = encrypted ? encryptedOperationErrorRate : operationErrorRate;
     if (RouterUtils.isSystemHealthError(e)) {
       blobErrorCount.inc();
-      if (options != null && options.getBlobOptions.getRange() != null) {
-        blobWithRangeErrorCount.inc();
+      if (options != null) {
+        if (options.getBlobOptions.getRange() != null) {
+          blobWithRangeErrorCount.inc();
+        }
+        if (options.getBlobOptions.hasBlobSegmentIdx()) {
+          blobWithSegmentErrorCount.inc();
+        }
       }
       operationErrorRateMeter.mark();
     }
@@ -762,6 +909,50 @@ public class NonBlockingRouterMetrics {
         betweenSixMonthsAndYearOld.inc();
       } else {
         moreThanYearOld.inc();
+      }
+    }
+  }
+
+  /**
+   * Close {@link NonBlockingRouterMetrics} by shutting down scheduler (if present) in this class.
+   */
+  public void close() {
+    if (scheduler != null) {
+      shutDownExecutorService(scheduler, 5, TimeUnit.SECONDS);
+    }
+  }
+
+  /**
+   * A thread that helps periodically dump resource-level histogram (with given percentile) into log file.
+   */
+  private class HistogramDumper implements Runnable {
+
+    @Override
+    public void run() {
+      double quantile = routerConfig.routerLatencyToleranceQuantile;
+      for (Map.Entry<Resource, Histogram> resourceToHistogram : getBlobLocalDcResourceToLatency.entrySet()) {
+        Resource resource = resourceToHistogram.getKey();
+        Histogram histogram = resourceToHistogram.getValue();
+        logger.debug("{} GetBlob local DC latency histogram {}th percentile in ms: {}", resource.toString(),
+            quantile * 100, histogram.getSnapshot().getValue(quantile));
+      }
+      for (Map.Entry<Resource, Histogram> resourceToHistogram : getBlobCrossDcResourceToLatency.entrySet()) {
+        Resource resource = resourceToHistogram.getKey();
+        Histogram histogram = resourceToHistogram.getValue();
+        logger.trace("{} GetBlob cross DC latency histogram {}th percentile in ms: {}", resource.toString(),
+            quantile * 100, histogram.getSnapshot().getValue(quantile));
+      }
+      for (Map.Entry<Resource, Histogram> resourceToHistogram : getBlobInfoLocalDcResourceToLatency.entrySet()) {
+        Resource resource = resourceToHistogram.getKey();
+        Histogram histogram = resourceToHistogram.getValue();
+        logger.debug("{} GetBlobInfo local DC latency histogram {}th percentile in ms: {}", resource.toString(),
+            quantile * 100, histogram.getSnapshot().getValue(quantile));
+      }
+      for (Map.Entry<Resource, Histogram> resourceToHistogram : getBlobInfoCrossDcResourceToLatency.entrySet()) {
+        Resource resource = resourceToHistogram.getKey();
+        Histogram histogram = resourceToHistogram.getValue();
+        logger.trace("{} GetBlobInfo cross DC latency histogram {}th percentile in ms: {}", resource.toString(),
+            quantile * 100, histogram.getSnapshot().getValue(quantile));
       }
     }
   }

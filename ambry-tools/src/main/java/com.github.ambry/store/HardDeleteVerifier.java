@@ -22,7 +22,9 @@ import com.github.ambry.messageformat.BlobData;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.messageformat.MessageFormatException;
 import com.github.ambry.messageformat.MessageFormatRecord;
-import com.github.ambry.messageformat.UpdateRecord;
+import com.github.ambry.messageformat.SubRecord;
+import com.github.ambry.replication.FindToken;
+import com.github.ambry.replication.FindTokenFactory;
 import com.github.ambry.tools.util.ToolUtils;
 import com.github.ambry.utils.CrcInputStream;
 import com.github.ambry.utils.Utils;
@@ -312,8 +314,22 @@ public class HardDeleteVerifier {
         StoreKeyFactory storeKeyFactory = Utils.getObj("com.github.ambry.commons.BlobIdFactory", map);
         while (stream.available() > Crc_Size) {
           BlobId key = (BlobId) storeKeyFactory.getStoreKey(stream);
-          byte[] value = new byte[version == PersistentIndex.VERSION_0 ? IndexValue.INDEX_VALUE_SIZE_IN_BYTES_V0
-              : IndexValue.INDEX_VALUE_SIZE_IN_BYTES_V1];
+          int valueByteSize;
+          switch (version) {
+            case PersistentIndex.VERSION_0:
+              valueByteSize = IndexValue.INDEX_VALUE_SIZE_IN_BYTES_V0;
+              break;
+            case PersistentIndex.VERSION_1:
+            case PersistentIndex.VERSION_2:
+              valueByteSize = IndexValue.INDEX_VALUE_SIZE_IN_BYTES_V1_V2;
+              break;
+            case PersistentIndex.VERSION_3:
+              valueByteSize = IndexValue.INDEX_VALUE_SIZE_IN_BYTES_V3;
+              break;
+            default:
+              throw new IllegalArgumentException("Unknown PersistentIndex Version.");
+          }
+          byte[] value = new byte[valueByteSize];
           stream.read(value);
           IndexValue blobValue = new IndexValue(segmentStartOffset.getName(), ByteBuffer.wrap(value), version);
           boolean deleted = blobValue.isFlagSet(IndexValue.Flags.Delete_Index);
@@ -461,7 +477,7 @@ public class HardDeleteVerifier {
               }
             } else if (MessageFormatRecord.deserializeUpdateRecord(streamlog)
                 .getType()
-                .equals(UpdateRecord.Type.DELETE)) {
+                .equals(SubRecord.Type.DELETE)) {
               deletes++;
             }
             currentOffset += (header.getMessageSize() + buffer.capacity() + id.sizeInBytes());
@@ -666,7 +682,7 @@ public class HardDeleteVerifier {
     boolean caughtExceptionInOld = false;
     try {
       isDeleteRecord =
-          MessageFormatRecord.deserializeUpdateRecord(streamlog).getType().equals(UpdateRecord.Type.DELETE);
+          MessageFormatRecord.deserializeUpdateRecord(streamlog).getType().equals(SubRecord.Type.DELETE);
     } catch (Exception e) {
       caughtException = true;
     }

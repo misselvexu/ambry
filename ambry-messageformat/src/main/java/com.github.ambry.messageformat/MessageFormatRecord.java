@@ -18,6 +18,7 @@ import com.github.ambry.store.StoreKeyFactory;
 import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Crc32;
 import com.github.ambry.utils.CrcInputStream;
+import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.Utils;
 import java.io.DataInputStream;
 import java.io.IOException;
@@ -44,6 +45,7 @@ public class MessageFormatRecord {
   public static final int Crc_Size = 8;
   public static final short Message_Header_Version_V1 = 1;
   public static final short Message_Header_Version_V2 = 2;
+  public static final short Message_Header_Version_V3 = 3;
   public static final short BlobProperties_Version_V1 = 1;
   public static final short Update_Version_V1 = 1;
   public static final short Update_Version_V2 = 2;
@@ -54,17 +56,20 @@ public class MessageFormatRecord {
   public static final short Blob_Version_V1 = 1;
   public static final short Blob_Version_V2 = 2;
   public static final short Metadata_Content_Version_V2 = 2;
+  public static final short Metadata_Content_Version_V3 = 3;
   public static final int Message_Header_Invalid_Relative_Offset = -1;
 
   static short headerVersionToUse = Message_Header_Version_V2;
 
   private static final short Delete_Subrecord_Version_V1 = 1;
+  private static final short Undelete_Subrecord_Version_V1 = 1;
   private static final short Ttl_Update_Subrecord_Version_V1 = 1;
 
   public static boolean isValidHeaderVersion(short headerVersion) {
     switch (headerVersion) {
       case Message_Header_Version_V1:
       case Message_Header_Version_V2:
+      case Message_Header_Version_V3:
         return true;
       default:
         return false;
@@ -83,6 +88,8 @@ public class MessageFormatRecord {
         return MessageHeader_Format_V1.getHeaderSize();
       case Message_Header_Version_V2:
         return MessageHeader_Format_V2.getHeaderSize();
+      case Message_Header_Version_V3:
+        return MessageHeader_Format_V3.getHeaderSize();
       default:
         throw new MessageFormatException("Unknown header version: " + headerVersion,
             MessageFormatErrorCodes.Unknown_Format_Version);
@@ -103,6 +110,8 @@ public class MessageFormatRecord {
         return new MessageHeader_Format_V1(input);
       case Message_Header_Version_V2:
         return new MessageHeader_Format_V2(input);
+      case Message_Header_Version_V3:
+        return new MessageHeader_Format_V3(input);
       default:
         throw new MessageFormatException("Unknown header version: " + headerVersion,
             MessageFormatErrorCodes.Unknown_Format_Version);
@@ -255,6 +264,14 @@ public class MessageFormatRecord {
         headerBuf.rewind();
         header = new MessageHeader_Format_V2(headerBuf);
         break;
+      case Message_Header_Version_V3:
+        headerBuf = ByteBuffer.allocate(MessageFormatRecord.MessageHeader_Format_V3.getHeaderSize());
+        headerBuf.putShort(headerVersion);
+        inputStream.read(headerBuf.array(), Version_Field_Size_In_Bytes,
+            MessageHeader_Format_V3.getHeaderSize() - Version_Field_Size_In_Bytes);
+        headerBuf.rewind();
+        header = new MessageHeader_Format_V3(headerBuf);
+        break;
       default:
         throw new MessageFormatException("Message header version not supported",
             MessageFormatErrorCodes.Unknown_Format_Version);
@@ -279,6 +296,18 @@ public class MessageFormatRecord {
      * @return the version of this Message Header Format
      */
     short getVersion();
+
+    /**
+     * @return whether this message header has an life version.  Life Version counts how many times
+     * a blob has been undeleted
+     */
+    boolean hasLifeVersion();
+
+    /**
+     * @return the life version of this Message Header Format.  Life Version counts how many
+     * times a blob has been undeleted
+     */
+    short getLifeVersion();
 
     /**
      * @return the offset of the message payload (the part after the blob id) relative to the end of the header.
@@ -489,6 +518,16 @@ public class MessageFormatRecord {
     @Override
     public short getVersion() {
       return buffer.getShort(0);
+    }
+
+    @Override
+    public boolean hasLifeVersion() {
+      return false;
+    }
+
+    @Override
+    public short getLifeVersion() {
+      return 0;
     }
 
     @Override
@@ -722,6 +761,16 @@ public class MessageFormatRecord {
     }
 
     @Override
+    public boolean hasLifeVersion() {
+      return false;
+    }
+
+    @Override
+    public short getLifeVersion() {
+      return 0;
+    }
+
+    @Override
     public long getMessageSize() {
       return buffer.getLong(Total_Size_Field_Offset_In_Bytes);
     }
@@ -805,6 +854,270 @@ public class MessageFormatRecord {
     public void verifyHeader() throws MessageFormatException {
       verifyCrc();
       checkHeaderConstraints(getMessageSize(), getBlobEncryptionKeyRecordRelativeOffset(),
+          getBlobPropertiesRecordRelativeOffset(), getUpdateRecordRelativeOffset(),
+          getUserMetadataRecordRelativeOffset(), getBlobRecordRelativeOffset());
+    }
+
+    private void verifyCrc() throws MessageFormatException {
+      Crc32 crc = new Crc32();
+      crc.update(buffer.array(), 0, buffer.limit() - Crc_Size);
+      if (crc.getValue() != getCrc()) {
+        throw new MessageFormatException("Message header is corrupt", MessageFormatErrorCodes.Data_Corrupt);
+      }
+    }
+  }
+
+  /**
+   *
+   *  - - - - - - - - - - -  - - - - - - - - - - - - - -- - -- - - - - - - - - - - - - -  - - - - - - - - - - - - - - - - - - - -
+   * |         |           |              |                 |               |           |               |           |           |
+   * | version |  life     | payload size | Blob Encryption | Blob Property | Update    | User Metadata | Blob      | Crc       |
+   * |(2 bytes)|  version  |   (8 bytes)  | Key Relative    | Relative      | Relative  | Relative      | Relative  | (8 bytes) |
+   * |         | (2 bytes) |              | Offset          | Offset        | Offset    | Offset        | Offset    |           |
+   * |         |           |              | (4 bytes)       | (4 bytes)     | (4 bytes) | (4 bytes)     | (4 bytes) |           |
+   * |         |           |              |                 |               |           |               |           |           |
+   *  - - - - - - - - - - - - - - - - - - - - - - - - -- - -- - - - - - - - - - - - - -  - - - - - - - - - - - - - - - - - - - -
+   *
+   *  version         - The version of the message header
+   *
+   *  life version    - The life version of the message header
+   *
+   *  payload size    - The size of the message payload.
+   *                    Blob Encryption Key Record Size (if present) + (Blob prop record size or update record size) +
+   *                    user metadata size + blob size
+   *
+   *  Blob Encryption - The offset at which the blob encryption key record is located relative to this message.
+   *  Key relative      Non-existence of blob key record is indicated by -1. Blob Keys are optionally present for Put
+   *  offset            records. Blob Keys will be absent for update records.
+   *
+   *  blob property   - The offset at which the blob property record is located relative to this message. Only one of
+   *  relative offset   blob property/update relative offset field can exist. Non existence is indicated by -1
+   *
+   *  update          - The offset at which the update record is located relative to this message. Only one of blob
+   *  relative offset   property/update relative offset field can exist. Non existence is indicated by -1
+   *
+   *  user metadata   - The offset at which the user metadata record is located relative to this message. This exist
+   *  relative offset   only when blob property record and blob record exist
+   *
+   *  blob metadata   - The offset at which the blob record is located relative to this message. This exist only when
+   *  relative offset   blob property record and user metadata record exist
+   *
+   *  crc             - The crc of the message header
+   *
+   */
+  public static class MessageHeader_Format_V3 implements MessageHeader_Format {
+    private ByteBuffer buffer;
+
+    private static final Logger logger = LoggerFactory.getLogger(MessageHeader_Format_V3.class);
+    // total size field start offset and size
+    public static final int Life_Version_Field_Offset_In_Bytes = Version_Field_Size_In_Bytes;
+    public static final int Life_Version_Field_Size_In_Bytes = 2;
+    public static final int Total_Size_Field_Offset_In_Bytes =
+        Life_Version_Field_Size_In_Bytes + Life_Version_Field_Offset_In_Bytes;
+    public static final int Total_Size_Field_Size_In_Bytes = 8;
+
+    // relative offset fields start offset and size
+    private static final int Number_Of_Relative_Offset_Fields = 5;
+    public static final int Relative_Offset_Field_Sizes_In_Bytes = 4;
+    public static final int Blob_Encryption_Key_Relative_Offset_Field_Offset_In_Bytes =
+        Total_Size_Field_Offset_In_Bytes + Total_Size_Field_Size_In_Bytes;
+    public static final int BlobProperties_Relative_Offset_Field_Offset_In_Bytes =
+        Blob_Encryption_Key_Relative_Offset_Field_Offset_In_Bytes + Relative_Offset_Field_Sizes_In_Bytes;
+    public static final int Update_Relative_Offset_Field_Offset_In_Bytes =
+        BlobProperties_Relative_Offset_Field_Offset_In_Bytes + Relative_Offset_Field_Sizes_In_Bytes;
+    public static final int UserMetadata_Relative_Offset_Field_Offset_In_Bytes =
+        Update_Relative_Offset_Field_Offset_In_Bytes + Relative_Offset_Field_Sizes_In_Bytes;
+    public static final int Blob_Relative_Offset_Field_Offset_In_Bytes =
+        UserMetadata_Relative_Offset_Field_Offset_In_Bytes + Relative_Offset_Field_Sizes_In_Bytes;
+
+    // crc field start offset
+    public static final int Crc_Field_Offset_In_Bytes =
+        Blob_Relative_Offset_Field_Offset_In_Bytes + Relative_Offset_Field_Sizes_In_Bytes;
+
+    public static int getHeaderSize() {
+      return Version_Field_Size_In_Bytes + Life_Version_Field_Size_In_Bytes + Total_Size_Field_Size_In_Bytes + (
+          Number_Of_Relative_Offset_Fields * Relative_Offset_Field_Sizes_In_Bytes) + Crc_Size;
+    }
+
+    public static void serializeHeader(ByteBuffer outputBuffer, short lifeVersion, long totalSize,
+        int blobEncryptionKeyRecordRelativeOffset, int blobPropertiesRecordRelativeOffset,
+        int updateRecordRelativeOffset, int userMetadataRecordRelativeOffset, int blobRecordRelativeOffset)
+        throws MessageFormatException {
+      checkHeaderConstraints(totalSize, lifeVersion, blobEncryptionKeyRecordRelativeOffset,
+          blobPropertiesRecordRelativeOffset, updateRecordRelativeOffset, userMetadataRecordRelativeOffset,
+          blobRecordRelativeOffset);
+      int startOffset = outputBuffer.position();
+      outputBuffer.putShort(Message_Header_Version_V3);
+      outputBuffer.putShort(lifeVersion);
+      outputBuffer.putLong(totalSize);
+      outputBuffer.putInt(blobEncryptionKeyRecordRelativeOffset);
+      outputBuffer.putInt(blobPropertiesRecordRelativeOffset);
+      outputBuffer.putInt(updateRecordRelativeOffset);
+      outputBuffer.putInt(userMetadataRecordRelativeOffset);
+      outputBuffer.putInt(blobRecordRelativeOffset);
+      Crc32 crc = new Crc32();
+      crc.update(outputBuffer.array(), startOffset, getHeaderSize() - Crc_Size);
+      outputBuffer.putLong(crc.getValue());
+      logger.trace(
+          "serializing header : version {} lifeVersion {} size {} blobEncryptionKeyRecordRelativeOffset {} blobPropertiesRecordRelativeOffset {} "
+              + "updateRecordRelativeOffset {} userMetadataRecordRelativeOffset {} blobRecordRelativeOffset {} crc {}",
+          Message_Header_Version_V3, lifeVersion, totalSize, blobEncryptionKeyRecordRelativeOffset,
+          blobPropertiesRecordRelativeOffset, updateRecordRelativeOffset, userMetadataRecordRelativeOffset,
+          blobPropertiesRecordRelativeOffset, crc.getValue());
+    }
+
+    // checks the following constraints
+    // 1. totalSize is greater than 0
+    // 2. if blobPropertiesRecordRelativeOffset is greater than 0, ensures that updateRecordRelativeOffset
+    //    is set to Message_Header_Invalid_Relative_Offset and userMetadataRecordRelativeOffset
+    //    and blobRecordRelativeOffset is positive
+    // 3. if updateRecordRelativeOffset is greater than 0, ensures that all the other offsets are set to
+    //    Message_Header_Invalid_Relative_Offset
+    private static void checkHeaderConstraints(long totalSize, short lifeVersion,
+        int blobEncryptionKeyRecordRelativeOffset, int blobPropertiesRecordRelativeOffset,
+        int updateRecordRelativeOffset, int userMetadataRecordRelativeOffset, int blobRecordRelativeOffset)
+        throws MessageFormatException {
+      // check constraints
+      if (totalSize <= 0) {
+        throw new MessageFormatException(
+            "checkHeaderConstraints - totalSize " + totalSize + " needs to be greater than 0",
+            MessageFormatErrorCodes.Header_Constraint_Error);
+      }
+
+      if (lifeVersion < 0) {
+        throw new MessageFormatException(
+            "checkHeaderConstraints - lifeVersion " + lifeVersion + " needs to be greater than or equal to 0",
+            MessageFormatErrorCodes.Header_Constraint_Error);
+      }
+
+      if (blobPropertiesRecordRelativeOffset > 0 && (
+          updateRecordRelativeOffset != Message_Header_Invalid_Relative_Offset || userMetadataRecordRelativeOffset <= 0
+              || blobRecordRelativeOffset <= 0)) {
+        throw new MessageFormatException(
+            "checkHeaderConstraints - blobPropertiesRecordRelativeOffset is greater than 0 "
+                + " but other properties do not satisfy constraints" + " blobPropertiesRecordRelativeOffset "
+                + blobPropertiesRecordRelativeOffset + " updateRecordRelativeOffset " + updateRecordRelativeOffset
+                + " userMetadataRecordRelativeOffset " + userMetadataRecordRelativeOffset + " blobRecordRelativeOffset "
+                + blobRecordRelativeOffset, MessageFormatErrorCodes.Header_Constraint_Error);
+      }
+
+      if (updateRecordRelativeOffset > 0 && (
+          blobEncryptionKeyRecordRelativeOffset != Message_Header_Invalid_Relative_Offset
+              || blobPropertiesRecordRelativeOffset != Message_Header_Invalid_Relative_Offset
+              || userMetadataRecordRelativeOffset != Message_Header_Invalid_Relative_Offset
+              || blobRecordRelativeOffset != Message_Header_Invalid_Relative_Offset)) {
+        throw new MessageFormatException("checkHeaderConstraints - updateRecordRelativeOffset is greater than 0 "
+            + " but other properties do not satisfy constraints" + " blobEncryptionKeyRelativeOffset "
+            + blobEncryptionKeyRecordRelativeOffset + " blobPropertiesRecordRelativeOffset "
+            + blobPropertiesRecordRelativeOffset + " updateRecordRelativeOffset " + updateRecordRelativeOffset
+            + " userMetadataRecordRelativeOffset " + userMetadataRecordRelativeOffset + " blobRecordRelativeOffset "
+            + blobRecordRelativeOffset, MessageFormatErrorCodes.Header_Constraint_Error);
+      }
+    }
+
+    public MessageHeader_Format_V3(ByteBuffer input) {
+      buffer = input;
+    }
+
+    @Override
+    public short getVersion() {
+      return buffer.getShort(0);
+    }
+
+    @Override
+    public short getLifeVersion() {
+      return buffer.getShort(Life_Version_Field_Offset_In_Bytes);
+    }
+
+    @Override
+    public boolean hasLifeVersion() {
+      return true;
+    }
+
+    @Override
+    public long getMessageSize() {
+      return buffer.getLong(Total_Size_Field_Offset_In_Bytes);
+    }
+
+    @Override
+    public int getBlobPropertiesRecordRelativeOffset() {
+      return buffer.getInt(BlobProperties_Relative_Offset_Field_Offset_In_Bytes);
+    }
+
+    @Override
+    public int getBlobPropertiesRecordSize() {
+      return getUserMetadataRecordRelativeOffset() - getBlobPropertiesRecordRelativeOffset();
+    }
+
+    @Override
+    public boolean isPutRecord() {
+      return getBlobPropertiesRecordRelativeOffset() != Message_Header_Invalid_Relative_Offset;
+    }
+
+    @Override
+    public int getUpdateRecordRelativeOffset() {
+      return buffer.getInt(Update_Relative_Offset_Field_Offset_In_Bytes);
+    }
+
+    @Override
+    public int getBlobEncryptionKeyRecordRelativeOffset() {
+      return buffer.getInt(Blob_Encryption_Key_Relative_Offset_Field_Offset_In_Bytes);
+    }
+
+    @Override
+    public int getBlobEncryptionKeyRecordSize() {
+      if (hasEncryptionKeyRecord()) {
+        return getBlobPropertiesRecordRelativeOffset() - getBlobEncryptionKeyRecordRelativeOffset();
+      } else {
+        return 0;
+      }
+    }
+
+    @Override
+    public boolean hasEncryptionKeyRecord() {
+      return getBlobEncryptionKeyRecordRelativeOffset() != Message_Header_Invalid_Relative_Offset;
+    }
+
+    @Override
+    public int getUserMetadataRecordRelativeOffset() {
+      return buffer.getInt(UserMetadata_Relative_Offset_Field_Offset_In_Bytes);
+    }
+
+    @Override
+    public int getUserMetadataRecordSize() {
+      return getBlobRecordRelativeOffset() - getUserMetadataRecordRelativeOffset();
+    }
+
+    @Override
+    public int getBlobRecordRelativeOffset() {
+      return buffer.getInt(Blob_Relative_Offset_Field_Offset_In_Bytes);
+    }
+
+    @Override
+    public long getBlobRecordSize() {
+      int messageSizeExcludingBlobRecord = getBlobRecordRelativeOffset() - getPayloadRelativeOffset();
+      return getMessageSize() - messageSizeExcludingBlobRecord;
+    }
+
+    @Override
+    public int getPayloadRelativeOffset() {
+      if (isPutRecord()) {
+        return hasEncryptionKeyRecord() ? getBlobEncryptionKeyRecordRelativeOffset()
+            : getBlobPropertiesRecordRelativeOffset();
+      } else {
+        return getUpdateRecordRelativeOffset();
+      }
+    }
+
+    @Override
+    public long getCrc() {
+      return buffer.getLong(Crc_Field_Offset_In_Bytes);
+    }
+
+    @Override
+    public void verifyHeader() throws MessageFormatException {
+      verifyCrc();
+      checkHeaderConstraints(getMessageSize(), getLifeVersion(), getBlobEncryptionKeyRecordRelativeOffset(),
           getBlobPropertiesRecordRelativeOffset(), getUpdateRecordRelativeOffset(),
           getUserMetadataRecordRelativeOffset(), getBlobRecordRelativeOffset());
     }
@@ -1003,7 +1316,7 @@ public class MessageFormatRecord {
      * @param type the type of the sub record in this update record.
      * @return the size of the record if the record were serialized
      */
-    public static int getRecordSize(UpdateRecord.Type type) {
+    public static int getRecordSize(SubRecord.Type type) {
       int subRecordSize;
       switch (type) {
         case DELETE:
@@ -1011,6 +1324,9 @@ public class MessageFormatRecord {
           break;
         case TTL_UPDATE:
           subRecordSize = Ttl_Update_Sub_Format_V1.getRecordSize();
+          break;
+        case UNDELETE:
+          subRecordSize = Undelete_Sub_Format_V1.getRecordSize();
           break;
         default:
           throw new IllegalArgumentException("Unknown update record type: " + type);
@@ -1038,6 +1354,9 @@ public class MessageFormatRecord {
         case TTL_UPDATE:
           Ttl_Update_Sub_Format_V1.serialize(outputBuffer, updateRecord.getTtlUpdateSubRecord());
           break;
+        case UNDELETE:
+          Undelete_Sub_Format_V1.serialize(outputBuffer, updateRecord.getUndeleteSubRecord());
+          break;
         default:
           throw new IllegalArgumentException("Unknown update record type: " + updateRecord.getType());
       }
@@ -1058,13 +1377,16 @@ public class MessageFormatRecord {
       short accountId = dataStream.readShort();
       short containerId = dataStream.readShort();
       long updateTimeInMs = dataStream.readLong();
-      UpdateRecord.Type type = UpdateRecord.Type.values()[dataStream.readShort()];
+      SubRecord.Type type = SubRecord.Type.values()[dataStream.readShort()];
       switch (type) {
         case DELETE:
           updateRecord = new UpdateRecord(accountId, containerId, updateTimeInMs, getDeleteSubRecord(dataStream));
           break;
         case TTL_UPDATE:
           updateRecord = new UpdateRecord(accountId, containerId, updateTimeInMs, getTtlUpdateSubRecord(dataStream));
+          break;
+        case UNDELETE:
+          updateRecord = new UpdateRecord(accountId, containerId, updateTimeInMs, getUndeleteSubRecord(dataStream));
           break;
         default:
           throw new IllegalArgumentException("Unknown update record type: " + type);
@@ -1093,6 +1415,24 @@ public class MessageFormatRecord {
           return Delete_Sub_Format_V1.deserialize(inputStream);
         default:
           throw new MessageFormatException("delete record version not supported: " + version,
+              MessageFormatErrorCodes.Unknown_Format_Version);
+      }
+    }
+
+    /**
+     * @param inputStream the stream that contains the serialized form of a {@link UndeleteSubRecord}.
+     * @return the deserialized {@link UndeleteSubRecord}
+     * @throws IOException if there are problems reading from stream.
+     * @throws MessageFormatException if the format of the message is unexpected.
+     */
+    private static UndeleteSubRecord getUndeleteSubRecord(DataInputStream inputStream)
+        throws IOException, MessageFormatException {
+      short version = inputStream.readShort();
+      switch (version) {
+        case Undelete_Subrecord_Version_V1:
+          return Undelete_Sub_Format_V1.deserialize(inputStream);
+        default:
+          throw new MessageFormatException("undelete record version not supported: " + version,
               MessageFormatErrorCodes.Unknown_Format_Version);
       }
     }
@@ -1137,6 +1477,30 @@ public class MessageFormatRecord {
 
     static DeleteSubRecord deserialize(DataInputStream stream) {
       return new DeleteSubRecord();
+    }
+  }
+
+  /**
+   *  - - - - -
+   * |         |
+   * | version |
+   * |(2 bytes)|
+   * |         |
+   *  - - - - -
+   *  version         - The version of the undelete record
+   */
+  private static class Undelete_Sub_Format_V1 {
+
+    static int getRecordSize() {
+      return Version_Field_Size_In_Bytes;
+    }
+
+    static void serialize(ByteBuffer outputBuffer, UndeleteSubRecord undeleteSubRecord) {
+      outputBuffer.putShort(Undelete_Subrecord_Version_V1);
+    }
+
+    static UndeleteSubRecord deserialize(DataInputStream stream) {
+      return new UndeleteSubRecord();
     }
   }
 
@@ -1307,7 +1671,7 @@ public class MessageFormatRecord {
       if (dataSize > Integer.MAX_VALUE) {
         throw new IOException("We only support data of max size == MAX_INT. Error while reading blob from store");
       }
-      ByteBufferInputStream output = new ByteBufferInputStream(crcStream, (int) dataSize);
+      ByteBufferInputStream output = Utils.getByteBufferInputStreamFromCrcInputStream(crcStream, (int) dataSize);
       long crc = crcStream.getValue();
       long streamCrc = dataStream.readLong();
       if (crc != streamCrc) {
@@ -1365,7 +1729,7 @@ public class MessageFormatRecord {
       if (dataSize > Integer.MAX_VALUE) {
         throw new IOException("We only support data of max size == MAX_INT. Error while reading blob from store");
       }
-      ByteBufferInputStream output = new ByteBufferInputStream(crcStream, (int) dataSize);
+      ByteBufferInputStream output = Utils.getByteBufferInputStreamFromCrcInputStream(crcStream, (int) dataSize);
       long crc = crcStream.getValue();
       long streamCrc = dataStream.readLong();
       if (crc != streamCrc) {
@@ -1457,7 +1821,7 @@ public class MessageFormatRecord {
      * @throws MessageFormatException
      */
     public static CompositeBlobInfo deserializeMetadataContentRecord(DataInputStream stream,
-        StoreKeyFactory storeKeyFactory) throws IOException, MessageFormatException {
+        StoreKeyFactory storeKeyFactory) throws IOException {
       List<StoreKey> keys = new ArrayList<StoreKey>();
       int chunkSize = stream.readInt();
       long totalSize = stream.readLong();
@@ -1467,6 +1831,97 @@ public class MessageFormatRecord {
         keys.add(storeKey);
       }
       return new CompositeBlobInfo(chunkSize, totalSize, keys);
+    }
+  }
+
+  /**
+   *  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+   * |         |              |            |            |          |            |            |          |
+   * | version |  total size  | # of keys  |  size of   |   key1   |  size of   |    key2    |  ......  |
+   * |(2 bytes)|  (8 bytes)   | (4 bytes)  | key1 blob  |          | key2 blob  |            |  ......  |
+   * |         |              |            | (8 bytes)  |          | (8 bytes)  |            |          |
+   *  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+   *  version           - The version of the metadata content record
+   *
+   *  total size        - total size of the object this metadata describes.
+   *
+   *  # of keys         - number of keys in the metadata blob
+   *
+   *  size of key1 blob - size of the data referenced by key1
+   *
+   *  key1              - first key to be part of metadata blob
+   *
+   *  size of key2 blob - size of the data referenced by key2
+   *
+   *  key2              - second key to be part of metadata blob
+   *
+   */
+  public static class Metadata_Content_Format_V3 {
+    private static final int NUM_OF_KEYS_FIELD_SIZE_IN_BYTES = 4;
+    private static final int SIZE_OF_BLOB_FIELD_SIZE_IN_BYTES = 8;
+    private static final int TOTAL_SIZE_FIELD_SIZE_IN_BYTES = 8;
+
+    /**
+     * Get the total size of the metadata content record.
+     * @param keySize The size of each key in bytes.
+     * @param numberOfKeys The total number of keys.
+     * @return The total size in bytes.
+     */
+    public static int getMetadataContentSize(int keySize, int numberOfKeys) {
+      return Version_Field_Size_In_Bytes + TOTAL_SIZE_FIELD_SIZE_IN_BYTES + NUM_OF_KEYS_FIELD_SIZE_IN_BYTES
+          + numberOfKeys * (keySize + SIZE_OF_BLOB_FIELD_SIZE_IN_BYTES);
+    }
+
+    /**
+     * Serialize a metadata content record.
+     * @param outputBuffer output buffer of the serialized metadata content
+     * @param totalSize total size of the blob data content
+     * @param keysAndContentSizes list of data blob keys referenced by the metadata
+     *                            blob along with the data content sizes of each data blob
+     */
+    public static void serializeMetadataContentRecord(ByteBuffer outputBuffer, long totalSize,
+        List<Pair<StoreKey, Long>> keysAndContentSizes) {
+      int keySize = keysAndContentSizes.get(0).getFirst().sizeInBytes();
+      outputBuffer.putShort(Metadata_Content_Version_V3);
+      outputBuffer.putLong(totalSize);
+      outputBuffer.putInt(keysAndContentSizes.size());
+      long sum = 0;
+      for (Pair<StoreKey, Long> keyAndContentSize : keysAndContentSizes) {
+        if (keyAndContentSize.getFirst().sizeInBytes() != keySize) {
+          throw new IllegalArgumentException("Keys are not of same size");
+        }
+        outputBuffer.putLong(keyAndContentSize.getSecond());
+        outputBuffer.put(keyAndContentSize.getFirst().toBytes());
+        sum += keyAndContentSize.getSecond();
+      }
+      if (sum != totalSize) {
+        throw new IllegalArgumentException("Key content sizes do not equal total size");
+      }
+    }
+
+    /**
+     * Deserialize a metadata content record from a stream.
+     * @param stream The stream to read the serialized record from.
+     * @param storeKeyFactory The factory to use for parsing keys in the serialized metadata content record.
+     * @return A {@link CompositeBlobInfo} object with the chunk size and list of keys from the record.
+     * @throws IOException
+     */
+    public static CompositeBlobInfo deserializeMetadataContentRecord(DataInputStream stream,
+        StoreKeyFactory storeKeyFactory) throws IOException {
+      List<Pair<StoreKey, Long>> keysAndContentSizes = new ArrayList<>();
+      long totalSize = stream.readLong();
+      long sum = 0;
+      int numberOfKeys = stream.readInt();
+      for (int i = 0; i < numberOfKeys; i++) {
+        long contentSize = stream.readLong();
+        StoreKey storeKey = storeKeyFactory.getStoreKey(stream);
+        keysAndContentSizes.add(new Pair<>(storeKey, contentSize));
+        sum += contentSize;
+      }
+      if (sum != totalSize) {
+        throw new IllegalArgumentException("Key content sizes do not equal total size");
+      }
+      return new CompositeBlobInfo(keysAndContentSizes);
     }
   }
 }

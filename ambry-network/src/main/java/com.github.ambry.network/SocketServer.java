@@ -17,7 +17,6 @@ import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.commons.SSLFactory;
 import com.github.ambry.config.NetworkConfig;
 import com.github.ambry.config.SSLConfig;
-import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
@@ -49,6 +48,7 @@ import org.slf4j.LoggerFactory;
  */
 public class SocketServer implements NetworkServer {
 
+  private final NetworkConfig networkConfig;
   private final String host;
   private final int port;
   private final int numProcessorThreads;
@@ -65,6 +65,7 @@ public class SocketServer implements NetworkServer {
   private SSLFactory sslFactory;
 
   public SocketServer(NetworkConfig config, SSLConfig sslConfig, MetricRegistry registry, ArrayList<Port> portList) {
+    this.networkConfig = config;
     this.host = config.hostName;
     this.port = config.port;
     this.numProcessorThreads = config.numIoThreads;
@@ -149,7 +150,7 @@ public class SocketServer implements NetworkServer {
   public void start() throws IOException, InterruptedException {
     logger.info("Starting {} processor threads", numProcessorThreads);
     for (int i = 0; i < numProcessorThreads; i++) {
-      processors.add(i, new Processor(i, maxRequestSize, requestResponseChannel, metrics, sslFactory));
+      processors.add(i, new Processor(i, maxRequestSize, requestResponseChannel, metrics, sslFactory, networkConfig));
       Utils.newThread("ambry-processor-" + port + " " + i, processors.get(i), false).start();
     }
 
@@ -161,7 +162,7 @@ public class SocketServer implements NetworkServer {
     });
 
     // start accepting connections
-    logger.info("Starting acceptor threads");
+    logger.info("Starting acceptor threads on port {}", port);
     Acceptor plainTextAcceptor = new Acceptor(port, processors, sendBufferSize, recvBufferSize, metrics);
     this.acceptors.add(plainTextAcceptor);
     Utils.newThread("ambry-acceptor", plainTextAcceptor, false).start();
@@ -190,6 +191,7 @@ public class SocketServer implements NetworkServer {
         processor.shutdown();
       }
       logger.info("Shutdown completed");
+      requestResponseChannel.shutdown();
     } catch (Exception e) {
       logger.error("Error shutting down socket server {}", e);
     }
@@ -383,7 +385,6 @@ class SSLAcceptor extends Acceptor {
  * each of which has its own selectors
  */
 class Processor extends AbstractServerThread {
-  private final int maxRequestSize;
   private final SocketRequestResponseChannel channel;
   private final int id;
   private final Time time;
@@ -392,15 +393,16 @@ class Processor extends AbstractServerThread {
   private final Selector selector;
   private final ServerNetworkMetrics metrics;
   private static final long pollTimeoutMs = 300;
+  private final NetworkConfig networkConfig;
 
   Processor(int id, int maxRequestSize, RequestResponseChannel channel, ServerNetworkMetrics metrics,
-      SSLFactory sslFactory) throws IOException {
-    this.maxRequestSize = maxRequestSize;
+      SSLFactory sslFactory, NetworkConfig networkConfig) throws IOException {
     this.channel = (SocketRequestResponseChannel) channel;
     this.id = id;
     this.time = SystemTime.getInstance();
-    selector = new Selector(metrics, time, sslFactory);
+    selector = new Selector(metrics, time, sslFactory, networkConfig);
     this.metrics = metrics;
+    this.networkConfig = networkConfig;
   }
 
   public void run() {
@@ -417,8 +419,9 @@ class Processor extends AbstractServerThread {
         List<NetworkReceive> completedReceives = selector.completedReceives();
         for (NetworkReceive networkReceive : completedReceives) {
           String connectionId = networkReceive.getConnectionId();
-          SocketServerRequest req = new SocketServerRequest(id, connectionId,
-              new ByteBufferInputStream(networkReceive.getReceivedBytes().getPayload()));
+          Object buffer = networkReceive.getReceivedBytes().getAndRelease();
+          SocketServerRequest req = new SocketServerRequest(id, connectionId, buffer,
+              Utils.createDataInputStreamFromBuffer(buffer, networkConfig.networkPutRequestShareMemory));
           channel.sendRequest(req);
         }
       }

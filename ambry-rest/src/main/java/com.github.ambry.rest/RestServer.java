@@ -20,8 +20,12 @@ import com.codahale.metrics.JmxReporter;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.account.AccountService;
 import com.github.ambry.account.AccountServiceFactory;
+import com.github.ambry.account.HelixAccountService;
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.commons.NettyInternalMetrics;
 import com.github.ambry.commons.SSLFactory;
+import com.github.ambry.config.NettyConfig;
+import com.github.ambry.config.NetworkConfig;
 import com.github.ambry.config.RestServerConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.notification.NotificationSystem;
@@ -74,6 +78,7 @@ public class RestServer {
   private final NioServer nioServer;
   private final PublicAccessLogger publicAccessLogger;
   private final RestServerState restServerState;
+  private final NettyInternalMetrics nettyInternalMetrics;
 
   /**
    * {@link RestServer} specific metrics tracking.
@@ -136,12 +141,7 @@ public class RestServer {
       accountServiceCloseTimeInMs =
           metricRegistry.histogram(MetricRegistry.name(RestServer.class, "AccountServiceCloseTimeInMs"));
 
-      Gauge<Integer> restServerStatus = new Gauge<Integer>() {
-        @Override
-        public Integer getValue() {
-          return restServerState.isServiceUp() ? 1 : 0;
-        }
-      };
+      Gauge<Integer> restServerStatus = () -> restServerState.isServiceUp() ? 1 : 0;
       metricRegistry.register(MetricRegistry.name(RestServer.class, "RestServerState"), restServerStatus);
     }
   }
@@ -176,6 +176,11 @@ public class RestServer {
             sslFactory, accountService);
     router = routerFactory.getRouter();
 
+    // setup the router for the account service
+    if (accountService instanceof HelixAccountService) {
+      ((HelixAccountService) accountService).setupRouter(router);
+    }
+
     RestResponseHandlerFactory restResponseHandlerFactory =
         Utils.getObj(restServerConfig.restServerResponseHandlerFactory,
             restServerConfig.restServerResponseHandlerScalingUnitCount, metricRegistry);
@@ -200,6 +205,12 @@ public class RestServer {
     if (accountService == null || router == null || restResponseHandler == null || blobStorageService == null
         || restRequestHandler == null || nioServer == null) {
       throw new InstantiationException("Some of the server components were null");
+    }
+    NetworkConfig networkConfig = new NetworkConfig(verifiableProperties);
+    if (networkConfig.networkUseNettyByteBuf) {
+      nettyInternalMetrics = new NettyInternalMetrics(metricRegistry, new NettyConfig(verifiableProperties));
+    } else {
+      nettyInternalMetrics = null;
     }
     logger.trace("Instantiated RestServer");
   }
@@ -242,6 +253,11 @@ public class RestServer {
       logger.info("NIO server start took {} ms", elapsedTime);
       restServerMetrics.nioServerStartTimeInMs.update(elapsedTime);
 
+      if (nettyInternalMetrics != null) {
+        nettyInternalMetrics.start();
+        logger.info("NettyInternalMetric starts");
+      }
+
       restServerState.markServiceUp();
       logger.info("Service marked as up");
     } finally {
@@ -263,6 +279,12 @@ public class RestServer {
       //ordering is important.
       restServerState.markServiceDown();
       logger.info("Service marked as down ");
+
+      if (nettyInternalMetrics != null) {
+        nettyInternalMetrics.stop();
+        logger.info("NettyInternalMetrics stops");
+      }
+
       nioServer.shutdown();
       long nioServerShutdownTime = System.currentTimeMillis();
       long elapsedTime = nioServerShutdownTime - shutdownBeginTime;

@@ -13,11 +13,16 @@
  */
 package com.github.ambry.config;
 
+import org.apache.helix.model.LeaderStandbySMD;
+
+
 /**
  * The configs for resource state.
  */
 public class ClusterMapConfig {
-
+  public static final String AMBRY_STATE_MODEL_DEF = "AmbryLeaderStandby";
+  public static final String OLD_STATE_MODEL_DEF = LeaderStandbySMD.name;
+  public static final String DEFAULT_STATE_MODEL_DEF = AMBRY_STATE_MODEL_DEF;
   private static final String MAX_REPLICAS_ALL_DATACENTERS = "max-replicas-all-datacenters";
 
   /**
@@ -178,6 +183,19 @@ public class ClusterMapConfig {
   @Default("true")
   public final boolean clustermapListenCrossColo;
 
+  /**
+   * Name of the datacenter of vcr nodes. It is expected that all the vcr nodes will reside in the same datacenter.
+   */
+  @Config("clustermap.vcr.datacenter.name")
+  public final String clustermapVcrDatacenterName;
+
+  /**
+   * State model definition to register with helix cluster.
+   */
+  @Config("clustermap.state.model.definition")
+  @Default(DEFAULT_STATE_MODEL_DEF)
+  public final String clustermapStateModelDefinition;
+
   public ClusterMapConfig(VerifiableProperties verifiableProperties) {
     clusterMapFixedTimeoutDatanodeErrorThreshold =
         verifiableProperties.getIntInRange("clustermap.fixedtimeout.datanode.error.threshold", 3, 1, 100);
@@ -192,7 +210,7 @@ public class ClusterMapConfig {
         verifiableProperties.getIntInRange("clustermap.fixedtimeout.disk.retry.backoff.ms", 10 * 60 * 1000, 1,
             30 * 60 * 1000);
     clusterMapFixedTimeoutReplicaErrorThreshold =
-        verifiableProperties.getIntInRange("clustermap.fixedtimeout.replica.error.threshold", 1, 1, 100);
+        verifiableProperties.getIntInRange("clustermap.fixedtimeout.replica.error.threshold", 1, 1, Integer.MAX_VALUE);
     clusterMapFixedTimeoutReplicaRetryBackoffMs =
         verifiableProperties.getIntInRange("clustermap.fixedtimeout.replica.retry.backoff.ms", 10 * 60 * 1000, 1,
             30 * 60 * 1000);
@@ -210,5 +228,12 @@ public class ClusterMapConfig {
     clustermapCurrentXid = verifiableProperties.getLong("clustermap.current.xid", Long.MAX_VALUE);
     clusterMapEnablePartitionOverride = verifiableProperties.getBoolean("clustermap.enable.partition.override", false);
     clustermapListenCrossColo = verifiableProperties.getBoolean("clustermap.listen.cross.colo", true);
+    clustermapStateModelDefinition =
+        verifiableProperties.getString("clustermap.state.model.definition", DEFAULT_STATE_MODEL_DEF);
+    clustermapVcrDatacenterName = verifiableProperties.getString("clustermap.vcr.datacenter.name", null);
+    if (!clustermapStateModelDefinition.equals(DEFAULT_STATE_MODEL_DEF) && !clustermapStateModelDefinition.equals(
+        OLD_STATE_MODEL_DEF)) {
+      throw new IllegalArgumentException("Unsupported state model definition: " + clustermapStateModelDefinition);
+    }
   }
 }

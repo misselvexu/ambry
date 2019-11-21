@@ -17,7 +17,6 @@ import com.github.ambry.utils.Utils;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
@@ -30,7 +29,7 @@ import static com.github.ambry.clustermap.ClusterMapSnapshotConstants.*;
 /**
  * {@link PartitionId} implementation to use within dynamic cluster managers.
  */
-class AmbryPartition implements PartitionId {
+public class AmbryPartition implements PartitionId {
   private final Long id;
   private final String partitionClass;
   private final ClusterManagerCallback clusterManagerCallback;
@@ -65,7 +64,12 @@ class AmbryPartition implements PartitionId {
 
   @Override
   public List<AmbryReplica> getReplicaIds() {
-    return new ArrayList<>(clusterManagerCallback.getReplicaIdsForPartition(this));
+    return clusterManagerCallback.getReplicaIdsForPartition(this);
+  }
+
+  @Override
+  public List<AmbryReplica> getReplicaIdsByState(ReplicaState state, String dcName) {
+    return clusterManagerCallback.getReplicaIdsByState(this, state, dcName);
   }
 
   @Override
@@ -161,4 +165,3 @@ class AmbryPartition implements PartitionId {
     }
   }
 }
-

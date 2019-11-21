@@ -18,9 +18,9 @@ import com.codahale.metrics.Gauge;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.clustermap.TestUtils.*;
 import com.github.ambry.commons.ResponseHandler;
-import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.Utils;
@@ -29,6 +29,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -38,22 +39,31 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import org.apache.helix.HelixManager;
 import org.apache.helix.InstanceType;
 import org.apache.helix.ZNRecord;
+import org.apache.helix.model.IdealState;
 import org.apache.helix.model.InstanceConfig;
+import org.apache.helix.spectator.RoutingTableSnapshot;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
+import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
 
 import static com.github.ambry.clustermap.ClusterMapUtils.*;
 import static com.github.ambry.clustermap.TestUtils.*;
 import static org.junit.Assert.*;
 import static org.junit.Assume.*;
+import static org.mockito.Mockito.*;
 
 
 /**
@@ -62,7 +72,7 @@ import static org.junit.Assume.*;
 @RunWith(Parameterized.class)
 public class HelixClusterManagerTest {
   private final HashMap<String, com.github.ambry.utils.TestUtils.ZkInfo> dcsToZkInfo = new HashMap<>();
-  private final String dcs[] = new String[]{"DC0", "DC1"};
+  private final String[] dcs = new String[]{"DC0", "DC1"};
   private final TestUtils.TestHardwareLayout testHardwareLayout;
   private final TestPartitionLayout testPartitionLayout;
   private final String clusterNameStatic = "HelixClusterManagerTestCluster";
@@ -70,6 +80,8 @@ public class HelixClusterManagerTest {
   private final ClusterMapConfig clusterMapConfig;
   private final MockHelixCluster helixCluster;
   private final String hostname;
+  private final int portNum;
+  private final String selfInstanceName;
   private final String localDc;
   private final String remoteDc;
   private ClusterMap clusterManager;
@@ -85,6 +97,7 @@ public class HelixClusterManagerTest {
 
   // for verifying getPartitions() and getWritablePartitions()
   private static final String SPECIAL_PARTITION_CLASS = "specialPartitionClass";
+  private static final String NEW_PARTITION_ID_STR = "100";
   private final PartitionRangeCheckParams defaultRw;
   private final PartitionRangeCheckParams specialRw;
   private final PartitionRangeCheckParams defaultRo;
@@ -125,15 +138,15 @@ public class HelixClusterManagerTest {
     int port = 2200;
     byte dcId = (byte) 0;
     for (String dcName : dcs) {
-      dcsToZkInfo.put(dcName, new com.github.ambry.utils.TestUtils.ZkInfo(tempDirPath, dcName, dcId++, port++, false));
+      dcsToZkInfo.put(dcName, new com.github.ambry.utils.TestUtils.ZkInfo(tempDirPath, dcName, dcId++, port++, true));
     }
     hardwareLayoutPath = tempDirPath + File.separator + "hardwareLayoutTest.json";
     partitionLayoutPath = tempDirPath + File.separator + "partitionLayoutTest.json";
     String zkLayoutPath = tempDirPath + File.separator + "zkLayoutPath.json";
     JSONObject zkJson = constructZkLayoutJSON(dcsToZkInfo.values());
+    // initial partition count = 3
     testHardwareLayout = constructInitialHardwareLayoutJSON(clusterNameStatic);
     testPartitionLayout = constructInitialPartitionLayoutJSON(testHardwareLayout, 3, localDc);
-
     // for getPartitions() and getWritablePartitions() tests
     assertTrue("There should be more than 1 replica per partition in each DC for some of these tests to work",
         testPartitionLayout.replicaCountPerDc > 1);
@@ -170,7 +183,7 @@ public class HelixClusterManagerTest {
       partitionOverrideMap.computeIfAbsent(String.valueOf(i), k -> new HashMap<>())
           .put(ClusterMapUtils.PARTITION_STATE, ClusterMapUtils.READ_ONLY_STR);
     }
-    znRecord = new ZNRecord(ClusterMapUtils.ZNODE_NAME);
+    znRecord = new ZNRecord(PARTITION_OVERRIDE_STR);
     znRecord.setMapFields(partitionOverrideMap);
 
     helixCluster =
@@ -182,26 +195,32 @@ public class HelixClusterManagerTest {
       }
     }
 
-    hostname = "localhost";
+    DataNode currentNode = testHardwareLayout.getRandomDataNodeFromDc(localDc);
+    hostname = currentNode.getHostname();
+    portNum = currentNode.getPort();
+    selfInstanceName = getInstanceName(hostname, portNum);
     Properties props = new Properties();
     props.setProperty("clustermap.host.name", hostname);
     props.setProperty("clustermap.cluster.name", clusterNamePrefixInHelix + clusterNameStatic);
     props.setProperty("clustermap.datacenter.name", localDc);
+    props.setProperty("clustermap.port", Integer.toString(portNum));
     props.setProperty("clustermap.dcs.zk.connect.strings", zkJson.toString(2));
     props.setProperty("clustermap.current.xid", Long.toString(CURRENT_XID));
     props.setProperty("clustermap.enable.partition.override", Boolean.toString(overrideEnabled));
     props.setProperty("clustermap.listen.cross.colo", Boolean.toString(listenCrossColo));
     clusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
-    MockHelixManagerFactory helixManagerFactory = new MockHelixManagerFactory(helixCluster, znRecord, null);
+    Map<String, ZNRecord> znRecordMap = new HashMap<>();
+    znRecordMap.put(PARTITION_OVERRIDE_ZNODE_PATH, znRecord);
+    MockHelixManagerFactory helixManagerFactory = new MockHelixManagerFactory(helixCluster, znRecordMap, null);
     if (useComposite) {
       StaticClusterAgentsFactory staticClusterAgentsFactory =
           new StaticClusterAgentsFactory(clusterMapConfig, hardwareLayoutPath, partitionLayoutPath);
       metricRegistry = staticClusterAgentsFactory.getMetricRegistry();
       clusterManager = new CompositeClusterManager(staticClusterAgentsFactory.getClusterMap(),
-          new HelixClusterManager(clusterMapConfig, hostname, helixManagerFactory, metricRegistry));
+          new HelixClusterManager(clusterMapConfig, selfInstanceName, helixManagerFactory, metricRegistry));
     } else {
       metricRegistry = new MetricRegistry();
-      clusterManager = new HelixClusterManager(clusterMapConfig, hostname, helixManagerFactory, metricRegistry);
+      clusterManager = new HelixClusterManager(clusterMapConfig, selfInstanceName, helixManagerFactory, metricRegistry);
     }
   }
 
@@ -212,6 +231,9 @@ public class HelixClusterManagerTest {
   public void after() {
     if (clusterManager != null) {
       clusterManager.close();
+    }
+    for (com.github.ambry.utils.TestUtils.ZkInfo zkInfo : dcsToZkInfo.values()) {
+      zkInfo.shutdown();
     }
   }
 
@@ -226,6 +248,9 @@ public class HelixClusterManagerTest {
     // Several good instantiations happens in the constructor itself.
     assertEquals(0L,
         metricRegistry.getGauges().get(HelixClusterManager.class.getName() + ".instantiationFailed").getValue());
+    if (clusterManager instanceof HelixClusterManager) {
+      verifyInitialClusterChanges((HelixClusterManager) clusterManager, helixCluster, dcs);
+    }
 
     int savedport = dcsToZkInfo.get(remoteDc).getPort();
     // Connectivity failure to remote should not prevent instantiation.
@@ -234,18 +259,20 @@ public class HelixClusterManagerTest {
     JSONObject invalidZkJson = constructZkLayoutJSON(zkInfos);
     Properties props = new Properties();
     props.setProperty("clustermap.host.name", hostname);
+    props.setProperty("clustermap.port", Integer.toString(portNum));
     props.setProperty("clustermap.cluster.name", clusterNamePrefixInHelix + clusterNameStatic);
     props.setProperty("clustermap.datacenter.name", localDc);
     props.setProperty("clustermap.dcs.zk.connect.strings", invalidZkJson.toString(2));
     ClusterMapConfig invalidClusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
     metricRegistry = new MetricRegistry();
-    new HelixClusterManager(invalidClusterMapConfig, hostname, new MockHelixManagerFactory(helixCluster, null, null),
-        metricRegistry);
+    HelixClusterManager clusterManager = new HelixClusterManager(invalidClusterMapConfig, selfInstanceName,
+        new MockHelixManagerFactory(helixCluster, null, null), metricRegistry);
     assertEquals(0L,
         metricRegistry.getGauges().get(HelixClusterManager.class.getName() + ".instantiationFailed").getValue());
     assertEquals(1L, metricRegistry.getGauges()
         .get(HelixClusterManager.class.getName() + ".instantiationExceptionCount")
         .getValue());
+    verifyInitialClusterChanges(clusterManager, helixCluster, new String[]{localDc});
 
     // Local dc connectivity failure should fail instantiation.
     dcsToZkInfo.get(remoteDc).setPort(savedport);
@@ -256,8 +283,8 @@ public class HelixClusterManagerTest {
     invalidClusterMapConfig = new ClusterMapConfig(new VerifiableProperties(props));
     metricRegistry = new MetricRegistry();
     try {
-      new HelixClusterManager(invalidClusterMapConfig, hostname, new MockHelixManagerFactory(helixCluster, null, null),
-          metricRegistry);
+      new HelixClusterManager(invalidClusterMapConfig, selfInstanceName,
+          new MockHelixManagerFactory(helixCluster, null, null), metricRegistry);
       fail("Instantiation should have failed with invalid zk addresses");
     } catch (IOException e) {
       assertEquals(1L,
@@ -269,7 +296,7 @@ public class HelixClusterManagerTest {
 
     metricRegistry = new MetricRegistry();
     try {
-      new HelixClusterManager(clusterMapConfig, hostname,
+      new HelixClusterManager(clusterMapConfig, selfInstanceName,
           new MockHelixManagerFactory(helixCluster, null, new Exception("beBad")), metricRegistry);
       fail("Instantiation should fail with a HelixManager factory that throws exception on listener registrations");
     } catch (Exception e) {
@@ -287,16 +314,17 @@ public class HelixClusterManagerTest {
   @Test
   public void emptyPartitionOverrideTest() throws Exception {
     assumeTrue(overrideEnabled);
+    // Close the one initialized in the constructor, as this test needs to test fetching override map from property store as well.
+    // Otherwise, the ZNRecord still exists and HelixClusterManager will populate override map based on ZNRecord.
+    clusterManager.close();
     metricRegistry = new MetricRegistry();
     // create a MockHelixManagerFactory
-    ClusterMap clusterManagerWithEmptyRecord =
-        new HelixClusterManager(clusterMapConfig, hostname, new MockHelixManagerFactory(helixCluster, null, null),
-            metricRegistry);
+    ClusterMap clusterManagerWithEmptyRecord = new HelixClusterManager(clusterMapConfig, selfInstanceName,
+        new MockHelixManagerFactory(helixCluster, null, null), metricRegistry);
 
     Set<String> writableInClusterManager = new HashSet<>();
     for (PartitionId partition : clusterManagerWithEmptyRecord.getWritablePartitionIds(null)) {
-      String partitionStr =
-          useComposite ? ((Partition) partition).toPathString() : ((AmbryPartition) partition).toPathString();
+      String partitionStr = partition.toPathString();
       writableInClusterManager.add(partitionStr);
     }
     Set<String> writableInCluster = helixCluster.getWritablePartitions();
@@ -307,6 +335,115 @@ public class HelixClusterManagerTest {
   }
 
   /**
+   * Test HelixClusterManager can get a new replica with given partitionId, hostname and port number.
+   * @throws Exception
+   */
+  @Test
+  public void getNewReplicaTest() throws Exception {
+    assumeTrue(!useComposite);
+    clusterManager.close();
+    metricRegistry = new MetricRegistry();
+    // 1. test the case where ZNRecord is NULL in Helix PropertyStore
+    HelixClusterManager helixClusterManager =
+        new HelixClusterManager(clusterMapConfig, hostname, new MockHelixManagerFactory(helixCluster, null, null),
+            metricRegistry);
+    PartitionId partitionOfNewReplica = helixClusterManager.getAllPartitionIds(null).get(0);
+    DataNode dataNodeOfNewReplica = testHardwareLayout.getAllExistingDataNodes().get(0);
+    assertNull("New replica should be null because no replica infos ZNRecord in Helix",
+        helixClusterManager.getBootstrapReplica(partitionOfNewReplica.toPathString(), dataNodeOfNewReplica));
+    helixClusterManager.close();
+
+    // Prepare new replica info map in Helix property store. We use the first partition and first data node in HardwareLayout
+    // and PartitionLayout to build the replica info map of an existing partition. Also, we place a new partition on last
+    // data node in HardwareLayout. The format should be as follows.
+    // {
+    //   "0":{
+    //       "partitionClass" : "defaultPartitionClass"
+    //       "replicaCapacityInBytes" : "107374182400"
+    //       "localhost_18088" : "/mnt0"
+    //   }
+    //   "100":{
+    //       "partitionClass" : "defaultPartitionClass"
+    //       "replicaCapacityInBytes" : "107374182400"
+    //       "localhost_18099" : "/mnt5"
+    //       "localhost_18088" : "/mnt10"
+    //       "newhost_001"     : "/mnt0"
+    //   }
+    // }
+    Map<String, Map<String, String>> partitionToReplicaInfosMap = new HashMap<>();
+    // new replica of existing partition
+    Map<String, String> newReplicaInfos1 = new HashMap<>();
+    newReplicaInfos1.put(PARTITION_CLASS_STR, DEFAULT_PARTITION_CLASS);
+    newReplicaInfos1.put(REPLICAS_CAPACITY_STR, String.valueOf(TestPartitionLayout.defaultReplicaCapacityInBytes));
+    newReplicaInfos1.put(dataNodeOfNewReplica.getHostname() + "_" + dataNodeOfNewReplica.getPort(),
+        dataNodeOfNewReplica.getDisks().get(0).getMountPath());
+    partitionToReplicaInfosMap.put(partitionOfNewReplica.toPathString(), newReplicaInfos1);
+    // new replica of a new partition
+    Map<String, String> newReplicaInfos2 = new HashMap<>();
+    newReplicaInfos2.put(PARTITION_CLASS_STR, DEFAULT_PARTITION_CLASS);
+    newReplicaInfos2.put(REPLICAS_CAPACITY_STR, String.valueOf(TestPartitionLayout.defaultReplicaCapacityInBytes));
+    DataNode dataNodeOfNewPartition =
+        testHardwareLayout.getAllExistingDataNodes().get(testHardwareLayout.getDataNodeCount() - 1);
+    int diskNum = dataNodeOfNewPartition.getDisks().size();
+    newReplicaInfos2.put(dataNodeOfNewPartition.getHostname() + "_" + dataNodeOfNewPartition.getPort(),
+        dataNodeOfNewPartition.getDisks().get(diskNum - 1).getMountPath());
+    // add two fake entries (fake disk and fake host)
+    newReplicaInfos2.put(getInstanceName(dataNodeOfNewReplica.getHostname(), dataNodeOfNewReplica.getPort()), "/mnt10");
+    newReplicaInfos2.put("newhost_100", "/mnt0");
+    partitionToReplicaInfosMap.put(NEW_PARTITION_ID_STR, newReplicaInfos2);
+    // fake node that doesn't exist in current clustermap
+    DataNodeId fakeNode = Mockito.mock(DataNode.class);
+    Mockito.when(fakeNode.getHostname()).thenReturn("new_host");
+    Mockito.when(fakeNode.getPort()).thenReturn(100);
+    // set ZNRecord
+    ZNRecord replicaInfosZNRecord = new ZNRecord(REPLICA_ADDITION_STR);
+    replicaInfosZNRecord.setMapFields(partitionToReplicaInfosMap);
+    // populate znRecordMap
+    Map<String, ZNRecord> znRecordMap = new HashMap<>();
+    znRecordMap.put(REPLICA_ADDITION_ZNODE_PATH, replicaInfosZNRecord);
+    // create a new cluster manager
+    metricRegistry = new MetricRegistry();
+    helixClusterManager = new HelixClusterManager(clusterMapConfig, hostname,
+        new MockHelixManagerFactory(helixCluster, znRecordMap, null), metricRegistry);
+
+    // 2. test that cases: 1) partition is not found  2) host is not found in helix property store that associates with new replica
+    // select a partition that doesn't equal to partitionOfNewReplica
+    PartitionId partitionForTest;
+    Random random = new Random();
+    List<PartitionId> partitionsInClusterManager = helixClusterManager.getAllPartitionIds(null);
+    do {
+      partitionForTest = partitionsInClusterManager.get(random.nextInt(partitionsInClusterManager.size()));
+    } while (partitionForTest.toString().equals(partitionOfNewReplica.toString()));
+    assertNull("New replica should be null because given partition id is not in Helix property store",
+        helixClusterManager.getBootstrapReplica(partitionForTest.toPathString(), dataNodeOfNewReplica));
+    // select partitionOfNewReplica but a random node that doesn't equal to
+    DataNode dataNodeForTest;
+    List<DataNode> dataNodesInHardwareLayout = testHardwareLayout.getAllExistingDataNodes();
+    do {
+      dataNodeForTest = dataNodesInHardwareLayout.get(random.nextInt(dataNodesInHardwareLayout.size()));
+    } while (dataNodeForTest == dataNodeOfNewReplica);
+    assertNull("New replica should be null because hostname is not found in replica info map",
+        helixClusterManager.getBootstrapReplica(partitionOfNewReplica.toPathString(), dataNodeForTest));
+
+    // 3. test that new replica is from a new partition which doesn't exist in current cluster yet. (Mock adding new partition case)
+    //    3.1 test new partition on host that is not present in current clustermap
+    assertNull("New replica should be null because host is not present in clustermap",
+        helixClusterManager.getBootstrapReplica(NEW_PARTITION_ID_STR, fakeNode));
+    //    3.2 test new partition on disk that doesn't exist
+    assertNull("New replica should be null because disk doesn't exist",
+        helixClusterManager.getBootstrapReplica(NEW_PARTITION_ID_STR, dataNodeOfNewReplica));
+    //    3.3 test replica is created for new partition
+    assertNotNull("New replica should be created successfully",
+        helixClusterManager.getBootstrapReplica(NEW_PARTITION_ID_STR, dataNodeOfNewPartition));
+
+    // 4. test that new replica of existing partition is successfully created based on infos from Helix property store.
+    assertNotNull("New replica should be created successfully",
+        helixClusterManager.getBootstrapReplica(partitionOfNewReplica.toPathString(), dataNodeOfNewReplica));
+
+    helixClusterManager.close();
+  }
+
+  /**
    * Tests all the interface methods.
    * @throws Exception
    */
@@ -314,44 +451,130 @@ public class HelixClusterManagerTest {
   public void basicInterfaceTest() throws Exception {
     assumeTrue(!overrideEnabled);
 
-    for (String metricName : clusterManager.getMetricRegistry().getNames()) {
-      System.out.println(metricName);
-    }
     assertEquals("Incorrect local datacenter ID", 0, clusterManager.getLocalDatacenterId());
     testPartitionReplicaConsistency();
     testInvalidPartitionId();
     testDatacenterDatanodeReplicas();
-    assertStateEquivalency();
+    assertStateEquivalency(helixCluster.getDownInstances(), helixCluster.getUpInstances());
   }
 
   /**
    * Test that everything works as expected in the presence of liveness changes initiated by Helix itself.
-   * @throws Exception
    */
   @Test
-  public void helixInitiatedLivenessChangeTest() throws Exception {
+  public void helixInitiatedLivenessChangeTest() {
     // this test is not intended for the composite cluster manager and override enabled cases.
     assumeTrue(!useComposite && !overrideEnabled);
 
     // all instances are up initially.
-    assertStateEquivalency();
+    assertStateEquivalency(helixCluster.getDownInstances(), helixCluster.getUpInstances());
 
-    // Bring one instance down in each dc.
+    // Bring one instance (not current host) down in each dc
     for (String zkAddr : helixCluster.getZkAddrs()) {
-      helixCluster.bringInstanceDown(helixCluster.getUpInstances(zkAddr).get(0));
+      String instance =
+          helixCluster.getUpInstances(zkAddr).stream().filter(name -> !name.equals(selfInstanceName)).findFirst().get();
+      helixCluster.bringInstanceDown(instance);
     }
 
-    assertStateEquivalency();
+    assertStateEquivalency(helixCluster.getDownInstances(), helixCluster.getUpInstances());
 
     // Bring all instances down in all dcs.
     helixCluster.bringAllInstancesDown();
-    assertStateEquivalency();
+    Set<String> expectedDownInstances = helixCluster.getDownInstances();
+    Set<String> expectedUpInstances = helixCluster.getUpInstances();
+    expectedDownInstances.remove(selfInstanceName);
+    expectedUpInstances.add(selfInstanceName);
+    assertStateEquivalency(expectedDownInstances, expectedUpInstances);
 
     // Bring one instance up in each dc.
+    boolean selfInstanceIsChosen = false;
     for (String zkAddr : helixCluster.getZkAddrs()) {
-      helixCluster.bringInstanceUp(helixCluster.getDownInstances(zkAddr).get(0));
+      String instanceName = helixCluster.getDownInstances(zkAddr).get(0);
+      selfInstanceIsChosen = instanceName.equals(selfInstanceName);
+      helixCluster.bringInstanceUp(instanceName);
     }
-    assertStateEquivalency();
+    expectedDownInstances = helixCluster.getDownInstances();
+    expectedUpInstances = helixCluster.getUpInstances();
+    if (!selfInstanceIsChosen) {
+      expectedDownInstances.remove(selfInstanceName);
+      expectedUpInstances.add(selfInstanceName);
+    }
+    assertStateEquivalency(expectedDownInstances, expectedUpInstances);
+  }
+
+  /**
+   * Test helix initiated ideal state change can be correctly handled by {@link HelixClusterManager}.
+   * @throws Exception
+   */
+  @Test
+  public void helixInitiatedIdealStateChangeTest() throws Exception {
+    assumeTrue(!useComposite && !overrideEnabled);
+    HelixClusterManager helixClusterManager = (HelixClusterManager) clusterManager;
+    verifyInitialClusterChanges(helixClusterManager, helixCluster, dcs);
+    String resourceName = "newResource";
+    String partitionName = String.valueOf(helixCluster.getAllPartitions().size());
+    IdealState idealState = new IdealState(resourceName);
+    idealState.setPreferenceList(partitionName, new ArrayList<>());
+    helixCluster.addNewResource(resourceName, idealState, localDc);
+    verifyInitialClusterChanges(helixClusterManager, helixCluster, new String[]{localDc});
+    // localDc should have one more partition compared with remoteDc
+    Map<String, ConcurrentHashMap<String, String>> partitionToResource =
+        (helixClusterManager).getPartitionToResourceMap();
+    assertEquals("localDc should have one more partition", partitionToResource.get(localDc).size(),
+        partitionToResource.get(remoteDc).size() + 1);
+    assertTrue(partitionToResource.get(localDc).containsKey(partitionName) && !partitionToResource.get(remoteDc)
+        .containsKey(partitionName));
+  }
+
+  /**
+   * Test that routing table change reflects correct state of each replica and {@link HelixClusterManager} is able to get
+   * replica in required state.
+   */
+  @Test
+  public void routingTableProviderChangeTest() throws Exception {
+    assumeTrue(!useComposite && !overrideEnabled);
+    metricRegistry = new MetricRegistry();
+    // Mock metricRegistry here to introduce a latch based counter for testing purpose
+    MetricRegistry mockMetricRegistry = Mockito.spy(metricRegistry);
+    Counter mockCounter = Mockito.mock(Counter.class);
+    AtomicReference<CountDownLatch> routingTableChangeLatch = new AtomicReference<>();
+    routingTableChangeLatch.set(new CountDownLatch(4));
+    doAnswer(invocation -> {
+      routingTableChangeLatch.get().countDown();
+      return null;
+    }).when(mockCounter).inc();
+    doReturn(mockCounter).when(mockMetricRegistry)
+        .counter(MetricRegistry.name(HelixClusterManager.class, "routingTableChangeTriggerCount"));
+    HelixClusterManager helixClusterManager = new HelixClusterManager(clusterMapConfig, selfInstanceName,
+        new MockHelixManagerFactory(helixCluster, null, null), mockMetricRegistry);
+    Map<String, AtomicReference<RoutingTableSnapshot>> snapshotsByDc = helixClusterManager.getRoutingTableSnapshots();
+    RoutingTableSnapshot localDcSnapshot = snapshotsByDc.get(localDc).get();
+
+    Set<InstanceConfig> instanceConfigsInSnapshot = new HashSet<>(localDcSnapshot.getInstanceConfigs());
+    Set<InstanceConfig> instanceConfigsInCluster =
+        new HashSet<>(helixCluster.getInstanceConfigsFromDcs(new String[]{localDc}));
+    assertEquals("Mismatch in instance configs", instanceConfigsInCluster, instanceConfigsInSnapshot);
+    // verify leader replica of each partition is correct
+    verifyLeaderReplicasInDc(helixClusterManager, localDc);
+
+    // randomly choose a partition and change the leader replica of it in cluster
+    List<? extends PartitionId> defaultPartitionIds = helixClusterManager.getAllPartitionIds(DEFAULT_PARTITION_CLASS);
+    PartitionId partitionToChange = defaultPartitionIds.get((new Random()).nextInt(defaultPartitionIds.size()));
+    MockHelixAdmin mockHelixAdmin = helixCluster.getHelixAdminFromDc(localDc);
+    String currentLeaderInstance = mockHelixAdmin.getPartitionToLeaderReplica().get(partitionToChange.toPathString());
+    String newLeaderInstance = mockHelixAdmin.getInstancesForPartition(partitionToChange.toPathString())
+        .stream()
+        .filter(k -> !k.equals(currentLeaderInstance))
+        .findFirst()
+        .get();
+    routingTableChangeLatch.set(new CountDownLatch(1));
+    mockHelixAdmin.changeLeaderReplicaForPartition(partitionToChange.toPathString(), newLeaderInstance);
+    mockHelixAdmin.triggerRoutingTableNotification();
+    assertTrue("Routing table change didn't come within 1 second",
+        routingTableChangeLatch.get().await(1, TimeUnit.SECONDS));
+    verifyLeaderReplicasInDc(helixClusterManager, localDc);
+
+    helixClusterManager.close();
   }
 
   /**
@@ -422,7 +645,7 @@ public class HelixClusterManagerTest {
 
     // The following does not do anything currently.
     clusterManager.onReplicaEvent(replica, ReplicaEventType.Partition_ReadOnly);
-    assertStateEquivalency();
+    assertStateEquivalency(helixCluster.getDownInstances(), helixCluster.getUpInstances());
   }
 
   /**
@@ -484,11 +707,11 @@ public class HelixClusterManagerTest {
    * {@link org.apache.helix.NotificationContext.Type#INIT} and that they are dealt with correctly.
    */
   @Test
-  public void sealedReplicaChangeTest() throws Exception {
+  public void sealedReplicaChangeTest() {
     assumeTrue(!useComposite && !overrideEnabled && listenCrossColo);
 
     // all instances are up initially.
-    assertStateEquivalency();
+    assertStateEquivalency(helixCluster.getDownInstances(), helixCluster.getUpInstances());
 
     AmbryPartition partition = (AmbryPartition) clusterManager.getWritablePartitionIds(null).get(0);
     List<String> instances = helixCluster.getInstancesForPartition((partition.toPathString()));
@@ -513,7 +736,7 @@ public class HelixClusterManagerTest {
         clusterManager.getWritablePartitionIds(null).contains(partition));
     assertEquals("If no replica is SEALED, the whole partition should be Writable", PartitionState.READ_WRITE,
         partition.getPartitionState());
-    assertStateEquivalency();
+    assertStateEquivalency(helixCluster.getDownInstances(), helixCluster.getUpInstances());
   }
 
   /**
@@ -566,9 +789,11 @@ public class HelixClusterManagerTest {
       Utils.writeJsonObjectToFile(testPartitionLayout.getPartitionLayout().toJSONObject(), partitionLayoutPath);
       helixCluster.upgradeWithNewPartitionLayout(partitionLayoutPath);
       clusterManager.close();
-      MockHelixManagerFactory helixManagerFactory = new MockHelixManagerFactory(helixCluster, znRecord, null);
+      Map<String, ZNRecord> znRecordMap = new HashMap<>();
+      znRecordMap.put(PARTITION_OVERRIDE_ZNODE_PATH, znRecord);
+      MockHelixManagerFactory helixManagerFactory = new MockHelixManagerFactory(helixCluster, znRecordMap, null);
       HelixClusterManager clusterManager =
-          new HelixClusterManager(clusterMapConfig, hostname, helixManagerFactory, new MetricRegistry());
+          new HelixClusterManager(clusterMapConfig, selfInstanceName, helixManagerFactory, new MetricRegistry());
       // Ensure the new RW partition is added
       assertEquals("Mismatch in writable partitions when instanceConfig changes", writableInOverrideMap.size() + 1,
           clusterManager.getWritablePartitionIds(null).size());
@@ -621,7 +846,7 @@ public class HelixClusterManagerTest {
     assumeTrue(!useComposite && !overrideEnabled && listenCrossColo);
 
     // all instances are up initially.
-    assertStateEquivalency();
+    assertStateEquivalency(helixCluster.getDownInstances(), helixCluster.getUpInstances());
 
     AmbryPartition partition = (AmbryPartition) clusterManager.getWritablePartitionIds(null).get(0);
     List<String> instances = helixCluster.getInstancesForPartition((partition.toPathString()));
@@ -677,13 +902,21 @@ public class HelixClusterManagerTest {
 
     // Initialization path:
     MockHelixManagerFactory helixManagerFactory = new MockHelixManagerFactory(helixCluster, null, null);
-    List<InstanceConfig> instanceConfigs = helixCluster.getAllInstanceConfigs();
+    List<InstanceConfig> instanceConfigs = helixCluster.getInstanceConfigsFromDcs(dcs);
     int instanceCount = instanceConfigs.size();
-    int randomIndex = com.github.ambry.utils.TestUtils.RANDOM.nextInt(instanceConfigs.size());
+    // find the self instance config and put it at the end of list. This is to ensure subsequent test won't choose self instance config.
+    for (int i = 0; i < instanceCount; ++i) {
+      if (instanceConfigs.get(i).getInstanceName().equals(selfInstanceName)) {
+        Collections.swap(instanceConfigs, i, instanceConfigs.size() - 1);
+        break;
+      }
+    }
+    int randomIndex = com.github.ambry.utils.TestUtils.RANDOM.nextInt(instanceCount - 1);
     InstanceConfig aheadInstanceConfig = instanceConfigs.get(randomIndex);
-    Collections.swap(instanceConfigs, randomIndex, instanceConfigs.size() - 1);
+    Collections.swap(instanceConfigs, randomIndex, instanceConfigs.size() - 2);
     aheadInstanceConfig.getRecord().setSimpleField(XID_STR, Long.toString(CURRENT_XID + 1));
-    clusterManager = new HelixClusterManager(clusterMapConfig, hostname, helixManagerFactory, new MetricRegistry());
+    clusterManager =
+        new HelixClusterManager(clusterMapConfig, selfInstanceName, helixManagerFactory, new MetricRegistry());
     assertEquals(instanceCount - 1, clusterManager.getDataNodeIds().size());
     for (DataNodeId dataNode : clusterManager.getDataNodeIds()) {
       String instanceName = ClusterMapUtils.getInstanceName(dataNode.getHostname(), dataNode.getPort());
@@ -696,9 +929,9 @@ public class HelixClusterManagerTest {
       assertEquals(instanceCount, aheadInstanceClusterManager.getDataNodeIds().size());
     }
 
-    // Post-initialization InstanceConfig change:
+    // Post-initialization InstanceConfig change: pick an instance that is neither previous instance nor self instance
     InstanceConfig ignoreInstanceConfig =
-        instanceConfigs.get(com.github.ambry.utils.TestUtils.RANDOM.nextInt(instanceConfigs.size() - 1));
+        instanceConfigs.get(com.github.ambry.utils.TestUtils.RANDOM.nextInt(instanceCount - 2));
     String ignoreInstanceName = ignoreInstanceConfig.getInstanceName();
     ignoreInstanceConfig.getRecord().setSimpleField(XID_STR, Long.toString(CURRENT_XID + 2));
 
@@ -733,7 +966,9 @@ public class HelixClusterManagerTest {
     assumeTrue(!useComposite);
     HelixClusterManager helixClusterManager = (HelixClusterManager) clusterManager;
     Counter instanceTriggerCounter = helixClusterManager.helixClusterManagerMetrics.instanceConfigChangeTriggerCount;
-    Map<String, HelixManager> helixManagerMap = helixClusterManager.getHelixManagerMap();
+    Map<String, HelixClusterManager.DcInfo> dcInfosMap = helixClusterManager.getDcInfosMap();
+    Map<String, HelixManager> helixManagerMap =
+        dcInfosMap.entrySet().stream().collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().helixManager));
     for (Map.Entry<String, HelixManager> entry : helixManagerMap.entrySet()) {
       if (entry.getKey().equals(localDc)) {
         assertTrue("Helix cluster manager should always be connected to the local Helix manager",
@@ -749,7 +984,7 @@ public class HelixClusterManagerTest {
     assertEquals("Number of trigger count should be in accordance to listenCrossColo value",
         instanceConfigChangeTriggerCount + (listenCrossColo ? dcs.length : 1), instanceTriggerCounter.getCount());
 
-    InstanceConfig remoteInstanceConfig = helixCluster.getAllInstanceConfigs()
+    InstanceConfig remoteInstanceConfig = helixCluster.getInstanceConfigsFromDcs(dcs)
         .stream()
         .filter(e -> ClusterMapUtils.getDcName(e).equals(remoteDc))
         .findAny()
@@ -785,9 +1020,11 @@ public class HelixClusterManagerTest {
     // live instance trigger happens once initially.
     long instanceTriggerCount = dcs.length;
 
-    // Bring one instance down in each dc in order to test the metrics more generally.
+    // Bring one instance (not current instance) down in each dc in order to test the metrics more generally.
     for (String zkAddr : helixCluster.getZkAddrs()) {
-      helixCluster.bringInstanceDown(helixCluster.getUpInstances(zkAddr).get(0));
+      String instance =
+          helixCluster.getUpInstances(zkAddr).stream().filter(name -> !name.equals(selfInstanceName)).findFirst().get();
+      helixCluster.bringInstanceDown(instance);
       instanceTriggerCount++;
     }
 
@@ -871,6 +1108,64 @@ public class HelixClusterManagerTest {
   // Helpers
 
   /**
+   * Verify that {@link HelixClusterManager} receives and handles initial cluster changes (i.e InstanceConfig, IdealState
+   * change), and populates the in-mem clustermap correctly.
+   * @param clusterManager the {@link HelixClusterManager} to use for verification.
+   * @param helixCluster the {@link MockHelixCluster} to provide cluster infos
+   */
+  private void verifyInitialClusterChanges(HelixClusterManager clusterManager, MockHelixCluster helixCluster,
+      String[] dcs) {
+    // get in-mem data structures populated based on initial notification
+    Map<String, ConcurrentHashMap<String, String>> partitionToResouceByDc = clusterManager.getPartitionToResourceMap();
+    Map<String, Set<AmbryDataNode>> dataNodesByDc = clusterManager.getDcToDataNodesMap();
+
+    for (String dc : dcs) {
+      // 1. verify all instanceConfigs from Helix are present in cluster manager
+      List<InstanceConfig> instanceConfigsInCluster = helixCluster.getInstanceConfigsFromDcs(new String[]{dc});
+      assertEquals("Mismatch in number of instances", instanceConfigsInCluster.size(), dataNodesByDc.get(dc).size());
+      Set<String> hostsFromClusterManager =
+          dataNodesByDc.get(dc).stream().map(AmbryDataNode::getHostname).collect(Collectors.toSet());
+      Set<String> hostsFromHelix =
+          instanceConfigsInCluster.stream().map(InstanceConfig::getHostName).collect(Collectors.toSet());
+      assertEquals("Mismatch in hosts set", hostsFromHelix, hostsFromClusterManager);
+
+      // 2. verify all resources and partitions from Helix are present in cluster manager
+      Map<String, String> partitionToResourceMap = partitionToResouceByDc.get(dc);
+      MockHelixAdmin helixAdmin = helixCluster.getHelixAdminFromDc(dc);
+      List<IdealState> idealStates = helixAdmin.getIdealStates();
+      for (IdealState idealState : idealStates) {
+        String resourceName = idealState.getResourceName();
+        Set<String> partitionSet = idealState.getPartitionSet();
+        for (String partitionStr : partitionSet) {
+          assertEquals("Mismatch in resource name", resourceName, partitionToResourceMap.get(partitionStr));
+        }
+      }
+    }
+  }
+
+  /**
+   * Helper method to verify leader replicas in cluster match those in routing table snapshot.
+   * @param helixClusterManager the {@link HelixClusterManager} from which routing table snapshot is retrieved to check.
+   * @param dcName name of the data center in which this verification is performed.
+   */
+  private void verifyLeaderReplicasInDc(HelixClusterManager helixClusterManager, String dcName) {
+    // Following are maps of partitionId to the instance that holds its leader replica.
+    Map<String, String> leaderReplicasInSnapshot = new HashMap<>();
+    Map<String, String> leaderReplicasInCluster = helixCluster.getPartitionToLeaderReplica(dcName);
+    for (PartitionId partitionId : helixClusterManager.getAllPartitionIds(null)) {
+      List<? extends ReplicaId> leadReplicas = partitionId.getReplicaIdsByState(ReplicaState.LEADER, dcName);
+      assertTrue("There should not be more than one lead replica", leadReplicas.size() <= 1);
+      // some special partition class has replicas in one dc only
+      if (leadReplicas.size() == 1) {
+        DataNodeId dataNodeId = leadReplicas.get(0).getDataNodeId();
+        leaderReplicasInSnapshot.put(partitionId.toPathString(),
+            getInstanceName(dataNodeId.getHostname(), dataNodeId.getPort()));
+      }
+    }
+    assertEquals("Mismatch in leader replicas", leaderReplicasInCluster, leaderReplicasInSnapshot);
+  }
+
+  /**
    * Get the counter value for the metric in {@link HelixClusterManagerMetrics} with the given suffix.
    * @param suffix the suffix of the metric that distinguishes it from other metrics in the class.
    * @return the value of the counter.
@@ -895,8 +1190,7 @@ public class HelixClusterManagerTest {
   private Pair<Set<String>, Set<String>> getWritablePartitions() {
     Set<String> writableInClusterManager = new HashSet<>();
     for (PartitionId partition : clusterManager.getWritablePartitionIds(null)) {
-      String partitionStr =
-          useComposite ? ((Partition) partition).toPathString() : ((AmbryPartition) partition).toPathString();
+      String partitionStr = partition.toPathString();
       writableInClusterManager.add(partitionStr);
     }
     Set<String> writableInCluster = helixCluster.getWritablePartitions();
@@ -913,8 +1207,7 @@ public class HelixClusterManagerTest {
   private void testAllPartitions() {
     Set<String> partitionsInClusterManager = new HashSet<>();
     for (PartitionId partition : clusterManager.getAllPartitionIds(null)) {
-      String partitionStr =
-          useComposite ? ((Partition) partition).toPathString() : ((AmbryPartition) partition).toPathString();
+      String partitionStr = partition.toPathString();
       partitionsInClusterManager.add(partitionStr);
     }
     Set<String> allPartitions = helixCluster.getAllPartitions();
@@ -981,11 +1274,10 @@ public class HelixClusterManagerTest {
   /**
    * Assert that the state of datanodes in the cluster manager's view are consistent with their actual states in the
    * cluster.
+   * @param expectedDownInstances the expected down instances set in cluster manager.
+   * @param expectedUpInstances the expected up instances set in cluster manager.
    */
-  private void assertStateEquivalency() {
-    Set<String> upInstancesInCluster = helixCluster.getUpInstances();
-    Set<String> downInstancesInCluster = helixCluster.getDownInstances();
-
+  private void assertStateEquivalency(Set<String> expectedDownInstances, Set<String> expectedUpInstances) {
     Set<String> upInstancesInClusterManager = new HashSet<>();
     Set<String> downInstancesInClusterManager = new HashSet<>();
     for (DataNodeId dataNode : clusterManager.getDataNodeIds()) {
@@ -997,8 +1289,8 @@ public class HelixClusterManagerTest {
             ClusterMapUtils.getInstanceName(dataNode.getHostname(), dataNode.getPort())));
       }
     }
-    assertEquals(downInstancesInCluster, downInstancesInClusterManager);
-    assertEquals(upInstancesInCluster, upInstancesInClusterManager);
+    assertEquals(expectedDownInstances, downInstancesInClusterManager);
+    assertEquals(expectedUpInstances, upInstancesInClusterManager);
     Pair<Set<String>, Set<String>> writablePartitionsInTwoPlaces = getWritablePartitions();
     assertEquals(writablePartitionsInTwoPlaces.getFirst(), writablePartitionsInTwoPlaces.getSecond());
     testAllPartitions();
@@ -1010,18 +1302,19 @@ public class HelixClusterManagerTest {
   private static class MockHelixManagerFactory extends HelixFactory {
     private final MockHelixCluster helixCluster;
     private final Exception beBadException;
-    private final ZNRecord znRecord;
+    private final Map<String, ZNRecord> znRecordMap;
 
     /**
      * Construct this factory
      * @param helixCluster the {@link MockHelixCluster} that this factory's manager will be associated with.
-     * @param znRecord the {@link ZNRecord} that will be used to set HelixPropertyStore by this factory's manager.
+     * @param znRecordMap A map that maps ZNode path to corresponding {@link ZNRecord} that will be used in HelixPropertyStore.
      * @param beBadException the {@link Exception} that the Helix Manager constructed by this factory will throw.
      */
-    MockHelixManagerFactory(MockHelixCluster helixCluster, ZNRecord znRecord, Exception beBadException) {
+    MockHelixManagerFactory(MockHelixCluster helixCluster, Map<String, ZNRecord> znRecordMap,
+        Exception beBadException) {
       this.helixCluster = helixCluster;
       this.beBadException = beBadException;
-      this.znRecord = znRecord;
+      this.znRecordMap = znRecordMap;
     }
 
     /**
@@ -1032,13 +1325,13 @@ public class HelixClusterManagerTest {
      * @param zkAddr the address identifying the zk service to which this request is to be made.
      * @return the {@link MockHelixManager}
      */
-    HelixManager getZKHelixManager(String clusterName, String instanceName, InstanceType instanceType, String zkAddr) {
+    public HelixManager getZKHelixManager(String clusterName, String instanceName, InstanceType instanceType,
+        String zkAddr) {
       if (helixCluster.getZkAddrs().contains(zkAddr)) {
-        return new MockHelixManager(instanceName, instanceType, zkAddr, helixCluster, znRecord, beBadException);
+        return new MockHelixManager(instanceName, instanceType, zkAddr, helixCluster, znRecordMap, beBadException);
       } else {
         throw new IllegalArgumentException("Invalid ZkAddr");
       }
     }
   }
 }
-

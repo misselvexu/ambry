@@ -21,15 +21,15 @@ import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.LoggingNotificationSystem;
 import com.github.ambry.commons.ResponseHandler;
-import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobProperties;
-import com.github.ambry.network.NetworkClient;
+import com.github.ambry.network.SocketNetworkClient;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.protocol.RequestOrResponse;
 import com.github.ambry.protocol.RequestOrResponseType;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
@@ -71,14 +71,9 @@ public class TtlUpdateManagerTest {
   private static final int BLOBS_COUNT = 5;
   private static final String UPDATE_SERVICE_ID = "update-service-id";
   private static final String LOCAL_DC = "DC1";
-
-  static {
-    TestUtils.RANDOM.nextBytes(PUT_CONTENT);
-  }
-
   private final NonBlockingRouter router;
   private final TtlUpdateManager ttlUpdateManager;
-  private final NetworkClient networkClient;
+  private final SocketNetworkClient networkClient;
   private final AtomicReference<MockSelectorState> mockSelectorState = new AtomicReference<>(MockSelectorState.Good);
   private final MockClusterMap clusterMap = new MockClusterMap();
   private final MockServerLayout serverLayout = new MockServerLayout(clusterMap);
@@ -97,7 +92,7 @@ public class TtlUpdateManagerTest {
     VerifiableProperties vProps =
         new VerifiableProperties(getNonBlockingRouterProperties(DEFAULT_SUCCESS_TARGET, DEFAULT_PARALLELISM));
     RouterConfig routerConfig = new RouterConfig(vProps);
-    NonBlockingRouterMetrics metrics = new NonBlockingRouterMetrics(clusterMap);
+    NonBlockingRouterMetrics metrics = new NonBlockingRouterMetrics(clusterMap, null);
     MockNetworkClientFactory networkClientFactory =
         new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, serverLayout, time);
@@ -296,9 +291,6 @@ public class TtlUpdateManagerTest {
     }
   }
 
-  // helpers
-  // general
-
   /**
    * Executes a ttl update operations and verifies results
    * @param ids the collection of ids to ttl update
@@ -343,6 +335,9 @@ public class TtlUpdateManagerTest {
     }
   }
 
+  // helpers
+  // general
+
   /**
    * Sends all the requests that the {@code manager} may have ready
    * @param futureResult the {@link FutureResult} that tracks the operation
@@ -354,14 +349,15 @@ public class TtlUpdateManagerTest {
   private void sendRequestsGetResponses(FutureResult<Void> futureResult, TtlUpdateManager manager, boolean advanceTime,
       boolean ignoreUnrecognizedRequests) {
     List<RequestInfo> requestInfoList = new ArrayList<>();
+    Set<Integer> requestsToDrop = new HashSet<>();
     Set<RequestInfo> requestAcks = new HashSet<>();
     List<RequestInfo> referenceRequestInfos = new ArrayList<>();
     while (!futureResult.isDone()) {
-      manager.poll(requestInfoList);
+      manager.poll(requestInfoList, requestsToDrop);
       referenceRequestInfos.addAll(requestInfoList);
       List<ResponseInfo> responseInfoList = new ArrayList<>();
       try {
-        responseInfoList = networkClient.sendAndPoll(requestInfoList, AWAIT_TIMEOUT_MS);
+        responseInfoList = networkClient.sendAndPoll(requestInfoList, requestsToDrop, AWAIT_TIMEOUT_MS);
       } catch (RuntimeException | Error e) {
         if (!advanceTime) {
           throw e;
@@ -380,7 +376,7 @@ public class TtlUpdateManagerTest {
           throw new IllegalStateException("Received response more than once for a request");
         }
         requestAcks.add(requestInfo);
-        RouterRequestInfo routerRequestInfo = (RouterRequestInfo) responseInfo.getRequestInfo();
+        RequestInfo routerRequestInfo = responseInfo.getRequestInfo();
         RequestOrResponseType type = ((RequestOrResponse) routerRequestInfo.getRequest()).getRequestType();
         switch (type) {
           case TtlUpdateRequest:
@@ -411,8 +407,6 @@ public class TtlUpdateManagerTest {
     return properties;
   }
 
-  // fixedCountSuccessfulResponseTest() helpers
-
   /**
    * Does the fixed count successful response test by setting the appropriate number of successful responses
    * @param successfulResponsesCount the number of successful responses
@@ -440,7 +434,7 @@ public class TtlUpdateManagerTest {
     serverLayout.getMockServers().forEach(MockServer::resetServerErrors);
   }
 
-  // routerErrorCodeResolutionTest() helpers
+  // fixedCountSuccessfulResponseTest() helpers
 
   /**
    * Runs the router code resolution test based on the input
@@ -478,6 +472,12 @@ public class TtlUpdateManagerTest {
     }
     serverLayout.getMockServers().forEach(MockServer::resetServerErrors);
     assertTtl(router, blobIds, TTL_SECS);
+  }
+
+  // routerErrorCodeResolutionTest() helpers
+
+  static {
+    TestUtils.RANDOM.nextBytes(PUT_CONTENT);
   }
 }
 

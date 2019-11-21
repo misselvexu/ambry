@@ -18,6 +18,7 @@ import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.clustermap.ReplicaStatusDelegate;
 import com.github.ambry.config.StoreConfig;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.replication.FindToken;
 import com.github.ambry.utils.ByteBufferOutputStream;
 import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.Pair;
@@ -262,7 +263,7 @@ public class BlobStoreTest {
    */
   public BlobStoreTest(boolean isLogSegmented) throws InterruptedException, IOException, StoreException {
     this.isLogSegmented = isLogSegmented;
-    tempDir = StoreTestUtils.createTempDirectory("storeDir-" + UtilsTest.getRandomString(10));
+    tempDir = StoreTestUtils.createTempDirectory("storeDir-" + storeId);
     tempDirStr = tempDir.getAbsolutePath();
     StoreConfig config = new StoreConfig(new VerifiableProperties(properties));
     long bufferTimeMs = TimeUnit.SECONDS.toMillis(config.storeTtlUpdateBufferTimeSeconds);
@@ -691,8 +692,8 @@ public class BlobStoreTest {
     MockId mockId = put(1, PUT_RECORD_SIZE, Utils.Infinite_Time).get(0);
     short[] accountIds =
         {-1, Utils.getRandomShort(TestUtils.RANDOM), -1, mockId.getAccountId(), Utils.getRandomShort(TestUtils.RANDOM)};
-    short[] containerIds = {-1, -1, Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(
-        TestUtils.RANDOM), mockId.getContainerId()};
+    short[] containerIds = {-1, -1, Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM),
+        mockId.getContainerId()};
     for (int i = 0; i < accountIds.length; i++) {
       verifyDeleteFailure(new MockId(mockId.getID(), accountIds[i], containerIds[i]),
           StoreErrorCodes.Authorization_Failure);
@@ -723,8 +724,8 @@ public class BlobStoreTest {
     MockId mockId = put(1, PUT_RECORD_SIZE, Utils.Infinite_Time).get(0);
     short[] accountIds =
         {-1, Utils.getRandomShort(TestUtils.RANDOM), -1, mockId.getAccountId(), Utils.getRandomShort(TestUtils.RANDOM)};
-    short[] containerIds = {-1, -1, Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(
-        TestUtils.RANDOM), mockId.getContainerId()};
+    short[] containerIds = {-1, -1, Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM),
+        mockId.getContainerId()};
     for (int i = 0; i < accountIds.length; i++) {
       verifyGetFailure(new MockId(mockId.getID(), accountIds[i], containerIds[i]),
           StoreErrorCodes.Authorization_Failure);
@@ -942,6 +943,8 @@ public class BlobStoreTest {
   @Test
   public void shutdownTest() throws StoreException {
     store.shutdown();
+    File cleanShutDownFile = new File(tempDir, PersistentIndex.CLEAN_SHUTDOWN_FILENAME);
+    assertTrue("Clean shutdown file should exist.", cleanShutDownFile.exists());
     // no operations should be possible if store is not up or has been shutdown
     verifyOperationFailuresOnInactiveStore(store);
     store = createBlobStore(getMockReplicaId(tempDirStr));
@@ -1027,6 +1030,10 @@ public class BlobStoreTest {
     // verify error count would be reset after successful Put operation
     testStore1.put(validWriteSet1);
     assertEquals("Error count should be reset", 0, testStore1.getErrorCount().get());
+    // trigger a normal shutdown to persist data (otherwise following delete/ttl update operation will encounter ID_Not_Found error)
+    testStore1.shutdown();
+    // restart for subsequent tests
+    testStore1.start();
     // verify consecutive two failed Puts would make store shutdown (storeIoErrorCountToTriggerShutdown = 2)
     for (int i = 0; i < 2; ++i) {
       try {
@@ -1102,6 +1109,17 @@ public class BlobStoreTest {
     }
     assertEquals("Mismatch in error count", 2, testStore2.getErrorCount().get());
 
+    // test that when InternalError's error message is null, the error code should be Unknown_Error and store error count
+    // stays unchanged.
+    doThrow(new InternalError()).when(mockStoreKeyFactory).getStoreKey(any(DataInputStream.class));
+    try {
+      testStore2.get(Collections.singletonList(id2), EnumSet.noneOf(StoreGetOptions.class));
+      fail("should throw exception");
+    } catch (StoreException e) {
+      assertEquals("Mismatch in error code", StoreErrorCodes.Unknown_Error, e.getErrorCode());
+    }
+    assertEquals("Mismatch in error count", 2, testStore2.getErrorCount().get());
+
     // verify that StoreException.Unknown_Error could be captured by Get and error count stays unchanged.
     doThrow(new IOException("Unknown exception")).when(mockStoreKeyFactory).getStoreKey(any(DataInputStream.class));
     try {
@@ -1163,11 +1181,81 @@ public class BlobStoreTest {
     reloadStore();
   }
 
+  /**
+   * Test both success and failure cases when deleting store files.
+   * @throws Exception
+   */
+  @Test
+  public void deleteStoreFilesTest() throws Exception {
+    store.shutdown();
+    // create test store directory
+    File storeDir = StoreTestUtils.createTempDirectory("store-" + storeId);
+    File reserveDir = StoreTestUtils.createTempDirectory("reserve-pool");
+    DiskSpaceAllocator diskAllocator =
+        new DiskSpaceAllocator(true, reserveDir, 0, new StorageManagerMetrics(new MetricRegistry()));
+    StoreConfig config = new StoreConfig(new VerifiableProperties(properties));
+    MetricRegistry registry = new MetricRegistry();
+    StoreMetrics metrics = new StoreMetrics(registry);
+    BlobStore testStore =
+        new BlobStore(getMockReplicaId(storeDir.getAbsolutePath()), config, scheduler, storeStatsScheduler,
+            diskIOScheduler, diskAllocator, metrics, metrics, STORE_KEY_FACTORY, recovery, hardDelete, null, time);
+    testStore.start();
+    DiskSpaceRequirements diskSpaceRequirements = testStore.getDiskSpaceRequirements();
+    diskAllocator.initializePool(diskSpaceRequirements == null ? Collections.emptyList()
+        : Collections.singletonList(testStore.getDiskSpaceRequirements()));
+    // ensure store directory and file exist
+    assertTrue("Store directory doesn't exist", storeDir.exists());
+    File storeSegmentDir = new File(reserveDir, DiskSpaceAllocator.STORE_DIR_PREFIX + storeId);
+    if (isLogSegmented) {
+      assertTrue("Store segment directory doesn't exist", storeSegmentDir.exists());
+      assertTrue("In-mem store file map should contain entry associated with test store",
+          diskAllocator.getStoreReserveFileMap().containsKey(storeId));
+    }
+    // test that deletion on started store should fail
+    try {
+      testStore.deleteStoreFiles();
+    } catch (IllegalStateException e) {
+      //expected
+    }
+    // create a unreadable dir in store dir to induce deletion failure
+    File invalidDir = new File(storeDir, "invalidDir");
+    assertTrue("Couldn't create dir within store dir", invalidDir.mkdir());
+    assertTrue("Could not make unreadable", invalidDir.setReadable(false));
+    testStore.shutdown();
+    try {
+      testStore.deleteStoreFiles();
+      fail("should fail because one invalid dir is unreadable");
+    } catch (Exception e) {
+      // expected
+    }
+    assertTrue("store directory should exist because deletion failed", storeDir.exists());
+    // reset permission to allow deletion to succeed.
+    assertTrue("Could not make readable", invalidDir.setReadable(true));
+
+    // put a swap segment into store dir
+    File tempFile = File.createTempFile("sample-swap",
+        LogSegmentNameHelper.SUFFIX + BlobStoreCompactor.TEMP_LOG_SEGMENT_NAME_SUFFIX, storeDir);
+    // test success case (swap segment is returned and store dir is correctly deleted)
+    assertEquals("Swap reserve dir should be empty initially", 0,
+        diskAllocator.getSwapReserveFileMap().getFileSizeSet().size());
+    testStore.deleteStoreFiles();
+    assertFalse("swap segment still exists", tempFile.exists());
+    assertEquals("Swap reserve dir should have one swap segment", 1,
+        diskAllocator.getSwapReserveFileMap().getFileSizeSet().size());
+    assertFalse("store directory shouldn't exist", storeDir.exists());
+    assertFalse("store segment directory shouldn't exist", storeSegmentDir.exists());
+    assertFalse("test store entry should have been removed from in-mem store file map ",
+        diskAllocator.getStoreReserveFileMap().containsKey(storeId));
+    reloadStore();
+  }
+
   // helpers
   // general
 
   /**
-   * Verify store method can capture store exception and correctly handle it.
+   * Verify store method can capture store exception and correctly handle it. The method also verifies that if exception
+   * is really caused by disk I/O error, store shutdown process would skip any disk flush operation and no clean shutdown
+   * file should exist in directory.
    * @param methodCaller the method caller to invoke store methods to trigger store exception
    * @throws StoreException
    */
@@ -1176,8 +1264,14 @@ public class BlobStoreTest {
     MockBlobStore mockBlobStore =
         new MockBlobStore(getMockReplicaId(tempDirStr), new StoreConfig(new VerifiableProperties(properties)),
             mock(ReplicaStatusDelegate.class), new StoreMetrics(new MetricRegistry()));
+    // First, verify that a normal shutdown will create a clean shutdown file in the store directory.
     mockBlobStore.start();
-    // Verify that store won't be shut down if Unknown_Error occurred.
+    mockBlobStore.shutdown();
+    File shutdownFile = new File(tempDir, PersistentIndex.CLEAN_SHUTDOWN_FILENAME);
+    assertTrue("Clean shutdown file should exist", shutdownFile.exists());
+
+    mockBlobStore.start();
+    // Second, verify that store won't be shut down if Unknown_Error occurred.
     StoreException storeExceptionInIndex = new StoreException("Mock Unknown error", StoreErrorCodes.Unknown_Error);
     mockBlobStore.setPersistentIndex(storeExceptionInIndex);
     try {
@@ -1186,18 +1280,22 @@ public class BlobStoreTest {
     } catch (StoreException e) {
       assertEquals("Mismatch in StoreErrorCode", StoreErrorCodes.Unknown_Error, e.getErrorCode());
     }
+    assertTrue("Store should not be shut down", mockBlobStore.isStarted());
     assertEquals("Mismatch in store io error count", 0, mockBlobStore.getErrorCount().get());
-    // Verify that store will be shut down if IOError occurred
+
+    // Third, verify that store will be shut down if IOError occurred (disk I/O error)
     storeExceptionInIndex = new StoreException("Mock disk I/O error", StoreErrorCodes.IOError);
     mockBlobStore.setPersistentIndex(storeExceptionInIndex);
     try {
       methodCaller.invoke(mockBlobStore);
-      //mockBlobStore.findMissingKeys(idsToProvide);
       fail("should fail");
     } catch (StoreException e) {
       assertEquals("Mismatch in StoreErrorCode", StoreErrorCodes.IOError, e.getErrorCode());
     }
     assertFalse("Store should be shutdown after error count exceeded threshold", mockBlobStore.isStarted());
+
+    // In the end, verify that store shutdown would skip any disk flush operation if it is triggered by a real disk I/O error.
+    assertFalse("When encountering disk I/O error, clean shutdown file shouldn't exist", shutdownFile.exists());
   }
 
   /**

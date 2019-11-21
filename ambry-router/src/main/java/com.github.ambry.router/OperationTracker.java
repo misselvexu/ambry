@@ -26,7 +26,7 @@ import java.util.Iterator;
  * next replica to send a request.
  *
  * When an operation is progressing by receiving responses from replicas, its {@code OperationTracker}
- * needs to be informed by calling {@link #onResponse(ReplicaId, boolean)}.
+ * needs to be informed by calling {@link #onResponse(ReplicaId, TrackedRequestFinalState)}.
  *
  * Typical usage of an {@code OperationTracker} would be:
  * <pre>
@@ -54,6 +54,14 @@ interface OperationTracker {
   boolean hasSucceeded();
 
   /**
+   * Return {@code true} only if the number of NOT_FOUND responses from originating DC passes the threshold.
+   * It also means hasSucceeded would return {@code false}.
+   *
+   * @return {@code true} if the operation failed because of {@link TrackedRequestFinalState#NOT_FOUND}.
+   */
+  boolean hasFailedOnNotFound();
+
+  /**
    * Determines if an operation has completed (either succeeded or failed).
    *
    * @return {@code true} if the operation has completed.
@@ -61,13 +69,13 @@ interface OperationTracker {
   boolean isDone();
 
   /**
-   * Accounts for successful or failed response from a replica. Must invoke this method
-   * if a successful or failed response is received for a replica.
-   *
+   * Accounts for all type of response from a replica. Must invoke this method if a
+   * successful/failed/timed-out/notfound response is received for a replica. Note
+   * that not callers should not pass more than one state from the same replica.
    * @param replicaId ReplicaId associated with this response.
-   * @param isSuccessful Whether the request to the replicaId is successful or not.
+   * @param trackedRequestFinalState The final state of a single request being tracked (SUCCESS, FAILURE, TIMED_OUT or NOT_FOUND).
    */
-  void onResponse(ReplicaId replicaId, boolean isSuccessful);
+  void onResponse(ReplicaId replicaId, TrackedRequestFinalState trackedRequestFinalState);
 
   /**
    * Provide an iterator to the replicas to which requests may be sent. Each time when start to iterate

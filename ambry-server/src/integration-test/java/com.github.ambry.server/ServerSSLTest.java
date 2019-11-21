@@ -22,12 +22,14 @@ import com.github.ambry.network.Port;
 import com.github.ambry.network.PortType;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.TestUtils;
+import com.github.ambry.utils.Utils;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocketFactory;
 import org.junit.AfterClass;
@@ -35,6 +37,8 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
+
+import static org.junit.Assume.*;
 
 
 @RunWith(Parameterized.class)
@@ -131,9 +135,12 @@ public class ServerSSLTest {
    */
   @Test
   public void endToEndCloudBackupTest() throws Exception {
+    assumeTrue(testEncryption);
     DataNodeId dataNode = sslCluster.getClusterMap().getDataNodeIds().get(0);
     ServerTestUtil.endToEndCloudBackupTest(sslCluster, dataNode, clientSSLConfig2, clientSSLSocketFactory2,
-        testEncryption, notificationSystem, serverSSLProps);
+        notificationSystem, serverSSLProps, Utils.Infinite_Time, false);
+    ServerTestUtil.endToEndCloudBackupTest(sslCluster, dataNode, clientSSLConfig2, clientSSLSocketFactory2,
+        notificationSystem, serverSSLProps, System.currentTimeMillis() + TimeUnit.DAYS.toMillis(1), true);
   }
 
   @Test

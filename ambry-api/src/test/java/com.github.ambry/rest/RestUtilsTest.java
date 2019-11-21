@@ -46,6 +46,7 @@ import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.Test;
 
+import static com.github.ambry.router.GetBlobOptions.*;
 import static org.junit.Assert.*;
 
 
@@ -561,12 +562,12 @@ public class RestUtilsTest {
     // no range
     doBuildGetBlobOptionsTest(null, null, true, true);
     // valid ranges
-    doBuildGetBlobOptionsTest("bytes=0-7", ByteRanges.fromOffsetRange(0, 7), true, false);
-    doBuildGetBlobOptionsTest("bytes=234-56679090", ByteRanges.fromOffsetRange(234, 56679090), true, false);
-    doBuildGetBlobOptionsTest("bytes=1-", ByteRanges.fromStartOffset(1), true, false);
-    doBuildGetBlobOptionsTest("bytes=12345678-", ByteRanges.fromStartOffset(12345678), true, false);
-    doBuildGetBlobOptionsTest("bytes=-8", ByteRanges.fromLastNBytes(8), true, false);
-    doBuildGetBlobOptionsTest("bytes=-123456789", ByteRanges.fromLastNBytes(123456789), true, false);
+    doBuildGetBlobOptionsTest("bytes=0-7", ByteRanges.fromOffsetRange(0, 7), true, false, true);
+    doBuildGetBlobOptionsTest("bytes=234-56679090", ByteRanges.fromOffsetRange(234, 56679090), true, false, true);
+    doBuildGetBlobOptionsTest("bytes=1-", ByteRanges.fromStartOffset(1), true, false, true);
+    doBuildGetBlobOptionsTest("bytes=12345678-", ByteRanges.fromStartOffset(12345678), true, false, true);
+    doBuildGetBlobOptionsTest("bytes=-8", ByteRanges.fromLastNBytes(8), true, false, true);
+    doBuildGetBlobOptionsTest("bytes=-123456789", ByteRanges.fromLastNBytes(123456789), true, false, true);
     // bad ranges
     String[] badRanges =
         {"bytes=0-abcd", "bytes=0as23-44444444", "bytes=22-7777777777777777777777777777777777777777777", "bytes=22--53",
@@ -902,7 +903,7 @@ public class RestUtilsTest {
   }
 
   /**
-   * Test that {@link RestUtils#buildGetBlobOptions(Map, RestUtils.SubResource, GetOption)} works correctly for a given
+   * Test that {@link RestUtils#buildGetBlobOptions(Map, RestUtils.SubResource, GetOption, int)} works correctly for a given
    * range with and without a specified sub-resource.
    * @param rangeHeader the Range header value to add to the {@code args} map.
    * @param expectedRange the {@link ByteRange} expected to be parsed if the call should succeed, or {@code null} if no
@@ -913,6 +914,25 @@ public class RestUtilsTest {
    */
   private void doBuildGetBlobOptionsTest(String rangeHeader, ByteRange expectedRange,
       boolean shouldSucceedWithoutSubResource, boolean shouldSucceedWithSubResource) throws RestServiceException {
+    doBuildGetBlobOptionsTest(rangeHeader, expectedRange, shouldSucceedWithoutSubResource, shouldSucceedWithSubResource,
+        shouldSucceedWithSubResource);
+  }
+
+  /**
+   * Test that {@link RestUtils#buildGetBlobOptions(Map, RestUtils.SubResource, GetOption, int)} works correctly for a given
+   * range with and without a specified sub-resource.
+   * @param rangeHeader the Range header value to add to the {@code args} map.
+   * @param expectedRange the {@link ByteRange} expected to be parsed if the call should succeed, or {@code null} if no
+   *                      range is expected.
+   * @param shouldSucceedWithoutSubResource {@code true} if the call should succeed with no specified sub-resource.
+   * @param shouldSucceedWithNonSegmentSubResource {@code true} if the call should succeed with a specified non-Segment sub-resource.
+   * @param shouldSucceedWithSegment {@code true} if the call should succeed with a specified Segment sub-resource
+   *                                             (used if different than shouldSucceedWithSubResource).
+   * @throws RestServiceException
+   */
+  private void doBuildGetBlobOptionsTest(String rangeHeader, ByteRange expectedRange,
+      boolean shouldSucceedWithoutSubResource, boolean shouldSucceedWithNonSegmentSubResource, boolean shouldSucceedWithSegment)
+      throws RestServiceException {
     Map<String, Object> args = new HashMap<>();
     if (rangeHeader != null) {
       args.put(RestUtils.Headers.RANGE, rangeHeader);
@@ -920,13 +940,18 @@ public class RestUtilsTest {
     doBuildGetBlobOptionsTestForSubResource(args, null, expectedRange, GetBlobOptions.OperationType.All,
         shouldSucceedWithoutSubResource);
     for (RestUtils.SubResource subResource : RestUtils.SubResource.values()) {
-      doBuildGetBlobOptionsTestForSubResource(args, subResource, expectedRange, GetBlobOptions.OperationType.BlobInfo,
-          shouldSucceedWithSubResource);
+      if (subResource.equals(RestUtils.SubResource.Segment)) {
+        doBuildGetBlobOptionsTestForSubResource(args, subResource, expectedRange, OperationType.All,
+            shouldSucceedWithSegment);
+      } else {
+        doBuildGetBlobOptionsTestForSubResource(args, subResource, expectedRange, GetBlobOptions.OperationType.BlobInfo,
+            shouldSucceedWithNonSegmentSubResource);
+      }
     }
   }
 
   /**
-   * Test that {@link RestUtils#buildGetBlobOptions(Map, RestUtils.SubResource, GetOption)} works correctly with given args and a
+   * Test that {@link RestUtils#buildGetBlobOptions(Map, RestUtils.SubResource, GetOption, int)} works correctly with given args and a
    * specified sub-resource.
    * @param args the map of args for the method call.
    * @param subResource the sub-resource for the call.
@@ -941,7 +966,8 @@ public class RestUtilsTest {
       ByteRange expectedRange, GetBlobOptions.OperationType expectedOpType, boolean shouldSucceed)
       throws RestServiceException {
     if (shouldSucceed) {
-      GetBlobOptions options = RestUtils.buildGetBlobOptions(args, subResource, GetOption.None);
+      GetBlobOptions options =
+          RestUtils.buildGetBlobOptions(args, subResource, GetOption.None, NO_BLOB_SEGMENT_IDX_SPECIFIED);
       assertEquals("Unexpected range for args=" + args + " and subResource=" + subResource, expectedRange,
           options.getRange());
       assertEquals("Unexpected operation type for args=" + args + " and subResource=" + subResource, expectedOpType,
@@ -950,7 +976,7 @@ public class RestUtilsTest {
           options.getGetOption());
     } else {
       try {
-        RestUtils.buildGetBlobOptions(args, subResource, GetOption.None);
+        RestUtils.buildGetBlobOptions(args, subResource, GetOption.None, NO_BLOB_SEGMENT_IDX_SPECIFIED);
         fail("buildGetBlobOptions should not have succeeded with args=" + args + "and subResource=" + subResource);
       } catch (RestServiceException expected) {
         assertEquals("Unexpected error code.", RestServiceErrorCode.InvalidArgs, expected.getErrorCode());

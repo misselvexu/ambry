@@ -19,21 +19,16 @@ import com.github.ambry.account.AccountService;
 import com.github.ambry.account.Container;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.ClusterMapUtils;
-import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.config.RouterConfig;
-import com.github.ambry.network.NetworkClientErrorCode;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.notification.NotificationSystem;
-import com.github.ambry.protocol.RequestOrResponse;
 import com.github.ambry.protocol.TtlUpdateRequest;
 import com.github.ambry.protocol.TtlUpdateResponse;
-import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.Time;
-import java.io.DataInputStream;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -44,8 +39,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 
 /**
@@ -62,24 +55,8 @@ class TtlUpdateManager {
   private final RouterConfig routerConfig;
   private final Set<TtlUpdateOperation> ttlUpdateOperations = ConcurrentHashMap.newKeySet();
   private final Map<Integer, TtlUpdateOperation> correlationIdToTtlUpdateOperation = new HashMap<>();
-  private static final Logger logger = LoggerFactory.getLogger(TtlUpdateManager.class);
-
-  /**
-   * Used by a {@link TtlUpdateOperation} to associate a {@code CorrelationId} to a {@link TtlUpdateOperation}.
-   */
-  private class TtlUpdateRequestRegistrationCallbackImpl implements RequestRegistrationCallback<TtlUpdateOperation> {
-    private List<RequestInfo> requestListToFill;
-
-    @Override
-    public void registerRequestToSend(TtlUpdateOperation ttlUpdateOperation, RequestInfo requestInfo) {
-      requestListToFill.add(requestInfo);
-      correlationIdToTtlUpdateOperation.put(((RequestOrResponse) requestInfo.getRequest()).getCorrelationId(),
-          ttlUpdateOperation);
-    }
-  }
-
-  private final TtlUpdateRequestRegistrationCallbackImpl requestRegistrationCallback =
-      new TtlUpdateRequestRegistrationCallbackImpl();
+  private final RequestRegistrationCallback<TtlUpdateOperation> requestRegistrationCallback =
+      new RequestRegistrationCallback<>(correlationIdToTtlUpdateOperation);
 
   /**
    * Creates a TtlUpdateManager.
@@ -143,11 +120,13 @@ class TtlUpdateManager {
   /**
    * Polls all ttl update operations and populates a list of {@link RequestInfo} to be sent to data nodes in order to
    * complete ttl update operations.
-   * @param requestListToFill list to be filled with the requests created.
+   * @param requestsToSend list to be filled with the requests created.
+   * @param requestsToDrop list to be filled with the requests to drop.
    */
-  void poll(List<RequestInfo> requestListToFill) {
+  void poll(List<RequestInfo> requestsToSend, Set<Integer> requestsToDrop) {
     long startTime = time.milliseconds();
-    requestRegistrationCallback.requestListToFill = requestListToFill;
+    requestRegistrationCallback.setRequestsToSend(requestsToSend);
+    requestRegistrationCallback.setRequestsToDrop(requestsToDrop);
     for (TtlUpdateOperation op : ttlUpdateOperations) {
       boolean exceptionEncountered = false;
       try {
@@ -174,8 +153,10 @@ class TtlUpdateManager {
    */
   void handleResponse(ResponseInfo responseInfo) {
     long startTime = time.milliseconds();
-    TtlUpdateResponse ttlUpdateResponse = extractTtlUpdateResponseAndNotifyResponseHandler(responseInfo);
-    RouterRequestInfo routerRequestInfo = (RouterRequestInfo) responseInfo.getRequestInfo();
+    TtlUpdateResponse ttlUpdateResponse =
+        RouterUtils.extractResponseAndNotifyResponseHandler(responseHandler, routerMetrics, responseInfo,
+            TtlUpdateResponse::readFrom, TtlUpdateResponse::getError, false);
+    RequestInfo routerRequestInfo = responseInfo.getRequestInfo();
     int correlationId = ((TtlUpdateRequest) routerRequestInfo.getRequest()).getCorrelationId();
     TtlUpdateOperation ttlUpdateOperation = correlationIdToTtlUpdateOperation.remove(correlationId);
     // If it is still an active operation, hand over the response. Otherwise, ignore.
@@ -198,31 +179,6 @@ class TtlUpdateManager {
     } else {
       routerMetrics.ignoredResponseCount.inc();
     }
-  }
-
-  /**
-   * Extract the {@link TtlUpdateResponse} from the given {@link ResponseInfo}
-   * @param responseInfo the {@link ResponseInfo} from which the {@link TtlUpdateResponse} is to be extracted.
-   * @return the extracted {@link TtlUpdateResponse} if there is one; null otherwise.
-   */
-  private TtlUpdateResponse extractTtlUpdateResponseAndNotifyResponseHandler(ResponseInfo responseInfo) {
-    TtlUpdateResponse ttlUpdateResponse = null;
-    ReplicaId replicaId = ((RouterRequestInfo) responseInfo.getRequestInfo()).getReplicaId();
-    NetworkClientErrorCode networkClientErrorCode = responseInfo.getError();
-    if (networkClientErrorCode == null) {
-      try {
-        ttlUpdateResponse =
-            TtlUpdateResponse.readFrom(new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())));
-        responseHandler.onEvent(replicaId, ttlUpdateResponse.getError());
-      } catch (Exception e) {
-        // Ignore. There is no value in notifying the response handler.
-        logger.error("Response deserialization received unexpected error", e);
-        routerMetrics.responseDeserializationErrorCount.inc();
-      }
-    } else {
-      responseHandler.onEvent(replicaId, networkClientErrorCode);
-    }
-    return ttlUpdateResponse;
   }
 
   /**

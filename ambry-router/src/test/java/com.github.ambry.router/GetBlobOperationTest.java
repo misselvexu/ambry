@@ -14,6 +14,7 @@
 package com.github.ambry.router;
 
 import com.codahale.metrics.Counter;
+import com.codahale.metrics.Histogram;
 import com.github.ambry.account.InMemAccountService;
 import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.clustermap.PartitionId;
@@ -24,7 +25,6 @@ import com.github.ambry.commons.ByteBufferAsyncWritableChannel;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.LoggingNotificationSystem;
 import com.github.ambry.commons.ResponseHandler;
-import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.CryptoServiceConfig;
 import com.github.ambry.config.KMSConfig;
 import com.github.ambry.config.RouterConfig;
@@ -37,7 +37,7 @@ import com.github.ambry.messageformat.CompositeBlobInfo;
 import com.github.ambry.messageformat.MessageFormatFlags;
 import com.github.ambry.messageformat.MessageFormatRecord;
 import com.github.ambry.messageformat.MetadataContentSerDe;
-import com.github.ambry.network.NetworkClient;
+import com.github.ambry.network.SocketNetworkClient;
 import com.github.ambry.network.NetworkClientErrorCode;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
@@ -46,8 +46,8 @@ import com.github.ambry.protocol.GetRequest;
 import com.github.ambry.protocol.GetResponse;
 import com.github.ambry.protocol.PartitionRequestInfo;
 import com.github.ambry.protocol.PutRequest;
-import com.github.ambry.protocol.RequestOrResponse;
 import com.github.ambry.router.RouterTestHelpers.*;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.store.StoreKey;
 import com.github.ambry.utils.ByteBufferChannel;
 import com.github.ambry.utils.ByteBufferInputStream;
@@ -82,14 +82,16 @@ import org.junit.runners.Parameterized;
 
 import static com.github.ambry.router.PutManagerTest.*;
 import static com.github.ambry.router.RouterTestHelpers.*;
+import static org.junit.Assert.*;
+import static org.junit.Assume.*;
 
 
 /**
  * Tests for {@link GetBlobOperation}
  * This class creates a {@link NonBlockingRouter} with a {@link MockServer} and does puts through it. The gets,
  * however are done directly by the tests - that is, the tests create {@link GetBlobOperation} and get requests from
- * it and then use a {@link NetworkClient} directly to send requests to and get responses from the {@link MockServer}.
- * Since the {@link NetworkClient} used by the router and the test are different, and since the
+ * it and then use a {@link SocketNetworkClient} directly to send requests to and get responses from the {@link MockServer}.
+ * Since the {@link SocketNetworkClient} used by the router and the test are different, and since the
  * {@link GetBlobOperation} created by the tests are never known by the router, there are no conflicts with the
  * RequestResponseHandler of the router.
  * Many of the variables are made member variables, so that they can be shared between the router and the
@@ -119,6 +121,7 @@ public class GetBlobOperationTest {
   private MockKeyManagementService kms = null;
   private MockCryptoService cryptoService = null;
   private CryptoJobHandler cryptoJobHandler = null;
+  private String localDcName;
 
   // Certain tests recreate the routerConfig with different properties.
   private RouterConfig routerConfig;
@@ -134,18 +137,8 @@ public class GetBlobOperationTest {
   // Options which are passed into GetBlobOperations
   private GetBlobOptionsInternal options;
 
-  private final GetTestRequestRegistrationCallbackImpl requestRegistrationCallback =
-      new GetTestRequestRegistrationCallbackImpl();
-
-  private class GetTestRequestRegistrationCallbackImpl implements RequestRegistrationCallback<GetOperation> {
-    List<RequestInfo> requestListToFill;
-
-    @Override
-    public void registerRequestToSend(GetOperation getOperation, RequestInfo requestInfo) {
-      requestListToFill.add(requestInfo);
-      correlationIdToGetOperation.put(((RequestOrResponse) requestInfo.getRequest()).getCorrelationId(), getOperation);
-    }
-  }
+  private final RequestRegistrationCallback<GetOperation> requestRegistrationCallback =
+      new RequestRegistrationCallback<>(correlationIdToGetOperation);
 
   /**
    * A checker that either asserts that a get operation succeeds or returns the specified error code.
@@ -178,8 +171,9 @@ public class GetBlobOperationTest {
    */
   @Parameterized.Parameters
   public static List<Object[]> data() {
-    return Arrays.asList(
-        new Object[][]{{SimpleOperationTracker.class.getSimpleName(), false}, {AdaptiveOperationTracker.class.getSimpleName(), false}, {AdaptiveOperationTracker.class.getSimpleName(), true}});
+    return Arrays.asList(new Object[][]{{SimpleOperationTracker.class.getSimpleName(), false},
+        {AdaptiveOperationTracker.class.getSimpleName(), false},
+        {AdaptiveOperationTracker.class.getSimpleName(), true}});
   }
 
   /**
@@ -196,15 +190,16 @@ public class GetBlobOperationTest {
     // a blob size that is greater than the maxChunkSize and is not a multiple of it. Will result in a composite blob.
     blobSize = maxChunkSize * random.nextInt(10) + random.nextInt(maxChunkSize - 1) + 1;
     mockSelectorState.set(MockSelectorState.Good);
-    VerifiableProperties vprops = new VerifiableProperties(getDefaultNonBlockingRouterProperties());
+    VerifiableProperties vprops = new VerifiableProperties(getDefaultNonBlockingRouterProperties(true));
     routerConfig = new RouterConfig(vprops);
     mockClusterMap = new MockClusterMap();
+    localDcName = mockClusterMap.getDatacenterName(mockClusterMap.getLocalDatacenterId());
     blobIdFactory = new BlobIdFactory(mockClusterMap);
-    routerMetrics = new NonBlockingRouterMetrics(mockClusterMap);
+    routerMetrics = new NonBlockingRouterMetrics(mockClusterMap, routerConfig);
     options = new GetBlobOptionsInternal(new GetBlobOptionsBuilder().build(), false, routerMetrics.ageAtGet);
     mockServerLayout = new MockServerLayout(mockClusterMap);
     replicasCount =
-        mockClusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS).get(0).getReplicaIds().size();
+        mockClusterMap.getRandomWritablePartition(MockClusterMap.DEFAULT_PARTITION_CLASS, null).getReplicaIds().size();
     responseHandler = new ResponseHandler(mockClusterMap);
     MockNetworkClientFactory networkClientFactory =
         new MockNetworkClientFactory(vprops, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
@@ -215,8 +210,8 @@ public class GetBlobOperationTest {
       cryptoService = new MockCryptoService(new CryptoServiceConfig(vprops));
       cryptoJobHandler = new CryptoJobHandler(CryptoJobHandlerTest.DEFAULT_THREAD_COUNT);
     }
-    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(mockClusterMap), networkClientFactory,
-        new LoggingNotificationSystem(), mockClusterMap, kms, cryptoService, cryptoJobHandler,
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(mockClusterMap, routerConfig),
+        networkClientFactory, new LoggingNotificationSystem(), mockClusterMap, kms, cryptoService, cryptoJobHandler,
         new InMemAccountService(false, true), time, MockClusterMap.DEFAULT_PARTITION_CLASS);
     mockNetworkClient = networkClientFactory.getMockNetworkClient();
     routerCallback = new RouterCallback(mockNetworkClient, new ArrayList<BackgroundDeleteRequest>());
@@ -285,10 +280,9 @@ public class GetBlobOperationTest {
 
   /**
    * Test {@link GetBlobOperation} instantiation and validate the get methods.
-   * @throws Exception
    */
   @Test
-  public void testInstantiation() throws Exception {
+  public void testInstantiation() {
     Callback<GetBlobResultInternal> getRouterCallback = new Callback<GetBlobResultInternal>() {
       @Override
       public void onCompletion(GetBlobResultInternal result, Exception exception) {
@@ -311,7 +305,7 @@ public class GetBlobOperationTest {
     Assert.assertEquals("Blob ids must match", blobIdStr, op.getBlobIdStr());
 
     // test the case where the tracker type is bad
-    Properties properties = getDefaultNonBlockingRouterProperties();
+    Properties properties = getDefaultNonBlockingRouterProperties(true);
     properties.setProperty("router.get.operation.tracker.type", "NonExistentTracker");
     RouterConfig badConfig = new RouterConfig(new VerifiableProperties(properties));
     try {
@@ -456,7 +450,7 @@ public class GetBlobOperationTest {
   @Test
   public void testRouterRequestTimeoutAllFailure() throws Exception {
     doPut();
-    GetBlobOperation op = createOperation(null);
+    GetBlobOperation op = createOperation(routerConfig, null);
     op.poll(requestRegistrationCallback);
     while (!op.isOperationComplete()) {
       time.sleep(routerConfig.routerRequestTimeoutMs + 1);
@@ -467,26 +461,164 @@ public class GetBlobOperationTest {
     Assert.assertEquals("Must have attempted sending requests to all replicas", replicasCount,
         correlationIdToGetOperation.size());
     assertFailureAndCheckErrorCode(op, RouterErrorCode.OperationTimedOut);
+
+    // test that timed out response won't update latency histogram if exclude timeout is enabled.
+    assumeTrue(operationTrackerType.equals(AdaptiveOperationTracker.class.getSimpleName()));
+    AdaptiveOperationTracker tracker = (AdaptiveOperationTracker) op.getFirstChunkOperationTrackerInUse();
+    Histogram localColoTracker =
+        tracker.getLatencyHistogram(RouterTestHelpers.getAnyReplica(blobId, true, localDcName));
+    Histogram crossColoTracker =
+        tracker.getLatencyHistogram(RouterTestHelpers.getAnyReplica(blobId, false, localDcName));
+    Assert.assertEquals("Timed-out response shouldn't be counted into local colo latency histogram", 0,
+        localColoTracker.getCount());
+    Assert.assertEquals("Timed-out response shouldn't be counted into cross colo latency histogram", 0,
+        crossColoTracker.getCount());
   }
 
   /**
-   * Test the case where all requests time out within the NetworkClient.
+   * Test that timed out requests are allowed to update Histogram by default.
+   * @throws Exception
+   */
+  @Test
+  public void testTimeoutRequestUpdateHistogramByDefault() throws Exception {
+    doPut();
+    VerifiableProperties vprops = new VerifiableProperties(getDefaultNonBlockingRouterProperties(false));
+    RouterConfig routerConfig = new RouterConfig(vprops);
+    GetBlobOperation op = createOperation(routerConfig, null);
+    op.poll(requestRegistrationCallback);
+    while (!op.isOperationComplete()) {
+      time.sleep(routerConfig.routerRequestTimeoutMs + 1);
+      op.poll(requestRegistrationCallback);
+    }
+    Assert.assertEquals("Must have attempted sending requests to all replicas", replicasCount,
+        correlationIdToGetOperation.size());
+    Assert.assertEquals(RouterErrorCode.OperationTimedOut,
+        ((RouterException) op.getOperationException()).getErrorCode());
+    assumeTrue(operationTrackerType.equals(AdaptiveOperationTracker.class.getSimpleName()));
+    AdaptiveOperationTracker tracker = (AdaptiveOperationTracker) op.getFirstChunkOperationTrackerInUse();
+
+    Assert.assertEquals("Number of data points in local colo latency histogram is not expected", 3,
+        tracker.getLatencyHistogram(RouterTestHelpers.getAnyReplica(blobId, true, localDcName)).getCount());
+    Assert.assertEquals("Number of data points in cross colo latency histogram is not expected", 6,
+        tracker.getLatencyHistogram(RouterTestHelpers.getAnyReplica(blobId, false, localDcName)).getCount());
+  }
+
+  /**
+   * Test the case where 2 local replicas timed out. The remaining one local replica and rest remote replicas respond
+   * with Blob_Not_Found.
+   * @throws Exception
+   */
+  @Test
+  public void testRequestTimeoutAndBlobNotFoundLocalTimeout() throws Exception {
+    assumeTrue(operationTrackerType.equals(AdaptiveOperationTracker.class.getSimpleName()));
+    doPut();
+    GetBlobOperation op = createOperation(routerConfig, null);
+    AdaptiveOperationTracker tracker = (AdaptiveOperationTracker) op.getFirstChunkOperationTrackerInUse();
+    correlationIdToGetOperation.clear();
+    for (MockServer server : mockServerLayout.getMockServers()) {
+      server.setServerErrorForAllRequests(ServerErrorCode.Blob_Not_Found);
+    }
+    op.poll(requestRegistrationCallback);
+    time.sleep(routerConfig.routerRequestTimeoutMs + 1);
+
+    // 2 requests have been sent out and both of them timed out. Nest, complete operation on remaining replicas
+    // The request should have response from one local replica and all remote replicas.
+    while (!op.isOperationComplete()) {
+      op.poll(requestRegistrationCallback);
+      List<ResponseInfo> responses = sendAndWaitForResponses(requestRegistrationCallback.getRequestsToSend());
+      for (ResponseInfo responseInfo : responses) {
+        GetResponse getResponse = responseInfo.getError() == null ? GetResponse.readFrom(
+            Utils.createDataInputStreamFromBuffer(responseInfo.getResponse()), mockClusterMap) : null;
+        op.handleResponse(responseInfo, getResponse);
+        responseInfo.release();
+      }
+    }
+
+    RouterException routerException = (RouterException) op.getOperationException();
+    // error code should be OperationTimedOut because it precedes BlobDoesNotExist
+    Assert.assertEquals(RouterErrorCode.OperationTimedOut, routerException.getErrorCode());
+    Histogram localColoTracker =
+        tracker.getLatencyHistogram(RouterTestHelpers.getAnyReplica(blobId, true, localDcName));
+    Histogram crossColoTracker =
+        tracker.getLatencyHistogram(RouterTestHelpers.getAnyReplica(blobId, false, localDcName));
+    // the count of data points in local colo Histogram should be 1, because first 2 request timed out
+    Assert.assertEquals("The number of data points in local colo latency histogram is not expected", 1,
+        localColoTracker.getCount());
+    // the count of data points in cross colo Histogram should be 6 because all remote replicas respond with proper error code
+    Assert.assertEquals("The number of data points in cross colo latency histogram is not expected", 6,
+        crossColoTracker.getCount());
+  }
+
+  /**
+   * Test the case where origin replicas return Blob_Not_found and the rest times out.
+   * @throws Exception
+   */
+  @Test
+  public void testTimeoutAndBlobNotFoundInOriginDc() throws Exception {
+    assumeTrue(operationTrackerType.equals(AdaptiveOperationTracker.class.getSimpleName()));
+    doPut();
+
+    // Pick a remote DC as the new local DC.
+    String newLocal = "DC1";
+    String oldLocal = localDcName;
+    Properties props = getDefaultNonBlockingRouterProperties(true);
+    props.setProperty("router.datacenter.name", newLocal);
+    props.setProperty("router.get.request.parallelism", "3");
+    props.setProperty("router.operation.tracker.max.inflight.requests", "3");
+    routerConfig = new RouterConfig(new VerifiableProperties(props));
+
+    GetBlobOperation op = createOperation(routerConfig, null);
+    AdaptiveOperationTracker tracker = (AdaptiveOperationTracker) op.getFirstChunkOperationTrackerInUse();
+    correlationIdToGetOperation.clear();
+    for (MockServer server : mockServerLayout.getMockServers()) {
+      server.setServerErrorForAllRequests(ServerErrorCode.Blob_Not_Found);
+    }
+    op.poll(requestRegistrationCallback);
+    time.sleep(routerConfig.routerRequestTimeoutMs + 1);
+
+    // 3 requests have been sent out and all of them timed out. Nest, complete operation on remaining replicas
+    // The request should have response from all remote replicas.
+    while (!op.isOperationComplete()) {
+      op.poll(requestRegistrationCallback);
+      List<ResponseInfo> responses = sendAndWaitForResponses(requestRegistrationCallback.getRequestsToSend());
+      for (ResponseInfo responseInfo : responses) {
+        GetResponse getResponse = responseInfo.getError() == null ? GetResponse.readFrom(
+            Utils.createDataInputStreamFromBuffer(responseInfo.getResponse()), mockClusterMap) : null;
+        op.handleResponse(responseInfo, getResponse);
+        responseInfo.release();
+      }
+    }
+
+    RouterException routerException = (RouterException) op.getOperationException();
+    // error code should be OperationTimedOut because it precedes BlobDoesNotExist
+    Assert.assertEquals(RouterErrorCode.BlobDoesNotExist, routerException.getErrorCode());
+
+    props = getDefaultNonBlockingRouterProperties(true);
+    props.setProperty("router.datacenter.name", oldLocal);
+    props.setProperty("router.get.request.parallelism", "2");
+    props.setProperty("router.operation.tracker.max.inflight.requests", "2");
+    routerConfig = new RouterConfig(new VerifiableProperties(props));
+  }
+
+  /**
+   * Test the case where all requests time out within the SocketNetworkClient.
    * @throws Exception
    */
   @Test
   public void testNetworkClientTimeoutAllFailure() throws Exception {
     doPut();
-    GetBlobOperation op = createOperation(null);
+    GetBlobOperation op = createOperation(routerConfig, null);
     while (!op.isOperationComplete()) {
       op.poll(requestRegistrationCallback);
-      for (RequestInfo requestInfo : requestRegistrationCallback.requestListToFill) {
+      for (RequestInfo requestInfo : requestRegistrationCallback.getRequestsToSend()) {
         ResponseInfo fakeResponse = new ResponseInfo(requestInfo, NetworkClientErrorCode.NetworkError, null);
         op.handleResponse(fakeResponse, null);
+        fakeResponse.release();
         if (op.isOperationComplete()) {
           break;
         }
       }
-      requestRegistrationCallback.requestListToFill.clear();
+      requestRegistrationCallback.getRequestsToSend().clear();
     }
 
     // At this time requests would have been created for all replicas, as none of them were delivered,
@@ -509,7 +641,8 @@ public class GetBlobOperationTest {
           @Override
           public void testAndAssert(RouterErrorCode expectedError) throws Exception {
             GetBlobOperation op = createOperationAndComplete(null);
-            Assert.assertEquals("Must have attempted sending requests to all replicas", replicasCount,
+            // Local dc is the origin DC, only two NOT_FOUND would terminate the operation.
+            Assert.assertEquals("Must have attempted sending requests to all replicas", 2,
                 correlationIdToGetOperation.size());
             assertFailureAndCheckErrorCode(op, expectedError);
           }
@@ -530,7 +663,7 @@ public class GetBlobOperationTest {
     serverErrorToRouterError.put(ServerErrorCode.Blob_Authorization_Failure, RouterErrorCode.BlobAuthorizationFailure);
     for (Map.Entry<ServerErrorCode, RouterErrorCode> entry : serverErrorToRouterError.entrySet()) {
       Map<ServerErrorCode, Integer> errorCounts = new HashMap<>();
-      errorCounts.put(ServerErrorCode.Blob_Not_Found, replicasCount - 1);
+      errorCounts.put(ServerErrorCode.Replica_Unavailable, replicasCount - 1);
       errorCounts.put(entry.getKey(), 1);
       testWithErrorCodes(errorCounts, mockServerLayout, entry.getValue(), getErrorCodeChecker);
     }
@@ -577,17 +710,17 @@ public class GetBlobOperationTest {
     String dcWherePutHappened = routerConfig.routerDatacenterName;
 
     // test requests coming in from local dc as well as cross-colo.
-    Properties props = getDefaultNonBlockingRouterProperties();
+    Properties props = getDefaultNonBlockingRouterProperties(true);
     props.setProperty("router.datacenter.name", "DC1");
     routerConfig = new RouterConfig(new VerifiableProperties(props));
     doTestSuccessInThePresenceOfVariousErrors(dcWherePutHappened);
 
-    props = getDefaultNonBlockingRouterProperties();
+    props = getDefaultNonBlockingRouterProperties(true);
     props.setProperty("router.datacenter.name", "DC2");
     routerConfig = new RouterConfig(new VerifiableProperties(props));
     doTestSuccessInThePresenceOfVariousErrors(dcWherePutHappened);
 
-    props = getDefaultNonBlockingRouterProperties();
+    props = getDefaultNonBlockingRouterProperties(true);
     props.setProperty("router.datacenter.name", "DC3");
     routerConfig = new RouterConfig(new VerifiableProperties(props));
     doTestSuccessInThePresenceOfVariousErrors(dcWherePutHappened);
@@ -763,7 +896,7 @@ public class GetBlobOperationTest {
       storeKeys.add(blobId);
     }
     blobSize = maxChunkSize * numChunks;
-    ByteBuffer metadataContent = MetadataContentSerDe.serializeMetadataContent(maxChunkSize, blobSize, storeKeys);
+    ByteBuffer metadataContent = MetadataContentSerDe.serializeMetadataContentV2(maxChunkSize, blobSize, storeKeys);
     metadataContent.flip();
     blobProperties =
         new BlobProperties(blobSize - 20, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
@@ -857,15 +990,14 @@ public class GetBlobOperationTest {
     // Ranges that start past the end of the blob (should not succeed)
     testRangeRequestFromStartOffset(blobSize, false);
     testRangeRequestOffsetRange(blobSize, blobSize + 20, false);
-    // 0 byte range
-    testRangeRequestLastNBytes(0, true);
     // 1 byte ranges
     testRangeRequestOffsetRange(0, 0, true);
+    testRangeRequestOffsetRange(blobSize / 2, blobSize / 2, true);
     testRangeRequestOffsetRange(blobSize - 1, blobSize - 1, true);
     testRangeRequestFromStartOffset(blobSize - 1, true);
     testRangeRequestLastNBytes(1, true);
 
-    blobSize = maxChunkSize * 2 + random.nextInt(maxChunkSize);
+    blobSize = maxChunkSize * 2 + random.nextInt(maxChunkSize) + 1;
     // Single start chunk
     testRangeRequestOffsetRange(0, maxChunkSize - 1, true);
     // Single intermediate chunk
@@ -899,7 +1031,7 @@ public class GetBlobOperationTest {
   @Test
   public void testSetOperationException() throws Exception {
     doPut();
-    GetBlobOperation op = createOperation(null);
+    GetBlobOperation op = createOperation(routerConfig, null);
     RouterErrorCode[] routerErrorCodes = new RouterErrorCode[8];
     routerErrorCodes[0] = RouterErrorCode.BlobDoesNotExist;
     routerErrorCodes[1] = RouterErrorCode.OperationTimedOut;
@@ -1218,7 +1350,8 @@ public class GetBlobOperationTest {
     }
     // Ensure that a ChannelClosed exception is not set when the ReadableStreamChannel is closed correctly.
     Assert.assertNull("Callback operation exception should be null", op.getOperationException());
-    if (options.getBlobOptions.getOperationType() != GetBlobOptions.OperationType.BlobInfo && !options.getBlobOptions.isRawMode()) {
+    if (options.getBlobOptions.getOperationType() != GetBlobOptions.OperationType.BlobInfo
+        && !options.getBlobOptions.isRawMode()) {
       int sizeWritten = blobSize;
       if (options.getBlobOptions.getRange() != null) {
         ByteRange range = options.getBlobOptions.getRange().toResolvedByteRange(blobSize);
@@ -1235,14 +1368,16 @@ public class GetBlobOperationTest {
    * @throws Exception
    */
   private GetBlobOperation createOperationAndComplete(Callback<GetBlobResultInternal> callback) throws Exception {
-    GetBlobOperation op = createOperation(callback);
+    GetBlobOperation op = createOperation(routerConfig, callback);
     while (!op.isOperationComplete()) {
       op.poll(requestRegistrationCallback);
-      List<ResponseInfo> responses = sendAndWaitForResponses(requestRegistrationCallback.requestListToFill);
+      List<ResponseInfo> responses = sendAndWaitForResponses(requestRegistrationCallback.getRequestsToSend());
       for (ResponseInfo responseInfo : responses) {
-        GetResponse getResponse = responseInfo.getError() == null ? GetResponse.readFrom(
-            new DataInputStream(new ByteBufferInputStream(responseInfo.getResponse())), mockClusterMap) : null;
+        DataInputStream dis = Utils.createDataInputStreamFromBuffer(responseInfo.getResponse(),
+            routerConfig.routerGetBlobOperationShareMemory);
+        GetResponse getResponse = responseInfo.getError() == null ? GetResponse.readFrom(dis, mockClusterMap) : null;
         op.handleResponse(responseInfo, getResponse);
+        responseInfo.release();
       }
     }
     return op;
@@ -1250,16 +1385,16 @@ public class GetBlobOperationTest {
 
   /**
    * Create a getBlob operation with the specified callback
+   * @param routerConfig the routerConfig used to instantiate GetBlobOperation.
    * @param callback the callback to run after completion of the operation, or {@code null} if no callback.
    * @return the operation
-   * @throws Exception
    */
-  private GetBlobOperation createOperation(Callback<GetBlobResultInternal> callback) throws Exception {
+  private GetBlobOperation createOperation(RouterConfig routerConfig, Callback<GetBlobResultInternal> callback) {
     NonBlockingRouter.currentOperationsCount.incrementAndGet();
     GetBlobOperation op =
         new GetBlobOperation(routerConfig, routerMetrics, mockClusterMap, responseHandler, blobId, options, callback,
             routerCallback, blobIdFactory, kms, cryptoService, cryptoJobHandler, time, false);
-    requestRegistrationCallback.requestListToFill = new ArrayList<>();
+    requestRegistrationCallback.setRequestsToSend(new ArrayList<>());
     return op;
   }
 
@@ -1348,8 +1483,8 @@ public class GetBlobOperationTest {
   private ByteBuffer getBlobBuffer() throws IOException {
     // Find server with the blob
     for (ReplicaId replicaId : blobId.getPartition().getReplicaIds()) {
-      MockServer server = mockServerLayout.getMockServer(replicaId.getDataNodeId().getHostname(),
-          replicaId.getDataNodeId().getPort());
+      MockServer server =
+          mockServerLayout.getMockServer(replicaId.getDataNodeId().getHostname(), replicaId.getDataNodeId().getPort());
       if (server.getBlobs().containsKey(blobId.getID())) {
         return getBlobBufferFromServer(server);
       }
@@ -1365,8 +1500,9 @@ public class GetBlobOperationTest {
   private ByteBuffer getBlobBufferFromServer(MockServer server) throws IOException {
     PartitionRequestInfo requestInfo =
         new PartitionRequestInfo(blobId.getPartition(), Collections.singletonList(blobId));
-    GetRequest getRequest = new GetRequest(1, "assertBlobReadSuccess", MessageFormatFlags.All,
-        Collections.singletonList(requestInfo), GetOption.None);
+    GetRequest getRequest =
+        new GetRequest(1, "assertBlobReadSuccess", MessageFormatFlags.All, Collections.singletonList(requestInfo),
+            GetOption.None);
     GetResponse getResponse = server.makeGetResponse(getRequest, ServerErrorCode.No_Error);
 
     // simulating server sending response over the wire
@@ -1393,35 +1529,39 @@ public class GetBlobOperationTest {
    * one of them.
    * @param requestList the list containing the requests handed over by the operation.
    * @return the list of responses from the network client.
-   * @throws IOException
    */
-  private List<ResponseInfo> sendAndWaitForResponses(List<RequestInfo> requestList) throws IOException {
+  private List<ResponseInfo> sendAndWaitForResponses(List<RequestInfo> requestList) {
     int sendCount = requestList.size();
     // Shuffle the replicas to introduce randomness in the order in which responses arrive.
     Collections.shuffle(requestList);
     List<ResponseInfo> responseList = new ArrayList<>();
-    responseList.addAll(mockNetworkClient.sendAndPoll(requestList, 100));
+    responseList.addAll(mockNetworkClient.sendAndPoll(requestList, Collections.emptySet(), 100));
     requestList.clear();
     while (responseList.size() < sendCount) {
-      responseList.addAll(mockNetworkClient.sendAndPoll(requestList, 100));
+      responseList.addAll(mockNetworkClient.sendAndPoll(requestList, Collections.emptySet(), 100));
     }
     return responseList;
   }
 
   /**
    * Get the default {@link Properties} for the {@link NonBlockingRouter}.
+   * @param excludeTimeout whether to exclude timed out request in Histogram.
    * @return the constructed {@link Properties}
    */
-  private Properties getDefaultNonBlockingRouterProperties() {
+  private Properties getDefaultNonBlockingRouterProperties(boolean excludeTimeout) {
     Properties properties = new Properties();
     properties.setProperty("router.hostname", "localhost");
-    properties.setProperty("router.datacenter.name", "DC1");
+    properties.setProperty("router.datacenter.name", "DC3");
     properties.setProperty("router.put.request.parallelism", Integer.toString(3));
     properties.setProperty("router.put.success.target", Integer.toString(2));
     properties.setProperty("router.max.put.chunk.size.bytes", Integer.toString(maxChunkSize));
     properties.setProperty("router.get.request.parallelism", Integer.toString(2));
     properties.setProperty("router.get.success.target", Integer.toString(1));
     properties.setProperty("router.get.operation.tracker.type", operationTrackerType);
+    properties.setProperty("router.request.timeout.ms", Integer.toString(20));
+    properties.setProperty("router.operation.tracker.exclude.timeout.enabled", Boolean.toString(excludeTimeout));
+    properties.setProperty("router.operation.tracker.terminate.on.not.found.enabled", "true");
+    properties.setProperty("router.get.blob.operation.share.memory", "true");
     return properties;
   }
 }

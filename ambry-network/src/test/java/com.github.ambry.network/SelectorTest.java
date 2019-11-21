@@ -14,16 +14,22 @@
 package com.github.ambry.network;
 
 import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.config.NetworkConfig;
+import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.SystemTime;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Properties;
 import java.util.Random;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import static java.util.Arrays.*;
 import static org.junit.Assert.*;
@@ -32,17 +38,32 @@ import static org.junit.Assert.*;
 /**
  * A set of tests for the selector. These use a test harness that runs a simple socket server that echos back responses.
  */
+@RunWith(Parameterized.class)
 public class SelectorTest {
-
   private static final int BUFFER_SIZE = 4 * 1024;
   private EchoServer server;
   private Selector selector;
+  private int selectorExecutorPoolSize;
+
+  @Parameterized.Parameters
+  public static List<Object[]> data() {
+    return Arrays.asList(new Object[][]{{0}, {2}});
+  }
+
+  public SelectorTest(int poolSize) {
+    selectorExecutorPoolSize = poolSize;
+  }
 
   @Before
   public void setup() throws Exception {
     this.server = new EchoServer(18283);
     this.server.start();
-    this.selector = new Selector(new NetworkMetrics(new MetricRegistry()), SystemTime.getInstance(), null);
+    Properties props = new Properties();
+    props.setProperty("selector.executor.pool.size", Integer.toString(selectorExecutorPoolSize));
+    VerifiableProperties vprops = new VerifiableProperties(props);
+    NetworkConfig networkConfig = new NetworkConfig(vprops);
+    this.selector =
+        new Selector(new NetworkMetrics(new MetricRegistry()), SystemTime.getInstance(), null, networkConfig);
   }
 
   @After
@@ -170,17 +191,17 @@ public class SelectorTest {
     // loop until we complete all requests
     while (responseCount < conns * reqs) {
       // do the i/o
-      selector.poll(0L, sends);
+      selector.poll(100L, sends);
 
       assertEquals("No disconnects should have occurred.", 0, selector.disconnected().size());
 
       // handle any responses we may have gotten
       for (NetworkReceive receive : selector.completedReceives()) {
-        String[] pieces = asString(receive).split("&");
+        ByteBuffer payload = (ByteBuffer) (receive.getReceivedBytes().getAndRelease());
+        String[] pieces = asString(payload).split("&");
         assertEquals("Should be in the form 'conn-counter'", 2, pieces.length);
         assertEquals("Check the source", receive.getConnectionId(), pieces[0]);
-        assertEquals("Check that the receive has kindly been rewound", 0,
-            receive.getReceivedBytes().getPayload().position());
+        assertEquals("Check that the receive has kindly been rewound", 0, payload.position());
         int index = Integer.parseInt(receive.getConnectionId().split("_")[1]);
         assertEquals("Check the request counter", responses[index], Integer.parseInt(pieces[1]));
         responses[index]++; // increment the expected counter
@@ -226,7 +247,8 @@ public class SelectorTest {
       selector.poll(1000L);
       for (NetworkReceive receive : selector.completedReceives()) {
         if (receive.getConnectionId() == connectionId) {
-          return asString(receive);
+          ByteBuffer payload = (ByteBuffer) (receive.getReceivedBytes().getAndRelease());
+          return asString(payload);
         }
       }
     }
@@ -250,8 +272,8 @@ public class SelectorTest {
     return new NetworkSend(connectionId, new BoundedByteBufferSend(buf), null, SystemTime.getInstance());
   }
 
-  static String asString(NetworkReceive receive) {
-    return new String(receive.getReceivedBytes().getPayload().array());
+  static String asString(ByteBuffer payload) {
+    return new String(payload.array(), payload.arrayOffset());
   }
 
   /**

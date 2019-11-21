@@ -80,7 +80,7 @@ class NettyRequest implements RestRequest {
   private final RestMethod restMethod;
   private final RestRequestMetricsTracker restRequestMetricsTracker = new RestRequestMetricsTracker();
   private final AtomicBoolean channelOpen = new AtomicBoolean(true);
-  private final AtomicLong bytesReceived = new AtomicLong(0);
+  protected final AtomicLong bytesReceived = new AtomicLong(0);
   private final AtomicLong bytesBuffered = new AtomicLong(0);
   private final Logger logger = LoggerFactory.getLogger(getClass());
   private final RecvByteBufAllocator recvByteBufAllocator = new DefaultMaxBytesRecvByteBufAllocator();
@@ -391,6 +391,11 @@ class NettyRequest implements RestRequest {
     return bytesReceived.get();
   }
 
+  @Override
+  public long getBlobBytesReceived() {
+    return bytesReceived.get();
+  }
+
   /**
    * Adds some content in the form of {@link HttpContent} to this RestRequest. This content will be available to read
    * through the read operations.
@@ -637,7 +642,7 @@ class NettyRequest implements RestRequest {
      */
     public final FutureResult<Long> futureResult = new FutureResult<Long>();
 
-    private final Callback<Long> callback;
+    private Callback<Long> callback;
     private final AtomicLong totalBytesRead = new AtomicLong(0);
     private final AtomicBoolean callbackInvoked = new AtomicBoolean(false);
 
@@ -668,6 +673,9 @@ class NettyRequest implements RestRequest {
         futureResult.done(totalBytesRead.get(), exception);
         if (callback != null) {
           callback.onCompletion(totalBytesRead.get(), exception);
+          // the callback may hold a reference to a large buffer. Setting the callback to null allows for memory to be
+          // freed before the next request comes over this connection.
+          callback = null;
         }
       }
     }

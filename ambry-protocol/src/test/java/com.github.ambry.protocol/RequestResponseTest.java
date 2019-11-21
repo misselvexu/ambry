@@ -18,16 +18,20 @@ import com.github.ambry.clustermap.ClusterMapUtils;
 import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.clustermap.MockPartitionId;
 import com.github.ambry.clustermap.PartitionId;
+import com.github.ambry.clustermap.ReplicaType;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.CommonTestUtils;
-import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.messageformat.BlobType;
 import com.github.ambry.messageformat.MessageFormatFlags;
 import com.github.ambry.messageformat.MessageMetadata;
-import com.github.ambry.store.FindToken;
-import com.github.ambry.store.FindTokenFactory;
+import com.github.ambry.replication.FindToken;
+import com.github.ambry.replication.FindTokenFactory;
+import com.github.ambry.replication.FindTokenHelper;
+import com.github.ambry.replication.FindTokenType;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.store.MessageInfo;
+import com.github.ambry.store.StoreKeyFactory;
 import com.github.ambry.utils.ByteBufferChannel;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.TestUtils;
@@ -40,6 +44,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import org.junit.After;
 import org.junit.Assert;
@@ -50,7 +55,26 @@ import static com.github.ambry.account.Account.*;
 import static com.github.ambry.account.Container.*;
 
 
+class MockFindTokenHelper extends FindTokenHelper {
+  public MockFindTokenHelper() {
+    super();
+  }
+
+  @Override
+  public FindTokenFactory getFindTokenFactoryFromReplicaType(ReplicaType replicaType) {
+    return new MockFindTokenFactory();
+  }
+}
+
 class MockFindTokenFactory implements FindTokenFactory {
+
+  public MockFindTokenFactory(StoreKeyFactory factory) {
+
+  }
+
+  public MockFindTokenFactory() {
+
+  }
 
   @Override
   public FindToken getFindToken(DataInputStream stream) throws IOException {
@@ -64,22 +88,30 @@ class MockFindTokenFactory implements FindTokenFactory {
 }
 
 class MockFindToken implements FindToken {
+  short version;
+  FindTokenType type;
   int index;
   long bytesRead;
 
   public MockFindToken(int index, long bytesRead) {
+    this.version = 0;
+    this.type = FindTokenType.IndexBased;
     this.index = index;
     this.bytesRead = bytesRead;
   }
 
   public MockFindToken(DataInputStream stream) throws IOException {
+    this.version = stream.readShort();
+    this.type = FindTokenType.values()[stream.readShort()];
     this.index = stream.readInt();
     this.bytesRead = stream.readLong();
   }
 
   @Override
   public byte[] toBytes() {
-    ByteBuffer byteBuffer = ByteBuffer.allocate(12);
+    ByteBuffer byteBuffer = ByteBuffer.allocate(2 * Short.BYTES + Integer.BYTES + Long.BYTES);
+    byteBuffer.putShort(version);
+    byteBuffer.putShort((short) type.ordinal());
     byteBuffer.putInt(index);
     byteBuffer.putLong(bytesRead);
     return byteBuffer.array();
@@ -91,6 +123,16 @@ class MockFindToken implements FindToken {
 
   public long getBytesRead() {
     return this.bytesRead;
+  }
+
+  @Override
+  public FindTokenType getType() {
+    return type;
+  }
+
+  @Override
+  public short getVersion() {
+    return version;
   }
 }
 
@@ -170,7 +212,7 @@ public class RequestResponseTest {
             ByteBuffer.wrap(blob), blobSize, blobType, blobKey == null ? null : ByteBuffer.wrap(blobKey)).sizeInBytes();
     // Initialize channel write limits in such a way that writeTo() may or may not be able to write out all the
     // data at once.
-    int channelWriteLimits[] =
+   int channelWriteLimits[] =
         {sizeInBytes, 2 * sizeInBytes, sizeInBytes / 2, sizeInBytes / (TestUtils.RANDOM.nextInt(sizeInBytes - 1) + 1)};
     int sizeInBlobProperties = (int) blobProperties.getBlobSize();
     DataInputStream requestStream;
@@ -394,33 +436,41 @@ public class RequestResponseTest {
 
   @Test
   public void replicaMetadataRequestTest() throws IOException {
-    doReplicaMetadataRequestTest(ReplicaMetadataResponse.CURRENT_VERSION);
-    doReplicaMetadataRequestTest(ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_4);
-    doReplicaMetadataRequestTest(ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_5);
+    for (ReplicaType replicaType : ReplicaType.values()) {
+      doReplicaMetadataRequestTest(ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_6,
+          ReplicaMetadataRequest.Replica_Metadata_Request_Version_V2, replicaType);
+      doReplicaMetadataRequestTest(ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_4,
+          ReplicaMetadataRequest.Replica_Metadata_Request_Version_V1, replicaType);
+      doReplicaMetadataRequestTest(ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_5,
+          ReplicaMetadataRequest.Replica_Metadata_Request_Version_V1, replicaType);
+    }
   }
 
-  private void doReplicaMetadataRequestTest(short responseVersionToUse) throws IOException {
-    ReplicaMetadataResponse.CURRENT_VERSION = responseVersionToUse;
+  private void doReplicaMetadataRequestTest(short responseVersionToUse, short requestVersionToUse,
+      ReplicaType replicaType) throws IOException {
     MockClusterMap clusterMap = new MockClusterMap();
     List<ReplicaMetadataRequestInfo> replicaMetadataRequestInfoList = new ArrayList<ReplicaMetadataRequestInfo>();
     ReplicaMetadataRequestInfo replicaMetadataRequestInfo =
-        new ReplicaMetadataRequestInfo(new MockPartitionId(), new MockFindToken(0, 1000), "localhost", "path");
+        new ReplicaMetadataRequestInfo(new MockPartitionId(), new MockFindToken(0, 1000), "localhost", "path",
+            replicaType, requestVersionToUse);
     replicaMetadataRequestInfoList.add(replicaMetadataRequestInfo);
-    ReplicaMetadataRequest request = new ReplicaMetadataRequest(1, "id", replicaMetadataRequestInfoList, 1000);
+    ReplicaMetadataRequest request =
+        new ReplicaMetadataRequest(1, "id", replicaMetadataRequestInfoList, 1000, requestVersionToUse);
     DataInputStream requestStream = serAndPrepForRead(request, -1, true);
     ReplicaMetadataRequest replicaMetadataRequestFromBytes =
-        ReplicaMetadataRequest.readFrom(requestStream, new MockClusterMap(), new MockFindTokenFactory());
+        ReplicaMetadataRequest.readFrom(requestStream, new MockClusterMap(), new MockFindTokenHelper());
     Assert.assertEquals(replicaMetadataRequestFromBytes.getMaxTotalSizeOfEntriesInBytes(), 1000);
     Assert.assertEquals(replicaMetadataRequestFromBytes.getReplicaMetadataRequestInfoList().size(), 1);
 
     try {
-      new ReplicaMetadataRequest(1, "id", null, 12);
+      new ReplicaMetadataRequest(1, "id", null, 12, requestVersionToUse);
       Assert.fail("Serializing should have failed");
     } catch (IllegalArgumentException e) {
       // expected. Nothing to do
     }
     try {
-      new ReplicaMetadataRequestInfo(new MockPartitionId(), null, "localhost", "path");
+      new ReplicaMetadataRequestInfo(new MockPartitionId(), null, "localhost", "path", replicaType,
+          requestVersionToUse);
       Assert.fail("Construction should have failed");
     } catch (IllegalArgumentException e) {
       // expected. Nothing to do
@@ -446,17 +496,18 @@ public class RequestResponseTest {
         totalSizeOfAllMessages += msgSize;
       }
       ReplicaMetadataResponseInfo responseInfo = new ReplicaMetadataResponseInfo(
-          clusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS).get(0), new MockFindToken(0, 1000),
-          messageInfoList, 1000);
+          clusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS).get(0), replicaType,
+          new MockFindToken(0, 1000), messageInfoList, 1000, responseVersionToUse);
       Assert.assertEquals("Total size of messages not as expected", totalSizeOfAllMessages,
           responseInfo.getTotalSizeOfAllMessages());
       replicaMetadataResponseInfoList.add(responseInfo);
     }
     ReplicaMetadataResponse response =
-        new ReplicaMetadataResponse(1234, "clientId", ServerErrorCode.No_Error, replicaMetadataResponseInfoList);
+        new ReplicaMetadataResponse(1234, "clientId", ServerErrorCode.No_Error, replicaMetadataResponseInfoList,
+            responseVersionToUse);
     requestStream = serAndPrepForRead(response, -1, false);
     ReplicaMetadataResponse deserializedReplicaMetadataResponse =
-        ReplicaMetadataResponse.readFrom(requestStream, new MockFindTokenFactory(), clusterMap);
+        ReplicaMetadataResponse.readFrom(requestStream, new MockFindTokenHelper(), clusterMap);
     Assert.assertEquals(deserializedReplicaMetadataResponse.getCorrelationId(), 1234);
     Assert.assertEquals(deserializedReplicaMetadataResponse.getError(), ServerErrorCode.No_Error);
     Assert.assertEquals("ReplicaMetadataResponse list size mismatch ", numResponseInfos,
@@ -477,8 +528,7 @@ public class RequestResponseTest {
         Assert.assertEquals("MsgInfo size mismatch ", originalMsgInfo.getSize(), msgInfo.getSize());
         Assert.assertEquals("MsgInfo key mismatch ", originalMsgInfo.getStoreKey(), msgInfo.getStoreKey());
         Assert.assertEquals("MsgInfo expiration value mismatch ", Utils.Infinite_Time, msgInfo.getExpirationTimeInMs());
-        if (ReplicaMetadataResponse.getCurrentVersion()
-            >= ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_3) {
+        if (response.getVersionId() >= ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_3) {
           Assert.assertEquals("AccountId mismatch ", originalMsgInfo.getAccountId(), msgInfo.getAccountId());
           Assert.assertEquals("ContainerId mismatch ", originalMsgInfo.getContainerId(), msgInfo.getContainerId());
           Assert.assertEquals("OperationTime mismatch ", operationTimeMs, msgInfo.getOperationTimeMs());
@@ -496,12 +546,38 @@ public class RequestResponseTest {
         response.toString().length() < maxLength);
     // test toString() of a ReplicaMetadataResponseInfo without any messages
     ReplicaMetadataResponseInfo responseInfo = new ReplicaMetadataResponseInfo(
-        clusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS).get(0), new MockFindToken(0, 1000),
-        Collections.emptyList(), 1000);
+        clusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS).get(0), replicaType,
+        new MockFindToken(0, 1000), Collections.emptyList(), 1000, responseVersionToUse);
     Assert.assertTrue("Length of toString() should be > 0", responseInfo.toString().length() > 0);
     // test toString() of a ReplicaMetadataResponse without any ReplicaMetadataResponseInfo
-    response = new ReplicaMetadataResponse(1234, "clientId", ServerErrorCode.No_Error, Collections.emptyList());
+    response = new ReplicaMetadataResponse(1234, "clientId", ServerErrorCode.No_Error, Collections.emptyList(),
+        responseVersionToUse);
     Assert.assertTrue("Length of toString() should be > 0", response.toString().length() > 0);
+  }
+
+  /**
+   * ReplicaMetadataRequestResonse compatibility test. Tests {@code ReplicaMetadataResponse#getCompatibleResponseVersion}
+   */
+  @Test
+  public void getCompatibleResponseVersionTest() {
+    Assert.assertEquals(
+        "Request version Replica_Metadata_Request_Version_V1 should be compatible with REPLICA_METADATA_RESPONSE_VERSION_V_5",
+        ReplicaMetadataResponse.getCompatibleResponseVersion(
+            ReplicaMetadataRequest.Replica_Metadata_Request_Version_V1),
+        ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_5);
+    Assert.assertEquals(
+        "Request version Replica_Metadata_Request_Version_V6 should be compatible with REPLICA_METADATA_RESPONSE_VERSION_V_6",
+        ReplicaMetadataResponse.getCompatibleResponseVersion(
+            ReplicaMetadataRequest.Replica_Metadata_Request_Version_V2),
+        ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_6);
+    Assert.assertFalse(
+        "Request version Replica_Metadata_Request_Version_V1 should not be compatible with REPLICA_METADATA_RESPONSE_VERSION_V_6",
+        ReplicaMetadataResponse.getCompatibleResponseVersion(ReplicaMetadataRequest.Replica_Metadata_Request_Version_V1)
+            == ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_6);
+    Assert.assertFalse(
+        "Request version Replica_Metadata_Request_Version_V1 should not be compatible with REPLICA_METADATA_RESPONSE_VERSION_V_6",
+        ReplicaMetadataResponse.getCompatibleResponseVersion(ReplicaMetadataRequest.Replica_Metadata_Request_Version_V2)
+            == ReplicaMetadataResponse.REPLICA_METADATA_RESPONSE_VERSION_V_5);
   }
 
   /**
@@ -596,8 +672,9 @@ public class RequestResponseTest {
    */
   @Test
   public void blobStoreControlAdminRequestTest() throws IOException {
-    doBlobStoreControlAdminRequestTest(true);
-    doBlobStoreControlAdminRequestTest(false);
+    for (BlobStoreControlAction requestType : EnumSet.allOf(BlobStoreControlAction.class)) {
+      doBlobStoreControlAdminRequestTest(requestType);
+    }
   }
 
   /**
@@ -613,7 +690,7 @@ public class RequestResponseTest {
     }
     doReplicationControlAdminRequestTest(origins, true);
     doReplicationControlAdminRequestTest(origins, false);
-    doReplicationControlAdminRequestTest(Collections.EMPTY_LIST, true);
+    doReplicationControlAdminRequestTest(Collections.emptyList(), true);
   }
 
   /**
@@ -663,10 +740,10 @@ public class RequestResponseTest {
   /**
    * Does the actual test of ser/de of {@link BlobStoreControlAdminRequest} and checks for equality of fields with
    * reference data.
-   * @param enable the value for the enable field in {@link BlobStoreControlAdminRequest}.
+   * @param storeControlRequestType the type of store control request specified in {@link BlobStoreControlAdminRequest}.
    * @throws IOException
    */
-  private void doBlobStoreControlAdminRequestTest(boolean enable) throws IOException {
+  private void doBlobStoreControlAdminRequestTest(BlobStoreControlAction storeControlRequestType) throws IOException {
     MockClusterMap clusterMap = new MockClusterMap();
     PartitionId id = clusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS).get(0);
     int correlationId = 1234;
@@ -676,7 +753,7 @@ public class RequestResponseTest {
     AdminRequest adminRequest =
         new AdminRequest(AdminRequestOrResponseType.BlobStoreControl, id, correlationId, clientId);
     BlobStoreControlAdminRequest blobStoreControlAdminRequest =
-        new BlobStoreControlAdminRequest(numCaughtUpPerPartition, enable, adminRequest);
+        new BlobStoreControlAdminRequest(numCaughtUpPerPartition, storeControlRequestType, adminRequest);
     DataInputStream requestStream = serAndPrepForRead(blobStoreControlAdminRequest, -1, true);
     AdminRequest deserializedAdminRequest =
         deserAdminRequestAndVerify(requestStream, clusterMap, correlationId, clientId,
@@ -685,9 +762,11 @@ public class RequestResponseTest {
         BlobStoreControlAdminRequest.readFrom(requestStream, deserializedAdminRequest);
     Assert.assertEquals("Num caught up per partition not as set", numCaughtUpPerPartition,
         deserializedBlobStoreControlRequest.getNumReplicasCaughtUpPerPartition());
-    Assert.assertEquals("Enable variable not as set", enable, deserializedBlobStoreControlRequest.shouldEnable());
+    Assert.assertEquals("Control request type is not expected", storeControlRequestType,
+        deserializedBlobStoreControlRequest.getStoreControlAction());
     // test toString method
     String correctString = "BlobStoreControlAdminRequest[ClientId=" + clientId + ", CorrelationId=" + correlationId
+        + ", BlobStoreControlAction=" + deserializedBlobStoreControlRequest.getStoreControlAction()
         + ", NumReplicasCaughtUpPerPartition="
         + deserializedBlobStoreControlRequest.getNumReplicasCaughtUpPerPartition() + ", PartitionId="
         + deserializedBlobStoreControlRequest.getPartitionId() + "]";

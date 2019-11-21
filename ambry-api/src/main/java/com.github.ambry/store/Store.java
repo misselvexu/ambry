@@ -13,6 +13,7 @@
  */
 package com.github.ambry.store;
 
+import com.github.ambry.replication.FindToken;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Set;
@@ -80,7 +81,6 @@ public interface Store {
   /**
    * Get the corresponding {@link StoreStats} instance for this store.
    * @return a {@link StoreStats} instance which can be used to fetch store related stats
-   * @throws StoreException
    */
   StoreStats getStoreStats();
 
@@ -105,7 +105,12 @@ public interface Store {
   boolean isEmpty();
 
   /**
-   * Shutsdown the store
+   * @return true if the store is started
+   */
+  boolean isStarted();
+
+  /**
+   * Shuts down the store
    */
   void shutdown() throws StoreException;
 }

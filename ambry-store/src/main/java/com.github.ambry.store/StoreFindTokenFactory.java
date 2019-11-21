@@ -13,6 +13,8 @@
  */
 package com.github.ambry.store;
 
+import com.github.ambry.replication.FindToken;
+import com.github.ambry.replication.FindTokenFactory;
 import java.io.DataInputStream;
 import java.io.IOException;
 

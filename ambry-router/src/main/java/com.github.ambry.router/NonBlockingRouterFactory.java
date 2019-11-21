@@ -23,6 +23,7 @@ import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.network.NetworkClientFactory;
 import com.github.ambry.network.NetworkMetrics;
+import com.github.ambry.network.SocketNetworkClientFactory;
 import com.github.ambry.notification.NotificationSystem;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.Time;
@@ -83,11 +84,11 @@ public class NonBlockingRouterFactory implements RouterFactory {
     this.notificationSystem = notificationSystem;
     this.accountService = accountService;
     MetricRegistry registry = clusterMap.getMetricRegistry();
-    routerMetrics = new NonBlockingRouterMetrics(clusterMap);
+    routerMetrics = new NonBlockingRouterMetrics(clusterMap, routerConfig);
     networkConfig = new NetworkConfig(verifiableProperties);
     networkMetrics = new NetworkMetrics(registry);
     time = SystemTime.getInstance();
-    networkClientFactory = new NetworkClientFactory(networkMetrics, networkConfig, sslFactory,
+    networkClientFactory = new SocketNetworkClientFactory(networkMetrics, networkConfig, sslFactory,
         routerConfig.routerScalingUnitMaxConnectionsPerPortPlainText,
         routerConfig.routerScalingUnitMaxConnectionsPerPortSsl, routerConfig.routerConnectionCheckoutTimeoutMs, time);
     KeyManagementServiceFactory kmsFactory =

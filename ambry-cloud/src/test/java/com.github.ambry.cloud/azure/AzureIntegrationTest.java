@@ -14,7 +14,10 @@
 package com.github.ambry.cloud.azure;
 
 import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Timer;
 import com.github.ambry.cloud.CloudBlobMetadata;
+import com.github.ambry.cloud.CloudFindToken;
+import com.github.ambry.cloud.CloudStorageException;
 import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.clustermap.MockPartitionId;
 import com.github.ambry.clustermap.PartitionId;
@@ -23,20 +26,19 @@ import com.github.ambry.config.CloudConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
-import com.microsoft.azure.documentdb.Document;
-import com.microsoft.azure.documentdb.DocumentClient;
-import com.microsoft.azure.documentdb.FeedOptions;
-import com.microsoft.azure.documentdb.FeedResponse;
-import com.microsoft.azure.documentdb.PartitionKey;
-import com.microsoft.azure.documentdb.RequestOptions;
+import com.microsoft.azure.documentdb.SqlQuerySpec;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -65,11 +67,14 @@ public class AzureIntegrationTest {
   private byte dataCenterId = 66;
   private short accountId = 101;
   private short containerId = 5;
-  private String cosmosCollectionLink;
+  private long testPartition = 666;
+  // one day retention
+  private int retentionPeriodDays = 1;
+  private String propFileName = "azure-test.properties";
+  private String tokenFileName = "replicaTokens";
 
   @Before
   public void setup() throws Exception {
-    String propFileName = "azure-test.properties";
     Properties props = new Properties();
     try (InputStream input = this.getClass().getClassLoader().getResourceAsStream(propFileName)) {
       if (input == null) {
@@ -79,10 +84,13 @@ public class AzureIntegrationTest {
     } catch (IOException ex) {
       throw new IllegalStateException("Could not load properties from resource: " + propFileName);
     }
+    props.setProperty("clustermap.cluster.name", "Integration-Test");
+    props.setProperty("clustermap.datacenter.name", "uswest");
+    props.setProperty("clustermap.host.name", "localhost");
+    props.setProperty(CloudConfig.CLOUD_DELETED_BLOB_RETENTION_DAYS, String.valueOf(retentionPeriodDays));
     VerifiableProperties verProps = new VerifiableProperties(props);
     azureDest =
         (AzureCloudDestination) new AzureCloudDestinationFactory(verProps, new MetricRegistry()).getCloudDestination();
-    cosmosCollectionLink = verProps.getString(AzureCloudConfig.COSMOS_COLLECTION_LINK);
   }
 
   /**
@@ -91,15 +99,20 @@ public class AzureIntegrationTest {
    */
   @Test
   public void testNormalFlow() throws Exception {
-    PartitionId partitionId = new MockPartitionId();
+    PartitionId partitionId = new MockPartitionId(testPartition, MockClusterMap.DEFAULT_PARTITION_CLASS);
     BlobId blobId = new BlobId(BLOB_ID_V6, BlobIdType.NATIVE, dataCenterId, accountId, containerId, partitionId, false,
         BlobDataType.DATACHUNK);
-    InputStream inputStream = getBlobInputStream(blobSize);
+    byte[] uploadData = TestUtils.getRandomBytes(blobSize);
+    InputStream inputStream = new ByteArrayInputStream(uploadData);
     CloudBlobMetadata cloudBlobMetadata =
         new CloudBlobMetadata(blobId, System.currentTimeMillis(), Utils.Infinite_Time, blobSize,
-            CloudBlobMetadata.EncryptionOrigin.VCR, vcrKmsContext, cryptoAgentFactory);
+            CloudBlobMetadata.EncryptionOrigin.VCR, vcrKmsContext, cryptoAgentFactory, blobSize);
     assertTrue("Expected upload to return true",
         azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, inputStream));
+
+    // Get blob should return the same data
+    verifyDownloadMatches(blobId, uploadData);
+
     // Try to upload same blob again
     assertFalse("Expected duplicate upload to return false",
         azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, inputStream));
@@ -107,10 +120,23 @@ public class AzureIntegrationTest {
     assertTrue("Expected update to return true", azureDest.updateBlobExpiration(blobId, expirationTime));
     CloudBlobMetadata metadata = azureDest.getBlobMetadata(Collections.singletonList(blobId)).get(blobId.getID());
     assertEquals(expirationTime, metadata.getExpirationTime());
+    assertEquals(azureDest.getAzureBlobName(blobId), metadata.getCloudBlobName());
     long deletionTime = System.currentTimeMillis() + 1000;
     assertTrue("Expected deletion to return true", azureDest.deleteBlob(blobId, deletionTime));
     metadata = azureDest.getBlobMetadata(Collections.singletonList(blobId)).get(blobId.getID());
     assertEquals(deletionTime, metadata.getDeletionTime());
+    assertEquals(azureDest.getAzureBlobName(blobId), metadata.getCloudBlobName());
+
+    azureDest.purgeBlob(metadata);
+    assertTrue("Expected empty set after purge",
+        azureDest.getBlobMetadata(Collections.singletonList(blobId)).isEmpty());
+
+    // Get blob should fail after purge
+    try {
+      verifyDownloadMatches(blobId, uploadData);
+      fail("download blob should fail after data is purged");
+    } catch (CloudStorageException csex) {
+    }
   }
 
   /**
@@ -119,28 +145,32 @@ public class AzureIntegrationTest {
    */
   @Test
   public void testBatchQuery() throws Exception {
+    cleanup();
+
     int numBlobs = 100;
-    long partition = 666;
-    PartitionId partitionId = new MockPartitionId(partition, MockClusterMap.DEFAULT_PARTITION_CLASS);
+    PartitionId partitionId = new MockPartitionId(testPartition, MockClusterMap.DEFAULT_PARTITION_CLASS);
     List<BlobId> blobIdList = new ArrayList<>();
     long creationTime = System.currentTimeMillis();
+    Map<BlobId, byte[]> blobIdtoDataMap = new HashMap<>();
     for (int j = 0; j < numBlobs; j++) {
       BlobId blobId =
           new BlobId(BLOB_ID_V6, BlobIdType.NATIVE, dataCenterId, accountId, containerId, partitionId, false,
               BlobDataType.DATACHUNK);
       blobIdList.add(blobId);
-      InputStream inputStream = getBlobInputStream(blobSize);
+      byte[] randomBytes = TestUtils.getRandomBytes(blobSize);
+      blobIdtoDataMap.put(blobId, randomBytes);
       CloudBlobMetadata cloudBlobMetadata = new CloudBlobMetadata(blobId, creationTime, Utils.Infinite_Time, blobSize,
-          CloudBlobMetadata.EncryptionOrigin.VCR, vcrKmsContext, cryptoAgentFactory);
+          CloudBlobMetadata.EncryptionOrigin.VCR, vcrKmsContext, cryptoAgentFactory, blobSize);
       assertTrue("Expected upload to return true",
-          azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, inputStream));
+          azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, new ByteArrayInputStream(randomBytes)));
     }
-
+    long uploadTime = System.currentTimeMillis() - creationTime;
+    logger.info("Uploaded {} blobs in {} ms", numBlobs, uploadTime);
     Map<String, CloudBlobMetadata> metadataMap = azureDest.getBlobMetadata(blobIdList);
     assertEquals("Unexpected size of returned metadata map", numBlobs, metadataMap.size());
     for (BlobId blobId : blobIdList) {
       CloudBlobMetadata metadata = metadataMap.get(blobId.getID());
-      assertNotNull("No metadata found for blobId: " + blobId);
+      assertNotNull("No metadata found for blobId: " + blobId, metadata);
       assertEquals("Unexpected metadata id", blobId.getID(), metadata.getId());
       assertEquals("Unexpected metadata accountId", accountId, metadata.getAccountId());
       assertEquals("Unexpected metadata containerId", containerId, metadata.getContainerId());
@@ -150,22 +180,186 @@ public class AzureIntegrationTest {
           metadata.getEncryptionOrigin());
       assertEquals("Unexpected metadata vcrKmsContext", vcrKmsContext, metadata.getVcrKmsContext());
       assertEquals("Unexpected metadata cryptoAgentFactory", cryptoAgentFactory, metadata.getCryptoAgentFactory());
+      assertEquals(azureDest.getAzureBlobName(blobId), metadata.getCloudBlobName());
+
+      verifyDownloadMatches(blobId, blobIdtoDataMap.get(blobId));
     }
 
-    // Cleanup
-    DocumentClient documentClient = azureDest.getDocumentClient();
-    FeedOptions feedOptions = new FeedOptions();
-    feedOptions.setPartitionKey(new PartitionKey(partitionId.toPathString()));
-    RequestOptions requestOptions = new RequestOptions();
-    requestOptions.setPartitionKey(feedOptions.getPartitionKey());
-    FeedResponse<Document> feedResponse =
-        documentClient.queryDocuments(cosmosCollectionLink, "SELECT * FROM c", feedOptions);
-    int numDeletes = 0;
-    for (Document document : feedResponse.getQueryIterable().toList()) {
-      documentClient.deleteDocument(document.getSelfLink(), requestOptions);
-      numDeletes++;
+    cleanup();
+  }
+
+  /**
+   * Test blob compaction.
+   * @throws Exception on error
+   */
+  @Test
+  public void testPurgeDeadBlobs() throws Exception {
+    cleanup();
+
+    int bucketCount = 10;
+    PartitionId partitionId = new MockPartitionId(testPartition, MockClusterMap.DEFAULT_PARTITION_CLASS);
+
+    // Upload blobs in various lifecycle states
+    long now = System.currentTimeMillis();
+    long creationTime = now - TimeUnit.DAYS.toMillis(7);
+    int expectedDeadBlobs = 0;
+    for (int j = 0; j < bucketCount; j++) {
+      // Active blob
+      BlobId blobId =
+          new BlobId(BLOB_ID_V6, BlobIdType.NATIVE, dataCenterId, accountId, containerId, partitionId, false,
+              BlobDataType.DATACHUNK);
+      InputStream inputStream = getBlobInputStream(blobSize);
+      CloudBlobMetadata cloudBlobMetadata = new CloudBlobMetadata(blobId, creationTime, Utils.Infinite_Time, blobSize,
+          CloudBlobMetadata.EncryptionOrigin.VCR, vcrKmsContext, cryptoAgentFactory, blobSize);
+      assertTrue("Expected upload to return true",
+          azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, inputStream));
+
+      // Blob deleted before retention cutoff (should match)
+      long timeOfDeath = now - TimeUnit.DAYS.toMillis(retentionPeriodDays + 1);
+      blobId = new BlobId(BLOB_ID_V6, BlobIdType.NATIVE, dataCenterId, accountId, containerId, partitionId, false,
+          BlobDataType.DATACHUNK);
+      inputStream = getBlobInputStream(blobSize);
+      cloudBlobMetadata = new CloudBlobMetadata(blobId, creationTime, Utils.Infinite_Time, blobSize,
+          CloudBlobMetadata.EncryptionOrigin.VCR, vcrKmsContext, cryptoAgentFactory, blobSize);
+      cloudBlobMetadata.setDeletionTime(timeOfDeath);
+      assertTrue("Expected upload to return true",
+          azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, inputStream));
+      expectedDeadBlobs++;
+
+      // Blob expired before retention cutoff (should match)
+      blobId = new BlobId(BLOB_ID_V6, BlobIdType.NATIVE, dataCenterId, accountId, containerId, partitionId, false,
+          BlobDataType.DATACHUNK);
+      inputStream = getBlobInputStream(blobSize);
+      cloudBlobMetadata =
+          new CloudBlobMetadata(blobId, creationTime, timeOfDeath, blobSize, CloudBlobMetadata.EncryptionOrigin.VCR,
+              vcrKmsContext, cryptoAgentFactory, blobSize);
+      assertTrue("Expected upload to return true",
+          azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, inputStream));
+      expectedDeadBlobs++;
+
+      // Blob deleted after retention cutoff
+      timeOfDeath = now - TimeUnit.HOURS.toMillis(1);
+      blobId = new BlobId(BLOB_ID_V6, BlobIdType.NATIVE, dataCenterId, accountId, containerId, partitionId, false,
+          BlobDataType.DATACHUNK);
+      inputStream = getBlobInputStream(blobSize);
+      cloudBlobMetadata = new CloudBlobMetadata(blobId, creationTime, Utils.Infinite_Time, blobSize,
+          CloudBlobMetadata.EncryptionOrigin.VCR, vcrKmsContext, cryptoAgentFactory, blobSize);
+      cloudBlobMetadata.setDeletionTime(timeOfDeath);
+      assertTrue("Expected upload to return true",
+          azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, inputStream));
+
+      // Blob expired after retention cutoff
+      blobId = new BlobId(BLOB_ID_V6, BlobIdType.NATIVE, dataCenterId, accountId, containerId, partitionId, false,
+          BlobDataType.DATACHUNK);
+      inputStream = getBlobInputStream(blobSize);
+      cloudBlobMetadata =
+          new CloudBlobMetadata(blobId, creationTime, timeOfDeath, blobSize, CloudBlobMetadata.EncryptionOrigin.VCR,
+              vcrKmsContext, cryptoAgentFactory, blobSize);
+      assertTrue("Expected upload to return true",
+          azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, inputStream));
     }
-    logger.info("Deleted {} metadata documents in partition {}", numDeletes, partitionId.toPathString());
+
+    // run getDeadBlobs query, should return 20
+    String partitionPath = String.valueOf(testPartition);
+    List<CloudBlobMetadata> deadBlobs = azureDest.getDeadBlobs(partitionPath);
+    assertEquals("Unexpected number of dead blobs", expectedDeadBlobs, deadBlobs.size());
+
+    int numPurged = azureDest.purgeBlobs(deadBlobs);
+    assertEquals("Not all blobs were purged", expectedDeadBlobs, numPurged);
+    cleanup();
+  }
+
+  /**
+   * Test findEntriesSince.
+   * @throws Exception on error
+   */
+  @Test
+  public void testFindEntriesSince() throws Exception {
+    cleanup();
+
+    PartitionId partitionId = new MockPartitionId(testPartition, MockClusterMap.DEFAULT_PARTITION_CLASS);
+    String partitionPath = String.valueOf(testPartition);
+
+    // Upload some blobs with different upload times
+    int blobCount = 90;
+    int chunkSize = 1000;
+    int maxTotalSize = 20000;
+    int expectedNumQueries = (blobCount * chunkSize) / maxTotalSize + 2;
+
+    long now = System.currentTimeMillis();
+    long startTime = now - TimeUnit.DAYS.toMillis(7);
+    for (int j = 0; j < blobCount; j++) {
+      BlobId blobId =
+          new BlobId(BLOB_ID_V6, BlobIdType.NATIVE, dataCenterId, accountId, containerId, partitionId, false,
+              BlobDataType.DATACHUNK);
+      InputStream inputStream = getBlobInputStream(chunkSize);
+      CloudBlobMetadata cloudBlobMetadata = new CloudBlobMetadata(blobId, startTime, Utils.Infinite_Time, chunkSize,
+          CloudBlobMetadata.EncryptionOrigin.VCR, vcrKmsContext, cryptoAgentFactory, chunkSize);
+      cloudBlobMetadata.setUploadTime(startTime + j * 1000);
+      assertTrue("Expected upload to return true",
+          azureDest.uploadBlob(blobId, blobSize, cloudBlobMetadata, inputStream));
+    }
+
+    CloudFindToken findToken = new CloudFindToken();
+    // Call findEntriesSince in a loop until no new entries are returned
+    List<CloudBlobMetadata> results;
+    int numQueries = 0;
+    int totalBlobsReturned = 0;
+    do {
+      results = azureDest.findEntriesSince(partitionPath, findToken, maxTotalSize);
+      numQueries++;
+      totalBlobsReturned += results.size();
+      findToken = CloudFindToken.getUpdatedToken(findToken, results);
+    } while (!results.isEmpty());
+
+    assertEquals("Wrong number of queries", expectedNumQueries, numQueries);
+    assertEquals("Wrong number of blobs", blobCount, totalBlobsReturned);
+    assertEquals("Wrong byte count", blobCount * chunkSize, findToken.getBytesRead());
+
+    cleanup();
+  }
+
+  private void cleanup() throws Exception {
+    String partitionPath = String.valueOf(testPartition);
+    Timer dummyTimer = new Timer();
+    List<CloudBlobMetadata> allBlobsInPartition =
+        azureDest.getCosmosDataAccessor().queryMetadata(partitionPath, new SqlQuerySpec("SELECT * FROM c"), dummyTimer);
+    azureDest.purgeBlobs(allBlobsInPartition);
+  }
+
+  /** Persist tokens to Azure, then read them back and verify they match. */
+  @Test
+  public void testTokens() throws Exception {
+    String partitionPath = String.valueOf(testPartition);
+    InputStream input = this.getClass().getClassLoader().getResourceAsStream(tokenFileName);
+    if (input == null) {
+      throw new IllegalStateException("Could not find resource: " + tokenFileName);
+    }
+    byte[] tokenBytes = new byte[2000];
+    int tokensLength = input.read(tokenBytes, 0, 2000);
+    tokenBytes = Arrays.copyOf(tokenBytes, tokensLength);
+    InputStream tokenStream = new ByteArrayInputStream(tokenBytes);
+    azureDest.persistTokens(partitionPath, tokenFileName, tokenStream);
+    ByteArrayOutputStream outputStream = new ByteArrayOutputStream(tokensLength);
+    assertTrue("Retrieve tokens returned false", azureDest.retrieveTokens(partitionPath, tokenFileName, outputStream));
+    assertTrue("Retrieved token did not match sent", Arrays.equals(outputStream.toByteArray(), tokenBytes));
+    // Try for nonexistent partition
+    outputStream.reset();
+    assertFalse("Expected retrieve to return false for nonexistent path",
+        azureDest.retrieveTokens("unknown-path", tokenFileName, outputStream));
+  }
+
+  /**
+   * test download matches the blob previously uploaded.
+   * @param blobId id of the blob to download
+   * @param uploadedData data uploaded to the blob
+   * @throws CloudStorageException
+   */
+  private void verifyDownloadMatches(BlobId blobId, byte[] uploadedData) throws CloudStorageException, IOException {
+    ByteArrayOutputStream outputStream = new ByteArrayOutputStream(blobSize);
+    azureDest.downloadBlob(blobId, outputStream);
+    assertTrue("Downloaded data should match the uploaded data",
+        Arrays.equals(uploadedData, outputStream.toByteArray()));
   }
 
   /**

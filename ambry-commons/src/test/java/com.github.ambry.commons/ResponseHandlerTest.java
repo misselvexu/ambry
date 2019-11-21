@@ -24,6 +24,7 @@ import com.github.ambry.network.ConnectionPoolTimeoutException;
 import com.github.ambry.network.NetworkClientErrorCode;
 import com.github.ambry.router.RouterErrorCode;
 import com.github.ambry.router.RouterException;
+import com.github.ambry.server.ServerErrorCode;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.SocketException;
@@ -61,6 +62,11 @@ public class ResponseHandlerTest {
 
     @Override
     public List<PartitionId> getWritablePartitionIds(String partitionClass) {
+      return null;
+    }
+
+    @Override
+    public PartitionId getRandomWritablePartition(String partitionClass, List<PartitionId> partitionsToExclude) {
       return null;
     }
 
@@ -116,6 +122,11 @@ public class ResponseHandlerTest {
     }
 
     @Override
+    public ReplicaId getBootstrapReplica(String partitionIdStr, DataNodeId dataNodeId) {
+      return null;
+    }
+
+    @Override
     public void close() {
     }
 
@@ -149,15 +160,20 @@ public class ResponseHandlerTest {
     expectedEventTypes.put(ServerErrorCode.Disk_Unavailable,
         new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Error});
     expectedEventTypes.put(ServerErrorCode.Partition_ReadOnly,
-        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok, ReplicaEventType.Partition_ReadOnly, ReplicaEventType.Replica_Available});
+        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok,
+            ReplicaEventType.Partition_ReadOnly, ReplicaEventType.Replica_Available});
     expectedEventTypes.put(ServerErrorCode.Replica_Unavailable,
-        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok, ReplicaEventType.Replica_Unavailable});
+        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok,
+            ReplicaEventType.Replica_Unavailable});
     expectedEventTypes.put(ServerErrorCode.Temporarily_Disabled,
-        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok, ReplicaEventType.Replica_Unavailable});
+        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok,
+            ReplicaEventType.Replica_Unavailable});
     expectedEventTypes.put(ServerErrorCode.Unknown_Error,
-        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok, ReplicaEventType.Replica_Available});
+        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok,
+            ReplicaEventType.Replica_Available});
     expectedEventTypes.put(ServerErrorCode.No_Error,
-        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok, ReplicaEventType.Replica_Available});
+        new ReplicaEventType[]{ReplicaEventType.Node_Response, ReplicaEventType.Disk_Ok,
+            ReplicaEventType.Replica_Available});
     expectedEventTypes.put(NetworkClientErrorCode.NetworkError, new ReplicaEventType[]{ReplicaEventType.Node_Timeout});
     expectedEventTypes.put(NetworkClientErrorCode.ConnectionUnavailable, new ReplicaEventType[]{});
     expectedEventTypes.put(new RouterException("", RouterErrorCode.UnexpectedInternalError), new ReplicaEventType[]{});

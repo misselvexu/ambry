@@ -18,24 +18,26 @@ import com.github.ambry.account.Container;
 import com.github.ambry.account.InMemAccountService;
 import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.clustermap.MockClusterMap;
+import com.github.ambry.clustermap.MockDataNodeId;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.LoggingNotificationSystem;
 import com.github.ambry.commons.ResponseHandler;
-import com.github.ambry.commons.ServerErrorCode;
 import com.github.ambry.config.CryptoServiceConfig;
 import com.github.ambry.config.KMSConfig;
 import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobProperties;
-import com.github.ambry.network.NetworkClient;
+import com.github.ambry.messageformat.MessageFormatRecord;
+import com.github.ambry.network.SocketNetworkClient;
 import com.github.ambry.network.NetworkClientErrorCode;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.notification.NotificationSystem;
 import com.github.ambry.protocol.GetOption;
 import com.github.ambry.protocol.RequestOrResponseType;
+import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.TestUtils;
@@ -69,6 +71,8 @@ import org.junit.Assert;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import static com.github.ambry.router.RouterTestHelpers.*;
 import static com.github.ambry.utils.TestUtils.*;
@@ -94,20 +98,22 @@ public class NonBlockingRouterTest {
   private static final int USER_METADATA_SIZE = 10;
   private int maxPutChunkSize = PUT_CONTENT_SIZE;
   private final Random random = new Random();
-  private NonBlockingRouter router;
-  private NonBlockingRouterMetrics routerMetrics;
+  protected NonBlockingRouter router;
+  protected NonBlockingRouterMetrics routerMetrics;
   private PutManager putManager;
   private GetManager getManager;
   private DeleteManager deleteManager;
   private AtomicReference<MockSelectorState> mockSelectorState = new AtomicReference<>(MockSelectorState.Good);
-  private final MockTime mockTime;
-  private final KeyManagementService kms;
-  private final String singleKeyForKMS;
-  private final CryptoService cryptoService;
-  private final MockClusterMap mockClusterMap;
-  private final boolean testEncryption;
-  private final InMemAccountService accountService;
-  private CryptoJobHandler cryptoJobHandler;
+  protected final MockTime mockTime;
+  protected final KeyManagementService kms;
+  protected final String singleKeyForKMS;
+  protected final CryptoService cryptoService;
+  protected final MockClusterMap mockClusterMap;
+  protected final boolean testEncryption;
+  protected final int metadataContentVersion;
+  protected final InMemAccountService accountService;
+  protected CryptoJobHandler cryptoJobHandler;
+  private static final Logger logger = LoggerFactory.getLogger(NonBlockingRouterTest.class);
 
   // Request params;
   BlobProperties putBlobProperties;
@@ -116,12 +122,15 @@ public class NonBlockingRouterTest {
   ReadableStreamChannel putChannel;
 
   /**
-   * Running for both regular and encrypted blobs
-   * @return an array with both {@code false} and {@code true}.
+   * Running for both regular and encrypted blobs, and versions 2 and 3 of MetadataContent
+   * @return an array with all four different choices
    */
   @Parameterized.Parameters
   public static List<Object[]> data() {
-    return Arrays.asList(new Object[][]{{false}, {true}});
+    return Arrays.asList(new Object[][]{{false, MessageFormatRecord.Metadata_Content_Version_V2},
+        {false, MessageFormatRecord.Metadata_Content_Version_V3},
+        {true, MessageFormatRecord.Metadata_Content_Version_V2},
+        {true, MessageFormatRecord.Metadata_Content_Version_V3}});
   }
 
   /**
@@ -129,8 +138,9 @@ public class NonBlockingRouterTest {
    * @param testEncryption {@code true} to test with encryption enabled. {@code false} otherwise
    * @throws Exception
    */
-  public NonBlockingRouterTest(boolean testEncryption) throws Exception {
+  public NonBlockingRouterTest(boolean testEncryption, int metadataContentVersion) throws Exception {
     this.testEncryption = testEncryption;
+    this.metadataContentVersion = metadataContentVersion;
     mockTime = new MockTime();
     mockClusterMap = new MockClusterMap();
     NonBlockingRouter.currentOperationsCount.set(0);
@@ -152,7 +162,7 @@ public class NonBlockingRouterTest {
    * the {@link NonBlockingRouter}.
    * @return the created VerifiableProperties instance.
    */
-  private Properties getNonBlockingRouterProperties(String routerDataCenter) {
+  protected Properties getNonBlockingRouterProperties(String routerDataCenter) {
     Properties properties = new Properties();
     properties.setProperty("router.hostname", "localhost");
     properties.setProperty("router.datacenter.name", routerDataCenter);
@@ -165,10 +175,13 @@ public class NonBlockingRouterTest {
     properties.setProperty("router.delete.success.target", Integer.toString(DELETE_SUCCESS_TARGET));
     properties.setProperty("router.connection.checkout.timeout.ms", Integer.toString(CHECKOUT_TIMEOUT_MS));
     properties.setProperty("router.request.timeout.ms", Integer.toString(REQUEST_TIMEOUT_MS));
+    properties.setProperty("router.connections.local.dc.warm.up.percentage", Integer.toString(67));
+    properties.setProperty("router.connections.remote.dc.warm.up.percentage", Integer.toString(34));
     properties.setProperty("clustermap.cluster.name", "test");
     properties.setProperty("clustermap.datacenter.name", "dc1");
     properties.setProperty("clustermap.host.name", "localhost");
     properties.setProperty("kms.default.container.key", TestUtils.getRandomKey(128));
+    properties.setProperty("router.metadata.content.version", String.valueOf(metadataContentVersion));
     return properties;
   }
 
@@ -176,7 +189,7 @@ public class NonBlockingRouterTest {
    * Construct {@link Properties} and {@link MockServerLayout} and initialize and set the
    * router with them.
    */
-  private void setRouter() throws IOException {
+  protected void setRouter() throws Exception {
     setRouter(getNonBlockingRouterProperties("DC1"), new MockServerLayout(mockClusterMap),
         new LoggingNotificationSystem());
   }
@@ -187,11 +200,12 @@ public class NonBlockingRouterTest {
    * @param mockServerLayout the {@link MockServerLayout}
    * @param notificationSystem the {@link NotificationSystem} to use.
    */
-  private void setRouter(Properties props, MockServerLayout mockServerLayout, NotificationSystem notificationSystem)
-      throws IOException {
+  protected void setRouter(Properties props, MockServerLayout mockServerLayout, NotificationSystem notificationSystem)
+      throws Exception {
     VerifiableProperties verifiableProperties = new VerifiableProperties((props));
-    routerMetrics = new NonBlockingRouterMetrics(mockClusterMap);
-    router = new NonBlockingRouter(new RouterConfig(verifiableProperties), routerMetrics,
+    RouterConfig routerConfig = new RouterConfig(verifiableProperties);
+    routerMetrics = new NonBlockingRouterMetrics(mockClusterMap, routerConfig);
+    router = new NonBlockingRouter(routerConfig, routerMetrics,
         new MockNetworkClientFactory(verifiableProperties, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, mockServerLayout, mockTime), notificationSystem, mockClusterMap, kms, cryptoService,
         cryptoJobHandler, accountService, mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
@@ -200,7 +214,7 @@ public class NonBlockingRouterTest {
   /**
    * Setup test suite to perform a {@link Router#putBlob} call using the constant {@link #PUT_CONTENT_SIZE}
    */
-  private void setOperationParams() {
+  protected void setOperationParams() {
     setOperationParams(PUT_CONTENT_SIZE, TTL_SECS);
   }
 
@@ -209,7 +223,7 @@ public class NonBlockingRouterTest {
    * @param putContentSize the size of the content to put
    * @param ttlSecs the TTL in seconds for the blob.
    */
-  private void setOperationParams(int putContentSize, long ttlSecs) {
+  protected void setOperationParams(int putContentSize, long ttlSecs) {
     putBlobProperties = new BlobProperties(-1, "serviceId", "memberId", "contentType", false, ttlSecs,
         Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), testEncryption, null);
     putUserMetadata = new byte[USER_METADATA_SIZE];
@@ -256,6 +270,7 @@ public class NonBlockingRouterTest {
     for (int i = 0; i < 2; i++) {
       setOperationParams();
       String blobId = router.putBlob(putBlobProperties, putUserMetadata, putChannel, PutBlobOptions.DEFAULT).get();
+      logger.debug("Put blob {}", blobId);
       blobIds.add(blobId);
     }
     setOperationParams();
@@ -389,9 +404,10 @@ public class NonBlockingRouterTest {
   public void testRequestResponseHandlerThreadExitFlow() throws Exception {
     Properties props = getNonBlockingRouterProperties("DC1");
     VerifiableProperties verifiableProperties = new VerifiableProperties((props));
+    RouterConfig routerConfig = new RouterConfig(verifiableProperties);
     MockClusterMap mockClusterMap = new MockClusterMap();
     MockTime mockTime = new MockTime();
-    router = new NonBlockingRouter(new RouterConfig(verifiableProperties), new NonBlockingRouterMetrics(mockClusterMap),
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(mockClusterMap, routerConfig),
         new MockNetworkClientFactory(verifiableProperties, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, new MockServerLayout(mockClusterMap), mockTime), new LoggingNotificationSystem(),
         mockClusterMap, kms, cryptoService, cryptoJobHandler, accountService, mockTime,
@@ -453,6 +469,7 @@ public class NonBlockingRouterTest {
     maxPutChunkSize = PUT_CONTENT_SIZE / 4;
     Properties props = getNonBlockingRouterProperties("DC1");
     VerifiableProperties verifiableProperties = new VerifiableProperties((props));
+    RouterConfig routerConfig = new RouterConfig(verifiableProperties);
     MockClusterMap mockClusterMap = new MockClusterMap();
     MockTime mockTime = new MockTime();
     MockServerLayout mockServerLayout = new MockServerLayout(mockClusterMap);
@@ -467,7 +484,7 @@ public class NonBlockingRouterTest {
         deletesDoneLatch.countDown();
       }
     };
-    router = new NonBlockingRouter(new RouterConfig(verifiableProperties), new NonBlockingRouterMetrics(mockClusterMap),
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(mockClusterMap, routerConfig),
         new MockNetworkClientFactory(verifiableProperties, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, mockServerLayout, mockTime), deleteTrackingNotificationSystem, mockClusterMap, kms,
         cryptoService, cryptoJobHandler, accountService, mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
@@ -537,7 +554,7 @@ public class NonBlockingRouterTest {
         deletesDoneLatch.get().countDown();
       }
     };
-    NonBlockingRouterMetrics localMetrics = new NonBlockingRouterMetrics(mockClusterMap);
+    NonBlockingRouterMetrics localMetrics = new NonBlockingRouterMetrics(mockClusterMap, routerConfig);
     router = new NonBlockingRouter(routerConfig, localMetrics,
         new MockNetworkClientFactory(verifiableProperties, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, mockServerLayout, mockTime), deleteTrackingNotificationSystem, mockClusterMap, kms,
@@ -614,11 +631,6 @@ public class NonBlockingRouterTest {
   public void testSimpleBlobDelete() throws Exception {
     // Ensure there are 4 chunks.
     maxPutChunkSize = PUT_CONTENT_SIZE;
-    Properties props = getNonBlockingRouterProperties("DC1");
-    VerifiableProperties verifiableProperties = new VerifiableProperties((props));
-    MockClusterMap mockClusterMap = new MockClusterMap();
-    MockTime mockTime = new MockTime();
-    MockServerLayout mockServerLayout = new MockServerLayout(mockClusterMap);
     String deleteServiceId = "delete-service";
     // metadata blob + data chunks.
     final AtomicInteger deletesInitiated = new AtomicInteger();
@@ -630,11 +642,8 @@ public class NonBlockingRouterTest {
         receivedDeleteServiceId.set(serviceId);
       }
     };
-    NonBlockingRouterMetrics localMetrics = new NonBlockingRouterMetrics(mockClusterMap);
-    router = new NonBlockingRouter(new RouterConfig(verifiableProperties), localMetrics,
-        new MockNetworkClientFactory(verifiableProperties, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
-            CHECKOUT_TIMEOUT_MS, mockServerLayout, mockTime), deleteTrackingNotificationSystem, mockClusterMap, kms,
-        cryptoService, cryptoJobHandler, accountService, mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
+    Properties props = getNonBlockingRouterProperties("DC1");
+    setRouter(props, new MockServerLayout(mockClusterMap), deleteTrackingNotificationSystem);
     setOperationParams();
     String blobId =
         router.putBlob(putBlobProperties, putUserMetadata, putChannel, new PutBlobOptionsBuilder().build()).get();
@@ -648,7 +657,7 @@ public class NonBlockingRouterTest {
     Assert.assertEquals("Only the original blob deletion should have been initiated", 1, deletesInitiated.get());
     Assert.assertEquals("The delete service ID should match the expected value", deleteServiceId,
         receivedDeleteServiceId.get());
-    Assert.assertEquals("Get should have been skipped", 1, localMetrics.skippedGetBlobCount.getCount());
+    Assert.assertEquals("Get should have been skipped", 1, routerMetrics.skippedGetBlobCount.getCount());
     router.close();
     assertClosed();
     Assert.assertEquals("All operations should have completed", 0, router.getOperationsCount());
@@ -719,8 +728,8 @@ public class NonBlockingRouterTest {
         // Fetch the stitched blob
         GetBlobResult getBlobResult = router.getBlob(stitchedBlobId, new GetBlobOptionsBuilder().build())
             .get(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-        assertTrue("Blob properties must be the same",
-            RouterTestHelpers.arePersistedFieldsEquivalent(putBlobProperties, getBlobResult.getBlobInfo().getBlobProperties()));
+        assertTrue("Blob properties must be the same", RouterTestHelpers.arePersistedFieldsEquivalent(putBlobProperties,
+            getBlobResult.getBlobInfo().getBlobProperties()));
         assertEquals("Unexpected blob size", expectedContent.length,
             getBlobResult.getBlobInfo().getBlobProperties().getBlobSize());
         assertArrayEquals("User metadata must be the same", putUserMetadata,
@@ -839,6 +848,22 @@ public class NonBlockingRouterTest {
   }
 
   /**
+   * Test that Response Handler correctly handles disconnected connections after warming up.
+   */
+  @Test
+  public void testWarmUpConnectionFailureHandling() throws Exception {
+    Properties props = getNonBlockingRouterProperties("DC3");
+    MockServerLayout mockServerLayout = new MockServerLayout(mockClusterMap);
+    mockSelectorState.set(MockSelectorState.FailConnectionInitiationOnPoll);
+    setRouter(props, mockServerLayout, new LoggingNotificationSystem());
+    for (DataNodeId node : mockClusterMap.getDataNodes()) {
+      assertTrue("Node should be marked as timed out by ResponseHandler.", ((MockDataNodeId) node).isTimedOut());
+    }
+    router.close();
+    mockSelectorState.set(MockSelectorState.Good);
+  }
+
+  /**
    * Response handling related tests for all operation managers.
    */
   @Test
@@ -879,13 +904,13 @@ public class NonBlockingRouterTest {
       mockServer.setServerErrorForAllRequests(ServerErrorCode.No_Error);
     }
 
-    NetworkClient networkClient =
+    SocketNetworkClient networkClient =
         new MockNetworkClientFactory(verifiableProperties, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, mockServerLayout, mockTime).getNetworkClient();
     cryptoJobHandler = new CryptoJobHandler(CryptoJobHandlerTest.DEFAULT_THREAD_COUNT);
     KeyManagementService localKMS = new MockKeyManagementService(new KMSConfig(verifiableProperties), singleKeyForKMS);
     putManager = new PutManager(mockClusterMap, mockResponseHandler, new LoggingNotificationSystem(),
-        new RouterConfig(verifiableProperties), new NonBlockingRouterMetrics(mockClusterMap),
+        new RouterConfig(verifiableProperties), new NonBlockingRouterMetrics(mockClusterMap, null),
         new RouterCallback(networkClient, new ArrayList<>()), "0", localKMS, cryptoService, cryptoJobHandler,
         accountService, mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
     OperationHelper opHelper = new OperationHelper(OperationType.PUT);
@@ -902,7 +927,7 @@ public class NonBlockingRouterTest {
 
     opHelper = new OperationHelper(OperationType.GET);
     getManager = new GetManager(mockClusterMap, mockResponseHandler, new RouterConfig(verifiableProperties),
-        new NonBlockingRouterMetrics(mockClusterMap),
+        new NonBlockingRouterMetrics(mockClusterMap, null),
         new RouterCallback(networkClient, new ArrayList<BackgroundDeleteRequest>()), localKMS, cryptoService,
         cryptoJobHandler, mockTime);
     testFailureDetectorNotification(opHelper, networkClient, failedReplicaIds, blobId, successfulResponseCount,
@@ -919,7 +944,7 @@ public class NonBlockingRouterTest {
     opHelper = new OperationHelper(OperationType.DELETE);
     deleteManager =
         new DeleteManager(mockClusterMap, mockResponseHandler, accountService, new LoggingNotificationSystem(),
-            new RouterConfig(verifiableProperties), new NonBlockingRouterMetrics(mockClusterMap),
+            new RouterConfig(verifiableProperties), new NonBlockingRouterMetrics(mockClusterMap, null),
             new RouterCallback(null, new ArrayList<BackgroundDeleteRequest>()), mockTime);
     testFailureDetectorNotification(opHelper, networkClient, failedReplicaIds, blobId, successfulResponseCount,
         invalidResponse, -1);
@@ -940,7 +965,7 @@ public class NonBlockingRouterTest {
    * Test that failure detector is correctly notified for all responses regardless of the order in which successful
    * and failed responses arrive.
    * @param opHelper the {@link OperationHelper}
-   * @param networkClient the {@link NetworkClient}
+   * @param networkClient the {@link SocketNetworkClient}
    * @param failedReplicaIds the list that will contain all the replicas for which failure was notified.
    * @param blobId the id of the blob to get/delete. For puts, this will be null.
    * @param successfulResponseCount the AtomicInteger that will contain the count of replicas for which success was
@@ -951,7 +976,7 @@ public class NonBlockingRouterTest {
    *                    If the index is -1, no responses will be failed, and successful responses will be returned to
    *                    the operation managers.
    */
-  private void testFailureDetectorNotification(OperationHelper opHelper, NetworkClient networkClient,
+  private void testFailureDetectorNotification(OperationHelper opHelper, SocketNetworkClient networkClient,
       List<ReplicaId> failedReplicaIds, BlobId blobId, AtomicInteger successfulResponseCount,
       AtomicBoolean invalidResponse, int indexToFail) throws Exception {
     failedReplicaIds.clear();
@@ -961,18 +986,18 @@ public class NonBlockingRouterTest {
     FutureResult futureResult = opHelper.submitOperation(blobId);
     int requestParallelism = opHelper.requestParallelism;
     List<RequestInfo> allRequests = new ArrayList<>();
+    Set<Integer> allDropped = new HashSet<>();
     long loopStartTimeMs = SystemTime.getInstance().milliseconds();
     while (allRequests.size() < requestParallelism) {
       if (loopStartTimeMs + AWAIT_TIMEOUT_MS < SystemTime.getInstance().milliseconds()) {
         Assert.fail("Waited too long for requests.");
       }
-      opHelper.pollOpManager(allRequests);
+      opHelper.pollOpManager(allRequests, allDropped);
     }
-    ReplicaId replicaIdToFail =
-        indexToFail == -1 ? null : ((RouterRequestInfo) allRequests.get(indexToFail)).getReplicaId();
+    ReplicaId replicaIdToFail = indexToFail == -1 ? null : allRequests.get(indexToFail).getReplicaId();
     for (RequestInfo requestInfo : allRequests) {
       ResponseInfo responseInfo;
-      if (replicaIdToFail != null && replicaIdToFail.equals(((RouterRequestInfo) requestInfo).getReplicaId())) {
+      if (replicaIdToFail != null && replicaIdToFail.equals(requestInfo.getReplicaId())) {
         responseInfo = new ResponseInfo(requestInfo, NetworkClientErrorCode.NetworkError, null);
       } else {
         List<RequestInfo> requestInfoListToSend = new ArrayList<>();
@@ -983,21 +1008,23 @@ public class NonBlockingRouterTest {
           if (loopStartTimeMs + AWAIT_TIMEOUT_MS < SystemTime.getInstance().milliseconds()) {
             Assert.fail("Waited too long for the response.");
           }
-          responseInfoList = networkClient.sendAndPoll(requestInfoListToSend, 10);
+          responseInfoList = networkClient.sendAndPoll(requestInfoListToSend, Collections.emptySet(), 10);
           requestInfoListToSend.clear();
         } while (responseInfoList.size() == 0);
         responseInfo = responseInfoList.get(0);
       }
       opHelper.handleResponse(responseInfo);
+      responseInfo.release();
     }
     // Poll once again so that the operation gets a chance to complete.
     allRequests.clear();
     if (testEncryption) {
       opHelper.awaitOpCompletionOrTimeOut(futureResult);
     } else {
-      opHelper.pollOpManager(allRequests);
+      opHelper.pollOpManager(allRequests, allDropped);
     }
     futureResult.get(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+    Assert.assertEquals(0, allDropped.size());
     if (indexToFail == -1) {
       Assert.assertEquals("Successful notification should have arrived for replicas that were up",
           opHelper.requestParallelism, successfulResponseCount.get());
@@ -1029,39 +1056,46 @@ public class NonBlockingRouterTest {
     invalidResponse.set(false);
     FutureResult futureResult = opHelper.submitOperation(blobId);
     List<RequestInfo> allRequests = new ArrayList<>();
+    Set<Integer> allDropped = new HashSet<>();
     long loopStartTimeMs = SystemTime.getInstance().milliseconds();
     while (!futureResult.isDone()) {
       if (loopStartTimeMs + AWAIT_TIMEOUT_MS < SystemTime.getInstance().milliseconds()) {
         Assert.fail("Waited too long for requests.");
       }
-      opHelper.pollOpManager(allRequests);
+      opHelper.pollOpManager(allRequests, allDropped);
       mockTime.sleep(REQUEST_TIMEOUT_MS + 1);
     }
+    System.out.println(allDropped);
     Assert.assertEquals("Successful notification should not have arrived for replicas that were up", 0,
         successfulResponseCount.get());
     Assert.assertEquals("Failure detector should not have been notified", 0, failedReplicaIds.size());
     Assert.assertFalse("There should be no notifications of any other kind", invalidResponse.get());
+    Set<Integer> allCorrelationIds = allRequests.stream()
+        .map(requestInfo -> requestInfo.getRequest().getCorrelationId())
+        .collect(Collectors.toSet());
+    Assert.assertEquals("Timed out requests should be dropped", allCorrelationIds, new HashSet<>(allDropped));
   }
 
   /**
    * Test that operations succeed even in the presence of responses that are corrupt and fail to deserialize.
    * @param opHelper the {@link OperationHelper}
-   * @param networkClient the {@link NetworkClient}
+   * @param networkClient the {@link SocketNetworkClient}
    * @param blobId the id of the blob to get/delete. For puts, this will be null.
    * @throws Exception
    */
-  private void testResponseDeserializationError(OperationHelper opHelper, NetworkClient networkClient, BlobId blobId)
+  private void testResponseDeserializationError(OperationHelper opHelper, SocketNetworkClient networkClient, BlobId blobId)
       throws Exception {
     mockSelectorState.set(MockSelectorState.Good);
     FutureResult futureResult = opHelper.submitOperation(blobId);
     int requestParallelism = opHelper.requestParallelism;
     List<RequestInfo> allRequests = new ArrayList<>();
+    Set<Integer> allDropped = new HashSet<>();
     long loopStartTimeMs = SystemTime.getInstance().milliseconds();
     while (allRequests.size() < requestParallelism) {
       if (loopStartTimeMs + AWAIT_TIMEOUT_MS < SystemTime.getInstance().milliseconds()) {
         Assert.fail("Waited too long for requests.");
       }
-      opHelper.pollOpManager(allRequests);
+      opHelper.pollOpManager(allRequests, allDropped);
     }
     List<ResponseInfo> responseInfoList = new ArrayList<>();
     loopStartTimeMs = SystemTime.getInstance().milliseconds();
@@ -1069,21 +1103,22 @@ public class NonBlockingRouterTest {
       if (loopStartTimeMs + AWAIT_TIMEOUT_MS < SystemTime.getInstance().milliseconds()) {
         Assert.fail("Waited too long for the response.");
       }
-      responseInfoList.addAll(networkClient.sendAndPoll(allRequests, 10));
+      responseInfoList.addAll(networkClient.sendAndPoll(allRequests, allDropped, 10));
       allRequests.clear();
     } while (responseInfoList.size() < requestParallelism);
     // corrupt the first response.
-    ByteBuffer response = responseInfoList.get(0).getResponse();
+    ByteBuffer response = (ByteBuffer) responseInfoList.get(0).getResponse();
     byte b = response.get(response.limit() - 1);
     response.put(response.limit() - 1, (byte) ~b);
     for (ResponseInfo responseInfo : responseInfoList) {
       opHelper.handleResponse(responseInfo);
     }
+    responseInfoList.forEach(ResponseInfo::release);
     allRequests.clear();
     if (testEncryption) {
       opHelper.awaitOpCompletionOrTimeOut(futureResult);
     } else {
-      opHelper.pollOpManager(allRequests);
+      opHelper.pollOpManager(allRequests, allDropped);
     }
     try {
       futureResult.get(AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
@@ -1097,7 +1132,7 @@ public class NonBlockingRouterTest {
    * @param expectedRequestResponseHandlerCount the expected number of ChunkFiller and RequestResponseHandler threads.
    * @param expectedChunkFillerCount the expected number of ChunkFiller threads.
    */
-  private void assertExpectedThreadCounts(int expectedRequestResponseHandlerCount, int expectedChunkFillerCount) {
+  protected void assertExpectedThreadCounts(int expectedRequestResponseHandlerCount, int expectedChunkFillerCount) {
     Assert.assertEquals("Number of RequestResponseHandler threads running should be as expected",
         expectedRequestResponseHandlerCount, TestUtils.numThreadsByThisName("RequestResponseHandlerThread"));
     Assert.assertEquals("Number of chunkFiller threads running should be as expected", expectedChunkFillerCount,
@@ -1113,7 +1148,7 @@ public class NonBlockingRouterTest {
    * Assert that submission after closing the router returns a future that is already done and an appropriate
    * exception.
    */
-  private void assertClosed() {
+  protected void assertClosed() {
     Future<String> future =
         router.putBlob(putBlobProperties, putUserMetadata, putChannel, new PutBlobOptionsBuilder().build());
     Assert.assertTrue(future.isDone());
@@ -1127,7 +1162,7 @@ public class NonBlockingRouterTest {
    *                  perfectly for test to work.
    * @throws Exception
    */
-  private void doTtlUpdateTest(int numChunks) throws Exception {
+  protected void doTtlUpdateTest(int numChunks) throws Exception {
     Assert.assertEquals("This test works only if the number of chunks is a perfect divisor of PUT_CONTENT_SIZE", 0,
         PUT_CONTENT_SIZE % numChunks);
     maxPutChunkSize = PUT_CONTENT_SIZE / numChunks;
@@ -1161,9 +1196,7 @@ public class NonBlockingRouterTest {
   /**
    * Enum for the three operation types.
    */
-  private enum OperationType {
-    PUT, GET, DELETE,
-  }
+  private enum OperationType {PUT, GET, DELETE,}
 
   /**
    * A helper class to abstract away the details about specific operation manager.
@@ -1224,18 +1257,19 @@ public class NonBlockingRouterTest {
 
     /**
      * Poll the associated operation manager.
-     * @param requestInfos the list of {@link RequestInfo} to pass in the poll call.
+     * @param requestsToSend the list of {@link RequestInfo} to send to pass into the poll call.
+     * @param requestsToDrop the list of correlation IDs to drop to pass into the poll call.
      */
-    void pollOpManager(List<RequestInfo> requestInfos) {
+    void pollOpManager(List<RequestInfo> requestsToSend, Set<Integer> requestsToDrop) {
       switch (opType) {
         case PUT:
-          putManager.poll(requestInfos);
+          putManager.poll(requestsToSend, requestsToDrop);
           break;
         case GET:
-          getManager.poll(requestInfos);
+          getManager.poll(requestsToSend, requestsToDrop);
           break;
         case DELETE:
-          deleteManager.poll(requestInfos);
+          deleteManager.poll(requestsToSend, requestsToDrop);
           break;
       }
     }
@@ -1248,11 +1282,13 @@ public class NonBlockingRouterTest {
     private void awaitOpCompletionOrTimeOut(FutureResult futureResult) throws InterruptedException {
       int timer = 0;
       List<RequestInfo> allRequests = new ArrayList<>();
+      Set<Integer> allDropped = new HashSet<>();
       while (timer < AWAIT_TIMEOUT_MS / 2 && !futureResult.completed()) {
-        pollOpManager(allRequests);
+        pollOpManager(allRequests, allDropped);
         Thread.sleep(50);
         timer += 50;
         allRequests.clear();
+        allDropped.clear();
       }
     }
 

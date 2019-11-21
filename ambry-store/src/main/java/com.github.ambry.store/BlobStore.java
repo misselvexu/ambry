@@ -17,6 +17,7 @@ import com.codahale.metrics.Timer;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.clustermap.ReplicaStatusDelegate;
 import com.github.ambry.config.StoreConfig;
+import com.github.ambry.replication.FindToken;
 import com.github.ambry.utils.FileLock;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
@@ -24,6 +25,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -41,7 +43,7 @@ import org.slf4j.LoggerFactory;
 /**
  * The blob store that controls the log and index
  */
-class BlobStore implements Store {
+public class BlobStore implements Store {
   static final String SEPARATOR = "_";
   private final static String LockFile = ".lock";
 
@@ -205,8 +207,8 @@ class BlobStore implements Store {
               StoreErrorCodes.Initialization_Error);
         }
 
-        StoreDescriptor storeDescriptor = new StoreDescriptor(dataDir);
-        log = new Log(dataDir, capacityInBytes, config.storeSegmentSizeInBytes, diskSpaceAllocator, metrics);
+        StoreDescriptor storeDescriptor = new StoreDescriptor(dataDir, config);
+        log = new Log(dataDir, capacityInBytes, diskSpaceAllocator, config, metrics);
         compactor = new BlobStoreCompactor(dataDir, storeId, factory, config, metrics, storeUnderCompactionMetrics,
             diskIOScheduler, diskSpaceAllocator, log, time, sessionId, storeDescriptor.getIncarnationId());
         index = new PersistentIndex(dataDir, storeId, taskScheduler, log, config, factory, recovery, hardDelete,
@@ -682,8 +684,58 @@ class BlobStore implements Store {
         LogSegment.HEADER_SIZE, index.getLogSegmentsNotInJournal(), blobStoreStats);
   }
 
+  /**
+   * Delete files of this store.
+   * This is the last step to remove store from this node. Return swap segments (if any) to reserve pool and delete all
+   * files/dirs associated with this store. This method is invoked by transition in AmbryStateModel (OFFLINE -> DROPPED)
+   */
+  public void deleteStoreFiles() throws StoreException, IOException {
+    // Step 0: ensure the store has been shut down
+    if (started) {
+      throw new IllegalStateException("Store is still started. Deleting store files is not allowed.");
+    }
+    // Step 1: return occupied swap segments (if any) to reserve pool
+    String[] swapSegmentsInUse = compactor.getSwapSegmentsInUse();
+    for (String fileName : swapSegmentsInUse) {
+      logger.info("Returning swap segment {} to reserve pool", fileName);
+      File swapSegmentTempFile = new File(dataDir, fileName);
+      diskSpaceAllocator.free(swapSegmentTempFile, config.storeSegmentSizeInBytes, storeId, true);
+    }
+    // Step 2: if segmented, delete remaining store segments in reserve pool
+    if (log.isLogSegmented()) {
+      logger.info("Deleting remaining segments associated with store {} in reserve pool", storeId);
+      diskSpaceAllocator.deleteAllSegmentsForStoreIds(
+          Collections.singletonList(replicaId.getPartitionId().toPathString()));
+    }
+    // Step 3: delete all files in current store directory
+    logger.info("Deleting store {} directory", storeId);
+    File storeDir = new File(dataDir);
+    try {
+      Utils.deleteFileOrDirectory(storeDir);
+    } catch (Exception e) {
+      throw new IOException("Couldn't delete store directory " + dataDir, e);
+    }
+    logger.info("All files of store {} are deleted", storeId);
+  }
+
+  /**
+   * @return {@link ReplicaStatusDelegate} associated with this store
+   */
+  public ReplicaStatusDelegate getReplicaStatusDelegate() {
+    return replicaStatusDelegate;
+  }
+
   @Override
   public void shutdown() throws StoreException {
+    shutdown(false);
+  }
+
+  /**
+   * Shuts down the store.
+   * @param skipDiskFlush {@code true} should skip any disk flush operations during shutdown. {@code false} otherwise.
+   * @throws StoreException
+   */
+  private void shutdown(boolean skipDiskFlush) throws StoreException {
     long startTimeInMs = time.milliseconds();
     synchronized (storeWriteLock) {
       checkStarted();
@@ -691,8 +743,8 @@ class BlobStore implements Store {
         logger.info("Store : " + dataDir + " shutting down");
         blobStoreStats.close();
         compactor.close(30);
-        index.close();
-        log.close();
+        index.close(skipDiskFlush);
+        log.close(skipDiskFlush);
         metrics.deregisterMetrics(storeId);
         started = false;
       } catch (Exception e) {
@@ -715,7 +767,7 @@ class BlobStore implements Store {
     int count = errorCount.incrementAndGet();
     if (count == config.storeIoErrorCountToTriggerShutdown) {
       logger.error("Shutting down BlobStore {} because IO error count exceeds threshold", storeId);
-      shutdown();
+      shutdown(true);
       metrics.storeIoErrorTriggeredShutdownCount.inc();
     }
   }
@@ -742,16 +794,19 @@ class BlobStore implements Store {
    */
   DiskSpaceRequirements getDiskSpaceRequirements() throws StoreException {
     checkStarted();
-    DiskSpaceRequirements requirements = log.isLogSegmented() ? new DiskSpaceRequirements(log.getSegmentCapacity(),
-        log.getRemainingUnallocatedSegments(), compactor.getSwapSegmentsInUse()) : null;
-    logger.debug("Store {} has disk space requirements: {}", storeId, requirements);
+    DiskSpaceRequirements requirements =
+        log.isLogSegmented() ? new DiskSpaceRequirements(replicaId.getPartitionId().toPathString(),
+            log.getSegmentCapacity(), log.getRemainingUnallocatedSegments(), compactor.getSwapSegmentsInUse().length)
+            : null;
+    logger.info("Store {} has disk space requirements: {}", storeId, requirements);
     return requirements;
   }
 
   /**
    * @return {@code true} if this store has been started successfully.
    */
-  boolean isStarted() {
+  @Override
+  public boolean isStarted() {
     return started;
   }
 

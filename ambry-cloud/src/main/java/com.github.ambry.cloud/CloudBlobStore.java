@@ -14,13 +14,14 @@
 package com.github.ambry.cloud;
 
 import com.codahale.metrics.Timer;
+import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.config.CloudConfig;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.replication.FindToken;
 import com.github.ambry.store.FindInfo;
-import com.github.ambry.store.FindToken;
 import com.github.ambry.store.MessageInfo;
 import com.github.ambry.store.MessageWriteSet;
 import com.github.ambry.store.Store;
@@ -32,14 +33,20 @@ import com.github.ambry.store.StoreKey;
 import com.github.ambry.store.StoreStats;
 import com.github.ambry.store.Write;
 import com.github.ambry.utils.ByteBufferInputStream;
+import com.github.ambry.utils.ByteBufferOutputStream;
 import com.github.ambry.utils.Utils;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.ReadableByteChannel;
 import java.security.GeneralSecurityException;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -56,11 +63,17 @@ import static com.github.ambry.cloud.CloudBlobMetadata.*;
 class CloudBlobStore implements Store {
 
   private static final Logger logger = LoggerFactory.getLogger(CloudBlobStore.class);
+  private static final int cacheInitialCapacity = 1000;
+  private static final float cacheLoadFactor = 0.75f;
   private final PartitionId partitionId;
   private final CloudDestination cloudDestination;
+  private final ClusterMap clusterMap;
   private final CloudBlobCryptoAgentFactory cryptoAgentFactory;
   private final CloudBlobCryptoAgent cryptoAgent;
   private final VcrMetrics vcrMetrics;
+
+  // Map blobId to state (created, ttlUpdated, deleted)
+  private final Map<String, BlobState> recentBlobCache;
   private final long minTtlMillis;
   private final boolean requireEncryption;
   private boolean started;
@@ -70,19 +83,21 @@ class CloudBlobStore implements Store {
    * @param properties the {@link VerifiableProperties} to use.
    * @param partitionId partition associated with BlobStore.
    * @param cloudDestination the {@link CloudDestination} to use.
+   * @param clusterMap the {@link ClusterMap} to use.
    * @param vcrMetrics the {@link VcrMetrics} to use.
    * @throws IllegalStateException if construction failed.
    */
   CloudBlobStore(VerifiableProperties properties, PartitionId partitionId, CloudDestination cloudDestination,
-      VcrMetrics vcrMetrics) throws IllegalStateException {
-
+      ClusterMap clusterMap, VcrMetrics vcrMetrics) throws IllegalStateException {
     CloudConfig cloudConfig = new CloudConfig(properties);
     ClusterMapConfig clusterMapConfig = new ClusterMapConfig(properties);
+    this.clusterMap = clusterMap;
     this.cloudDestination = Objects.requireNonNull(cloudDestination, "cloudDestination is required");
     this.partitionId = Objects.requireNonNull(partitionId, "partitionId is required");
     this.vcrMetrics = Objects.requireNonNull(vcrMetrics, "vcrMetrics is required");
     minTtlMillis = TimeUnit.DAYS.toMillis(cloudConfig.vcrMinTtlDays);
     requireEncryption = cloudConfig.vcrRequireEncryption;
+    recentBlobCache = Collections.synchronizedMap(new RecentBlobCache(cloudConfig.recentBlobCacheLimit));
 
     String cryptoAgentFactoryClass = cloudConfig.cloudBlobCryptoAgentFactoryClass;
     try {
@@ -95,13 +110,122 @@ class CloudBlobStore implements Store {
   }
 
   @Override
-  public void start() throws StoreException {
+  public void start() {
     started = true;
   }
 
   @Override
   public StoreInfo get(List<? extends StoreKey> ids, EnumSet<StoreGetOptions> storeGetOptions) throws StoreException {
-    throw new UnsupportedOperationException("Method not supported");
+    checkStarted();
+    checkDuplicates(ids);
+    List<CloudMessageReadSet.BlobReadInfo> blobReadInfos = new ArrayList<>(ids.size());
+    List<MessageInfo> messageInfos = new ArrayList<>(ids.size());
+    try {
+      List<BlobId> blobIdList = ids.stream().map(key -> (BlobId) key).collect(Collectors.toList());
+      Map<String, CloudBlobMetadata> cloudBlobMetadataListMap = cloudDestination.getBlobMetadata(blobIdList);
+      if (cloudBlobMetadataListMap.size() < blobIdList.size()) {
+        Set<BlobId> missingBlobs = blobIdList.stream()
+            .filter(blobId -> !cloudBlobMetadataListMap.containsKey(blobId))
+            .collect(Collectors.toSet());
+        throw new StoreException("Some of the keys were missing in the cloud metadata store: " + missingBlobs,
+            StoreErrorCodes.ID_Not_Found);
+      }
+      long currentTimeStamp = System.currentTimeMillis();
+      validateCloudMetadata(cloudBlobMetadataListMap, storeGetOptions, currentTimeStamp);
+      for (BlobId blobId : blobIdList) {
+        CloudBlobMetadata blobMetadata = cloudBlobMetadataListMap.get(blobId.getID());
+        // TODO: need to add ttlUpdated to CloudBlobMetadata so we can use it here
+        // For now, set ttlUpdated = true for all permanent blobs, so the correct ttl
+        // is applied by GetOperation.
+        boolean ttlUpdated = blobMetadata.getExpirationTime() == Utils.Infinite_Time;
+        boolean deleted = blobMetadata.getDeletionTime() != Utils.Infinite_Time;
+        MessageInfo messageInfo =
+            new MessageInfo(blobId, blobMetadata.getSize(), deleted, ttlUpdated, blobMetadata.getExpirationTime(),
+                (short) blobMetadata.getAccountId(), (short) blobMetadata.getContainerId(),
+                getOperationTime(blobMetadata));
+        messageInfos.add(messageInfo);
+        blobReadInfos.add(new CloudMessageReadSet.BlobReadInfo(blobMetadata, blobId));
+      }
+    } catch (CloudStorageException e) {
+      throw new StoreException(e, StoreErrorCodes.IOError);
+    }
+    CloudMessageReadSet messageReadSet = new CloudMessageReadSet(blobReadInfos, this);
+    return new StoreInfo(messageReadSet, messageInfos);
+  }
+
+  /**
+   * Download the blob corresponding to the {@code blobId} from the {@code CloudDestination} to the given {@code outputStream}
+   * If the blob was encrypted by vcr during upload, then this method also decrypts it.
+   * @param cloudBlobMetadata blob metadata to determine if the blob was encrypted by vcr during upload.
+   * @param blobId Id of the blob to the downloaded.
+   * @param outputStream {@code OutputStream} of the donwloaded blob.
+   * @throws StoreException if there is an error in downloading the blob.
+   */
+  void downloadBlob(CloudBlobMetadata cloudBlobMetadata, BlobId blobId, OutputStream outputStream)
+      throws StoreException {
+    try {
+      // TODO: for GET ops, avoid extra trip to fetch metadata unless config flag is set
+      // TODO: if needed, fetch metadata here and check encryption
+      if (cloudBlobMetadata.getEncryptionOrigin().equals(EncryptionOrigin.VCR)) {
+        ByteBuffer encryptedBlob = ByteBuffer.allocate((int) cloudBlobMetadata.getEncryptedSize());
+        cloudDestination.downloadBlob(blobId, new ByteBufferOutputStream(encryptedBlob));
+        ByteBuffer decryptedBlob = cryptoAgent.decrypt(encryptedBlob);
+        outputStream.write(decryptedBlob.array());
+      } else {
+        cloudDestination.downloadBlob(blobId, outputStream);
+      }
+    } catch (CloudStorageException | GeneralSecurityException | IOException e) {
+      throw new StoreException("Error occured in downloading blob for blobid :" + blobId, StoreErrorCodes.IOError);
+    }
+  }
+
+  /**
+   * validate the {@code CloudBlobMetadata} map to make sure it has metadata for all keys, and they meet the {@code storeGetOptions} requirements.
+   * @param cloudBlobMetadataListMap
+   * @throws StoreException if the {@code CloudBlobMetadata} isnt valid
+   */
+  private void validateCloudMetadata(Map<String, CloudBlobMetadata> cloudBlobMetadataListMap,
+      EnumSet<StoreGetOptions> storeGetOptions, long currentTimestamp) throws StoreException {
+    for (String key : cloudBlobMetadataListMap.keySet()) {
+      if (isBlobDeleted(cloudBlobMetadataListMap.get(key)) && !storeGetOptions.contains(
+          StoreGetOptions.Store_Include_Deleted)) {
+        throw new StoreException("Id " + key + " has been deleted on the cloud", StoreErrorCodes.ID_Deleted);
+      }
+      if (isBlobExpired(cloudBlobMetadataListMap.get(key), currentTimestamp) && !storeGetOptions.contains(
+          StoreGetOptions.Store_Include_Expired)) {
+        throw new StoreException("Id " + key + " has expired on the cloud", StoreErrorCodes.TTL_Expired);
+      }
+    }
+  }
+
+  /**
+   * Gets the operation time for a blob from blob metadata based on the blob's current state and timestamp recorded for that state.
+   * @param metadata blob metadata from which to derive operation time.
+   * @return operation time.
+   */
+  private long getOperationTime(CloudBlobMetadata metadata) {
+    if (isBlobDeleted(metadata)) {
+      return metadata.getDeletionTime();
+    }
+    return (metadata.getCreationTime() == Utils.Infinite_Time) ? metadata.getUploadTime() : metadata.getCreationTime();
+  }
+
+  /**
+   * Check if the blob is marked for deletion in its metadata
+   * @param metadata to check for deletion
+   * @return true if deleted. false otherwise
+   */
+  static boolean isBlobDeleted(CloudBlobMetadata metadata) {
+    return metadata.getDeletionTime() != Utils.Infinite_Time;
+  }
+
+  /**
+   * Check if the blob is expired
+   * @param metadata to check for expiration
+   * @return true if expired. false otherwise
+   */
+  static boolean isBlobExpired(CloudBlobMetadata metadata, long currentTimeStamp) {
+    return metadata.getExpirationTime() != Utils.Infinite_Time && metadata.getExpirationTime() < currentTimeStamp;
   }
 
   @Override
@@ -132,14 +256,21 @@ class CloudBlobStore implements Store {
       String kmsContext = null;
       String cryptoAgentFactoryClass = null;
       EncryptionOrigin encryptionOrigin = isRouterEncrypted ? EncryptionOrigin.ROUTER : EncryptionOrigin.NONE;
+      long encryptedSize = -1;
       if (requireEncryption) {
         if (isRouterEncrypted) {
           // Nothing further needed
         } else {
           // Need to encrypt the buffer before upload
           Timer.Context encryptionTimer = vcrMetrics.blobEncryptionTime.time();
-          messageBuf = cryptoAgent.encrypt(messageBuf);
-          encryptionTimer.stop();
+          try {
+            messageBuf = cryptoAgent.encrypt(messageBuf);
+            encryptedSize = messageBuf.remaining();
+          } catch (GeneralSecurityException ex) {
+            vcrMetrics.blobEncryptionErrorCount.inc();
+          } finally {
+            encryptionTimer.stop();
+          }
           vcrMetrics.blobEncryptionCount.inc();
           encryptionOrigin = EncryptionOrigin.VCR;
           kmsContext = cryptoAgent.getEncryptionContext();
@@ -150,8 +281,14 @@ class CloudBlobStore implements Store {
       }
       CloudBlobMetadata blobMetadata =
           new CloudBlobMetadata(blobId, messageInfo.getOperationTimeMs(), messageInfo.getExpirationTimeInMs(),
-              messageInfo.getSize(), encryptionOrigin, kmsContext, cryptoAgentFactoryClass);
-      cloudDestination.uploadBlob(blobId, size, blobMetadata, new ByteBufferInputStream(messageBuf));
+              messageInfo.getSize(), encryptionOrigin, kmsContext, cryptoAgentFactoryClass, encryptedSize);
+      // If buffer was encrypted, we no longer know its size
+      long bufferlen = (encryptedSize == -1) ? size : encryptedSize;
+      cloudDestination.uploadBlob(blobId, bufferlen, blobMetadata, new ByteBufferInputStream(messageBuf));
+      addToCache(blobId.getID(), BlobState.CREATED);
+    } else {
+      logger.trace("Blob is skipped: {}", messageInfo);
+      vcrMetrics.blobUploadSkippedCount.inc();
     }
   }
 
@@ -174,8 +311,10 @@ class CloudBlobStore implements Store {
     if (messageInfo.isDeleted()) {
       return false;
     }
-
-    // expiration time above threshold
+    if (recentBlobCache.containsKey(messageInfo.getStoreKey().getID())) {
+      return false;
+    }
+    // expiration time above threshold. Expired blobs are blocked by ReplicaThread.
     return (messageInfo.getExpirationTimeInMs() == Utils.Infinite_Time
         || messageInfo.getExpirationTimeInMs() - messageInfo.getOperationTimeMs() >= minTtlMillis);
   }
@@ -188,7 +327,12 @@ class CloudBlobStore implements Store {
     try {
       for (MessageInfo msgInfo : messageSetToDelete.getMessageSetInfo()) {
         BlobId blobId = (BlobId) msgInfo.getStoreKey();
-        cloudDestination.deleteBlob(blobId, msgInfo.getOperationTimeMs());
+        String blobKey = msgInfo.getStoreKey().getID();
+        BlobState blobState = recentBlobCache.get(blobKey);
+        if (blobState != BlobState.DELETED) {
+          cloudDestination.deleteBlob(blobId, msgInfo.getOperationTimeMs());
+          addToCache(blobKey, BlobState.DELETED);
+        }
       }
     } catch (CloudStorageException ex) {
       throw new StoreException(ex, StoreErrorCodes.IOError);
@@ -207,27 +351,92 @@ class CloudBlobStore implements Store {
     // Note: we skipped uploading the blob on PUT record if the TTL was below threshold.
     try {
       for (MessageInfo msgInfo : messageSetToUpdate.getMessageSetInfo()) {
-        BlobId blobId = (BlobId) msgInfo.getStoreKey();
-        cloudDestination.updateBlobExpiration(blobId, msgInfo.getExpirationTimeInMs());
+        // MessageInfo.expirationTimeInMs is not reliable if ttlUpdate is set. See {@code PersistentIndex#findKey()}
+        // and {@code PersistentIndex#markAsPermanent()}. If we change updateTtl to be more flexible, code here will
+        // need to be modified.
+        if (msgInfo.isTtlUpdated()) {
+          BlobId blobId = (BlobId) msgInfo.getStoreKey();
+          BlobState blobState = recentBlobCache.get(blobId.getID());
+          if (blobState == null || blobState == BlobState.CREATED) {
+            cloudDestination.updateBlobExpiration(blobId, Utils.Infinite_Time);
+            addToCache(blobId.getID(), BlobState.TTL_UPDATED);
+          }
+        } else {
+          logger.error("updateTtl() is called but msgInfo.isTtlUpdated is not set. msgInfo: {}", msgInfo);
+          vcrMetrics.updateTtlNotSetError.inc();
+        }
       }
     } catch (CloudStorageException ex) {
       throw new StoreException(ex, StoreErrorCodes.IOError);
     }
   }
 
+  /**
+   * Add a blob state mapping to the recent blob cache.
+   * @param blobKey the blob key to cache.
+   * @param blobState the state of the blob.
+   */
+  // Visible for test
+  void addToCache(String blobKey, BlobState blobState) {
+    recentBlobCache.put(blobKey, blobState);
+  }
+
   @Override
   public FindInfo findEntriesSince(FindToken token, long maxTotalSizeOfEntries) throws StoreException {
-    throw new UnsupportedOperationException("Method not supported");
+    CloudFindToken inputToken = (CloudFindToken) token;
+    try {
+      List<CloudBlobMetadata> results =
+          cloudDestination.findEntriesSince(partitionId.toPathString(), inputToken, maxTotalSizeOfEntries);
+      if (results.isEmpty()) {
+        return new FindInfo(Collections.emptyList(), inputToken);
+      }
+      List<MessageInfo> messageEntries = new ArrayList<>();
+      for (CloudBlobMetadata metadata : results) {
+        messageEntries.add(getMessageInfoFromMetadata(metadata));
+      }
+      // Build the new find token from the original one and the query results
+      CloudFindToken outputToken = CloudFindToken.getUpdatedToken(inputToken, results);
+      return new FindInfo(messageEntries, outputToken);
+    } catch (CloudStorageException | IOException ex) {
+      throw new StoreException(ex, StoreErrorCodes.IOError);
+    }
+  }
+
+  /**
+   * Create {@link MessageInfo} object from {@link CloudBlobMetadata} object.
+   * @param metadata {@link CloudBlobMetadata} object.
+   * @return {@link MessageInfo} object.
+   * @throws IOException
+   */
+  private MessageInfo getMessageInfoFromMetadata(CloudBlobMetadata metadata) throws IOException {
+    BlobId blobId = new BlobId(metadata.getId(), clusterMap);
+    long operationTime = (metadata.getDeletionTime() > 0) ? metadata.getDeletionTime()
+        : (metadata.getCreationTime() > 0) ? metadata.getCreationTime() : metadata.getUploadTime();
+    boolean isDeleted = metadata.getDeletionTime() > 0;
+    boolean isTtlUpdated = false;  // No way to know
+    return new MessageInfo(blobId, metadata.getSize(), isDeleted, isTtlUpdated, metadata.getExpirationTime(),
+        (short) metadata.getAccountId(), (short) metadata.getContainerId(), operationTime);
   }
 
   @Override
   public Set<StoreKey> findMissingKeys(List<StoreKey> keys) throws StoreException {
     checkStarted();
     // Check existence of keys in cloud metadata
-    List<BlobId> blobIdList = keys.stream().map(key -> (BlobId) key).collect(Collectors.toList());
+    List<BlobId> blobIdQueryList = keys.stream()
+        .filter(key -> !recentBlobCache.containsKey(key.getID()))
+        .map(key -> (BlobId) key)
+        .collect(Collectors.toList());
+    if (blobIdQueryList.isEmpty()) {
+      // Cool, the cache did its job and eliminated a Cosmos query!
+      return Collections.emptySet();
+    }
     try {
-      Set<String> foundSet = cloudDestination.getBlobMetadata(blobIdList).keySet();
-      return keys.stream().filter(key -> !foundSet.contains(key.getID())).collect(Collectors.toSet());
+      Set<String> foundSet = cloudDestination.getBlobMetadata(blobIdQueryList).keySet();
+      // return input keys - cached keys - keys returned by query
+      return keys.stream()
+          .filter(key -> !foundSet.contains(key.getID()))
+          .filter(key -> !recentBlobCache.containsKey(key.getID()))
+          .collect(Collectors.toSet());
     } catch (CloudStorageException ex) {
       throw new StoreException(ex, StoreErrorCodes.IOError);
     }
@@ -241,10 +450,8 @@ class CloudBlobStore implements Store {
   @Override
   public boolean isKeyDeleted(StoreKey key) throws StoreException {
     checkStarted();
-    // Return false for now, because we don't track recently deleted keys
-    // This way, the replica thread will replay the delete resulting in a no-op
-    // TODO: Consider LRU cache of recently deleted keys
-    return false;
+    // Not definitive, but okay for some deletes to be replayed.
+    return (BlobState.DELETED == recentBlobCache.get(key.getID()));
   }
 
   @Override
@@ -260,7 +467,13 @@ class CloudBlobStore implements Store {
 
   @Override
   public void shutdown() {
+    recentBlobCache.clear();
     started = false;
+  }
+
+  @Override
+  public boolean isStarted() {
+    return started;
   }
 
   private void checkStarted() throws StoreException {
@@ -274,14 +487,24 @@ class CloudBlobStore implements Store {
    * @param writeSet the {@link MessageWriteSet} to detect duplicates in
    * @throws IllegalArgumentException if a duplicate is detected
    */
-  private void checkDuplicates(MessageWriteSet writeSet) {
+  private void checkDuplicates(MessageWriteSet writeSet) throws IllegalArgumentException {
     List<MessageInfo> infos = writeSet.getMessageSetInfo();
-    if (infos.size() > 1) {
+    List<StoreKey> keys = infos.stream().map(info -> info.getStoreKey()).collect(Collectors.toList());
+    checkDuplicates(keys);
+  }
+
+  /**
+   * Detects duplicates in {@code keys}
+   * @param keys list of {@link StoreKey} to detect duplicates in
+   * @throws IllegalArgumentException if a duplicate is detected
+   */
+  private void checkDuplicates(List<? extends StoreKey> keys) throws IllegalArgumentException {
+    if (keys.size() > 1) {
+      new HashSet<>();
       Set<StoreKey> seenKeys = new HashSet<>();
-      for (MessageInfo info : infos) {
-        if (!seenKeys.add(info.getStoreKey())) {
-          throw new IllegalArgumentException("WriteSet contains duplicates. Duplicate detected: " + info.getStoreKey());
-        }
+      Set<StoreKey> duplicates = keys.stream().filter(key -> !seenKeys.add(key)).collect(Collectors.toSet());
+      if (duplicates.size() > 0) {
+        throw new IllegalArgumentException("list contains duplicates. Duplicates detected: " + duplicates);
       }
     }
   }
@@ -291,6 +514,10 @@ class CloudBlobStore implements Store {
     return "PartitionId: " + partitionId.toPathString() + " in the cloud";
   }
 
+  /** The lifecycle state of a recently seen blob. */
+  enum BlobState {CREATED, TTL_UPDATED, DELETED}
+
+  /** A {@link Write} implementation used by this store to write data. */
   private class CloudWriteChannel implements Write {
     private final CloudBlobStore cloudBlobStore;
     private final List<MessageInfo> messageInfoList;
@@ -325,11 +552,30 @@ class CloudBlobStore implements Store {
           }
           bytesRead += readResult;
         }
+        messageBuf.flip();
         cloudBlobStore.putBlob(messageInfo, messageBuf, size);
         messageIndex++;
       } catch (IOException | CloudStorageException | GeneralSecurityException e) {
         throw new StoreException(e, StoreErrorCodes.IOError);
       }
+    }
+  }
+
+  /**
+   * A local LRA cache of recent blobs processed by this store.
+   */
+  private class RecentBlobCache extends LinkedHashMap<String, BlobState> {
+    private final int maxEntries;
+
+    public RecentBlobCache(int maxEntries) {
+      // Use access order for eviction
+      super(cacheInitialCapacity, cacheLoadFactor, true);
+      this.maxEntries = maxEntries;
+    }
+
+    @Override
+    protected boolean removeEldestEntry(Map.Entry<String, BlobState> eldest) {
+      return (this.size() > maxEntries);
     }
   }
 }

@@ -40,7 +40,7 @@ public class BoundedByteBufferReceiveTest {
     Assert.assertEquals("Wrong number of bytes read", bufferSize,
         set.readFrom(Channels.newChannel(new ByteBufferInputStream(buffer))));
     buffer.clear();
-    ByteBuffer payload = set.getPayload();
+    ByteBuffer payload = set.getAndRelease();
     for (int i = 8; i < bufferSize; i++) {
       Assert.assertEquals(buffer.array()[i], payload.get());
     }

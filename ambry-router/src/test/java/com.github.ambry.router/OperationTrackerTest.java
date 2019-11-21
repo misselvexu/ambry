@@ -13,13 +13,13 @@
  */
 package com.github.ambry.router;
 
-import com.codahale.metrics.Counter;
-import com.codahale.metrics.Histogram;
-import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.clustermap.MockDataNodeId;
 import com.github.ambry.clustermap.MockPartitionId;
 import com.github.ambry.clustermap.MockReplicaId;
 import com.github.ambry.clustermap.ReplicaId;
+import com.github.ambry.config.RouterConfig;
+import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.network.Port;
 import com.github.ambry.network.PortType;
 import com.github.ambry.utils.MockTime;
@@ -27,10 +27,13 @@ import com.github.ambry.utils.Time;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -66,15 +69,12 @@ public class OperationTrackerTest {
   private MockPartitionId mockPartition;
   private String localDcName;
   private String originatingDcName;
+  private MockClusterMap mockClusterMap;
   private final LinkedList<ReplicaId> inflightReplicas = new LinkedList<>();
   private final Set<ReplicaId> repetitionTracker = new HashSet<>();
 
   // for AdaptiveOperationTracker
   private final Time time = new MockTime();
-  private final MetricRegistry registry = new MetricRegistry();
-  private final Histogram localColoTracker = registry.histogram("LocalColoTracker");
-  private final Histogram crossColoTracker = registry.histogram("CrossColoTracker");
-  private final Counter pastDueCounter = registry.counter("PastDueCounter");
 
   /**
    * Running for both {@link SimpleOperationTracker} and {@link AdaptiveOperationTracker}
@@ -112,13 +112,13 @@ public class OperationTrackerTest {
     // 0-3-0-0; 9-0-0-0
     assertFalse("Operation should not have been done.", ot.isDone());
     for (int i = 0; i < 2; i++) {
-      ot.onResponse(inflightReplicas.poll(), true);
+      ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.SUCCESS);
     }
     // 0-1-2-0; 9-0-0-0
     assertTrue("Operation should have succeeded", ot.hasSucceeded());
     assertTrue("Operation should be done", ot.isDone());
 
-    ot.onResponse(inflightReplicas.poll(), false);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.FAILURE);
     // 0-0-2-1; 9-0-0-0
     assertTrue("Operation should have succeeded", ot.hasSucceeded());
     assertTrue("Operation should be done", ot.isDone());
@@ -141,12 +141,12 @@ public class OperationTrackerTest {
     sendRequests(ot, 3, false);
     // 0-3-0-0; 9-0-0-0
     for (int i = 0; i < 2; i++) {
-      ot.onResponse(inflightReplicas.poll(), false);
+      ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.FAILURE);
     }
     assertFalse("Operation should not have succeeded", ot.hasSucceeded());
     assertTrue("Operation should be done", ot.isDone());
     // 0-1-0-2; 9-0-0-0
-    ot.onResponse(inflightReplicas.poll(), true);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.SUCCESS);
     // 0-0-1-2; 9-0-0-0
     assertFalse("Operation should not have succeeded", ot.hasSucceeded());
     assertTrue("Operation should be done", ot.isDone());
@@ -154,7 +154,6 @@ public class OperationTrackerTest {
 
   /**
    * crossColoEnabled = true, successTarget = 1, parallelism = 2.
-
    * <p/>
    * 1. Get 2 local replicas to send request (and send requests);
    * 2. 1 fails， 1 pending.
@@ -170,14 +169,14 @@ public class OperationTrackerTest {
     sendRequests(ot, 2, false);
     // 1-2-0-0; 9-0-0-0
 
-    ot.onResponse(inflightReplicas.poll(), false);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.FAILURE);
     // 1-1-0-1; 9-0-0-0
     assertFalse("Operation should not have been done.", ot.isDone());
 
     sendRequests(ot, 1, false);
     // 0-2-0-1; 9-0-0-0
     assertFalse("Operation should not be done", ot.isDone());
-    ot.onResponse(inflightReplicas.poll(), true);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.SUCCESS);
     // 0-1-1-1; 9-0-0-0
     assertTrue("Operation should have succeeded", ot.hasSucceeded());
     assertTrue("Operation should be done", ot.isDone());
@@ -185,7 +184,6 @@ public class OperationTrackerTest {
 
   /**
    * crossColoEnabled = true, successTarget = 1, parallelism = 2.
-
    * <p/>
    * 1. Get 2 local replicas to send request (and send requests);
    * 2. 1 local replica fails, 1 pending.
@@ -209,35 +207,35 @@ public class OperationTrackerTest {
     // 1-2-0-0; 9-0-0-0
     ReplicaId id = inflightReplicas.poll();
     assertEquals("First request should have been to local DC", localDcName, id.getDataNodeId().getDatacenterName());
-    ot.onResponse(id, false);
+    ot.onResponse(id, TrackedRequestFinalState.FAILURE);
     // 1-1-0-1; 9-0-0-0
     assertFalse("Operation should not be done", ot.isDone());
     sendRequests(ot, 1, false);
     // 0-2-0-1; 9-0-0-0
     id = inflightReplicas.poll();
     assertEquals("Second request should have been to local DC", localDcName, id.getDataNodeId().getDatacenterName());
-    ot.onResponse(id, false);
+    ot.onResponse(id, TrackedRequestFinalState.FAILURE);
     id = inflightReplicas.poll();
     assertEquals("Third request should have been to local DC", localDcName, id.getDataNodeId().getDatacenterName());
-    ot.onResponse(id, false);
+    ot.onResponse(id, TrackedRequestFinalState.FAILURE);
     // 0-0-0-3; 9-0-0-0
     assertFalse("Operation should not be done", ot.isDone());
     sendRequests(ot, 2, false);
     // 0-0-0-3; 7-2-0-0
     assertFalse("Operation should not be done", ot.isDone());
     for (int i = 0; i < 2; i++) {
-      ot.onResponse(inflightReplicas.poll(), false);
+      ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.FAILURE);
     }
     // 0-0-0-3; 7-0-0-2
     assertFalse("Operation should not be done", ot.isDone());
     sendRequests(ot, 2, false);
     // 0-0-0-3; 5-2-0-2
-    ot.onResponse(inflightReplicas.poll(), false);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.FAILURE);
     assertFalse("Operation should not be done", ot.isDone());
     // 0-0-0-3; 5-1-0-3
     sendRequests(ot, 1, false);
     // 0-0-0-3; 4-1-0-3
-    ot.onResponse(inflightReplicas.poll(), true);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.SUCCESS);
     assertTrue("Operation should have succeeded", ot.hasSucceeded());
     assertTrue("Operation should be done", ot.isDone());
   }
@@ -259,7 +257,7 @@ public class OperationTrackerTest {
     while (!ot.hasSucceeded()) {
       sendRequests(ot, 3, false);
       for (int i = 0; i < 3; i++) {
-        ot.onResponse(inflightReplicas.poll(), true);
+        ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.SUCCESS);
       }
     }
     assertTrue("Operation should have succeeded", ot.hasSucceeded());
@@ -290,16 +288,17 @@ public class OperationTrackerTest {
     mockPartition = new MockPartitionId();
     populateReplicaList(replicaCount);
     localDcName = datanodes.get(0).getDatacenterName();
+    mockClusterMap = new MockClusterMap(false, datanodes, 1, Collections.singletonList(mockPartition), localDcName);
     OperationTracker ot = getOperationTracker(true, 1, 2, true, Integer.MAX_VALUE);
     sendRequests(ot, 2, true);
-    ot.onResponse(inflightReplicas.poll(), false);
-    ot.onResponse(inflightReplicas.poll(), false);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.FAILURE);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.FAILURE);
     assertFalse("Operation should not be done", ot.isDone());
     sendRequests(ot, 1, true);
-    ot.onResponse(inflightReplicas.poll(), false);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.FAILURE);
     assertFalse("Operation should not be done", ot.isDone());
     sendRequests(ot, 1, false);
-    ot.onResponse(inflightReplicas.poll(), true);
+    ot.onResponse(inflightReplicas.poll(), TrackedRequestFinalState.SUCCESS);
     assertTrue("Operation should have succeeded", ot.hasSucceeded());
     assertTrue("Operation should be done", ot.isDone());
   }
@@ -316,6 +315,8 @@ public class OperationTrackerTest {
     datanodes.add(new MockDataNodeId(portList, mountPaths, "dc-0"));
     datanodes.add(new MockDataNodeId(portList, mountPaths, "dc-1"));
     mockPartition = new MockPartitionId();
+    mockClusterMap = new MockClusterMap(false, datanodes, 1, Collections.singletonList(mockPartition),
+        datanodes.get(0).getDatacenterName());
     int replicaCount = 6;
     populateReplicaList(replicaCount);
     // Test scenarios with various number of replicas down
@@ -335,12 +336,12 @@ public class OperationTrackerTest {
     sendRequests(ot, 3, false);
     for (int i = 0; i < 3; i++) {
       ReplicaId replica = inflightReplicas.poll();
-      ot.onResponse(replica, false);
+      ot.onResponse(replica, TrackedRequestFinalState.FAILURE);
     }
     sendRequests(ot, 3, false);
     for (int i = 0; i < 3; i++) {
       ReplicaId replica = inflightReplicas.poll();
-      ot.onResponse(replica, false);
+      ot.onResponse(replica, TrackedRequestFinalState.FAILURE);
     }
     assertEquals("Should have 0 replica in flight.", 0, inflightReplicas.size());
     assertFalse("Operation should have not succeeded", ot.hasSucceeded());
@@ -348,7 +349,7 @@ public class OperationTrackerTest {
     sendRequests(ot, 3, false);
     for (int i = 0; i < 3; i++) {
       ReplicaId replica = inflightReplicas.poll();
-      ot.onResponse(replica, true);
+      ot.onResponse(replica, TrackedRequestFinalState.SUCCESS);
     }
     assertEquals("Should have 0 replica in flight.", 0, inflightReplicas.size());
     assertTrue("Operation should have succeeded", ot.hasSucceeded());
@@ -366,7 +367,7 @@ public class OperationTrackerTest {
     sendRequests(ot, 3, false);
     for (int i = 0; i < 3; i++) {
       ReplicaId replica = inflightReplicas.poll();
-      ot.onResponse(replica, true);
+      ot.onResponse(replica, TrackedRequestFinalState.SUCCESS);
       assertEquals("Should be originating DC", originatingDcName, replica.getDataNodeId().getDatacenterName());
     }
     assertEquals("Should have 0 replica in flight.", 0, inflightReplicas.size());
@@ -385,14 +386,15 @@ public class OperationTrackerTest {
     sendRequests(ot, 6, false);
     for (int i = 0; i < 3; i++) {
       ReplicaId replica = inflightReplicas.poll();
-      ot.onResponse(replica, false); // fail first 3 requests to local
+      // fail first 3 requests to local
+      ot.onResponse(replica, TrackedRequestFinalState.FAILURE);
       assertEquals("Should be local DC", localDcName, replica.getDataNodeId().getDatacenterName());
     }
     assertFalse("Operation should have not succeeded", ot.hasSucceeded());
 
     for (int i = 0; i < 3; i++) {
       ReplicaId replica = inflightReplicas.poll();
-      ot.onResponse(replica, true);
+      ot.onResponse(replica, TrackedRequestFinalState.SUCCESS);
       assertEquals("Should be originating DC", originatingDcName, replica.getDataNodeId().getDatacenterName());
     }
     assertEquals("Should have 0 replica in flight.", 0, inflightReplicas.size());
@@ -413,18 +415,92 @@ public class OperationTrackerTest {
     assertEquals("Should have 6 replicas", 6, inflightReplicas.size());
     for (int i = 0; i < 3; i++) {
       ReplicaId replica = inflightReplicas.poll();
-      ot.onResponse(replica, false); // fail first 3 requests to local replicas
+      // fail first 3 requests to local replicas
+      ot.onResponse(replica, TrackedRequestFinalState.FAILURE);
       assertEquals("Should be local DC", localDcName, replica.getDataNodeId().getDatacenterName());
     }
     assertFalse("Operation should have not succeeded", ot.hasSucceeded());
 
     for (int i = 0; i < 3; i++) {
       ReplicaId replica = inflightReplicas.poll();
-      ot.onResponse(replica, true);
+      ot.onResponse(replica, TrackedRequestFinalState.SUCCESS);
       assertEquals("Should be originating DC", originatingDcName, replica.getDataNodeId().getDatacenterName());
     }
     assertEquals("Should have 0 replica in flight.", 0, inflightReplicas.size());
     assertTrue("Operation should have succeeded", ot.hasSucceeded());
+    assertTrue("Operation should be done", ot.isDone());
+  }
+
+  /**
+   * Test the case when NotFound Error should be disabled since the cross colo is disabled.
+   */
+  @Test
+  public void blobNotFoundInOriginDcAndCrossColoDisabledTest() {
+    initialize();
+    originatingDcName = datanodes.get(datanodes.size() - 1).getDatacenterName();
+    OperationTracker ot = getOperationTracker(false, 1, 3, false, Integer.MAX_VALUE);
+    sendRequests(ot, 3, false);
+    assertEquals("Should have 3 replicas", 3, inflightReplicas.size());
+    for (int i = 0; i < 3; i++) {
+      ReplicaId replica = inflightReplicas.poll();
+      // fail first 3 requests to local replicas
+      ot.onResponse(replica, TrackedRequestFinalState.NOT_FOUND);
+      assertEquals("Should be local DC", localDcName, replica.getDataNodeId().getDatacenterName());
+    }
+    assertFalse("Operation should have not succeeded", ot.hasSucceeded());
+    assertFalse("Operation should have not failed on NOT_FOUND", ot.hasFailedOnNotFound());
+    assertTrue("Operation should be done", ot.isDone());
+  }
+
+  /**
+   * Test the case when NotFound Error should be disabled since the origin DC is unknown.
+   */
+  @Test
+  public void originDcNotFoundUnknownOriginDcTest() {
+    initialize();
+    originatingDcName = null;
+    OperationTracker ot = getOperationTracker(true, 1, 12, false, Integer.MAX_VALUE);
+    sendRequests(ot, 12, false);
+    assertEquals("Should have 12 replicas", 12, inflightReplicas.size());
+    for (int i = 0; i < 12; i++) {
+      ReplicaId replica = inflightReplicas.poll();
+      // fail first 3 requests to local replicas
+      ot.onResponse(replica, TrackedRequestFinalState.NOT_FOUND);
+    }
+    assertFalse("Operation should have not succeeded", ot.hasSucceeded());
+    assertFalse("Operation should have not failed on NOT_FOUND", ot.hasFailedOnNotFound());
+    assertTrue("Operation should be done", ot.isDone());
+  }
+
+  /**
+   * Test the case when NotFound Error triggered.
+   */
+  @Test
+  public void originDcNotFoundTriggeredTest() {
+    initialize();
+    originatingDcName = datanodes.get(datanodes.size() - 1).getDatacenterName();
+    OperationTracker ot = getOperationTracker(true, 2, 3, true, Integer.MAX_VALUE);
+    sendRequests(ot, 3, false);
+    assertEquals("Should have 3 replicas", 3, inflightReplicas.size());
+    for (int i = 0; i < 3; i++) {
+      ReplicaId replica = inflightReplicas.poll();
+      // fail first 3 requests to local replicas
+      ot.onResponse(replica, TrackedRequestFinalState.NOT_FOUND);
+    }
+    assertFalse("Operation should have not succeeded", ot.hasSucceeded());
+    assertFalse("Operation should have not failed on NOT_FOUND", ot.hasFailedOnNotFound());
+    assertFalse("Operation should be done", ot.isDone());
+
+    sendRequests(ot, 3, false);
+    assertEquals("Should have 3 replicas", 3, inflightReplicas.size());
+    // Only send two not found response, it will terminate the operation.
+    for (int i = 0; i < 2; i++) {
+      ReplicaId replica = inflightReplicas.poll();
+      // fail first 3 requests to local replicas
+      ot.onResponse(replica, TrackedRequestFinalState.NOT_FOUND);
+      assertEquals("Should be originatingDcName DC", originatingDcName, replica.getDataNodeId().getDatacenterName());
+    }
+    assertTrue("Operation should have failed on NOT_FOUND", ot.hasFailedOnNotFound());
     assertTrue("Operation should be done", ot.isDone());
   }
 
@@ -459,19 +535,66 @@ public class OperationTrackerTest {
   }
 
   /**
+   * Test that operation tracker can correctly populate parameters(i.e. successTarget) based on input {@link RouterOperation}.
+   */
+  @Test
+  public void operationClassTest() {
+    Properties props = new Properties();
+    props.setProperty("router.hostname", "localhost");
+    props.setProperty("router.datacenter.name", "dc-0");
+    props.setProperty("router.get.success.target", "1");
+    props.setProperty("router.put.success.target", "2");
+    props.setProperty("router.delete.success.target", "2");
+    props.setProperty("router.ttl.update.success.target", "2");
+    RouterConfig routerConfig = new RouterConfig(new VerifiableProperties(props));
+    initialize();
+    NonBlockingRouterMetrics routerMetrics = new NonBlockingRouterMetrics(mockClusterMap, routerConfig);
+    Map<RouterOperation, Integer> operationAndSuccessTarget = new HashMap<>();
+    operationAndSuccessTarget.put(RouterOperation.GetBlobOperation, 1);
+    operationAndSuccessTarget.put(RouterOperation.GetBlobInfoOperation, 1);
+    operationAndSuccessTarget.put(RouterOperation.PutOperation, 2);
+    operationAndSuccessTarget.put(RouterOperation.DeleteOperation, 2);
+    operationAndSuccessTarget.put(RouterOperation.TtlUpdateOperation, 2);
+    for (Map.Entry<RouterOperation, Integer> entry : operationAndSuccessTarget.entrySet()) {
+      SimpleOperationTracker operationTracker = null;
+      switch (operationTrackerType) {
+        case SIMPLE_OP_TRACKER:
+          operationTracker =
+              new SimpleOperationTracker(routerConfig, entry.getKey(), mockPartition, originatingDcName, true);
+          break;
+        case ADAPTIVE_OP_TRACKER:
+          try {
+            operationTracker = new AdaptiveOperationTracker(routerConfig, routerMetrics, entry.getKey(), mockPartition,
+                originatingDcName, time);
+          } catch (IllegalArgumentException e) {
+            assertTrue("Get operation shouldn't throw any exception in adaptive tracker",
+                entry.getKey() != RouterOperation.GetBlobOperation
+                    && entry.getKey() != RouterOperation.GetBlobInfoOperation);
+          }
+          break;
+      }
+      // ensure the success target matches the number specified for each type of operaiton
+      if (operationTracker != null) {
+        assertEquals("The suggest target doesn't match", (long) entry.getValue(),
+            (operationTracker).getSuccessTarget());
+      }
+    }
+  }
+
+  /**
    * Initialize 4 DCs, each DC has 1 data node, which has 3 replicas.
    */
   private void initialize() {
     int replicaCount = 12;
     List<Port> portList = Collections.singletonList(new Port(PORT, PortType.PLAINTEXT));
     List<String> mountPaths = Collections.singletonList("mockMountPath");
-    datanodes = new ArrayList<>(Arrays.asList(
-        new MockDataNodeId[]{new MockDataNodeId(portList, mountPaths, "dc-0"), new MockDataNodeId(portList, mountPaths,
-            "dc-1"), new MockDataNodeId(portList, mountPaths, "dc-2"), new MockDataNodeId(portList, mountPaths,
-            "dc-3")}));
+    datanodes = new ArrayList<>(Arrays.asList(new MockDataNodeId(portList, mountPaths, "dc-0"),
+        new MockDataNodeId(portList, mountPaths, "dc-1"), new MockDataNodeId(portList, mountPaths, "dc-2"),
+        new MockDataNodeId(portList, mountPaths, "dc-3")));
     mockPartition = new MockPartitionId();
     populateReplicaList(replicaCount);
     localDcName = datanodes.get(0).getDatacenterName();
+    mockClusterMap = new MockClusterMap(false, datanodes, 1, Collections.singletonList(mockPartition), localDcName);
   }
 
   /**
@@ -495,16 +618,31 @@ public class OperationTrackerTest {
    */
   private OperationTracker getOperationTracker(boolean crossColoEnabled, int successTarget, int parallelism,
       boolean includeNonOriginatingDcReplicas, int replicasRequired) {
+    Properties props = new Properties();
+    props.setProperty("router.hostname", "localhost");
+    props.setProperty("router.datacenter.name", localDcName);
+    props.setProperty("router.get.cross.dc.enabled", Boolean.toString(crossColoEnabled));
+    props.setProperty("router.get.success.target", Integer.toString(successTarget));
+    props.setProperty("router.get.request.parallelism", Integer.toString(parallelism));
+    props.setProperty("router.get.include.non.originating.dc.replicas",
+        Boolean.toString(includeNonOriginatingDcReplicas));
+    props.setProperty("router.get.replicas.required", Integer.toString(replicasRequired));
+    props.setProperty("router.latency.tolerance.quantile", Double.toString(QUANTILE));
+    props.setProperty("router.operation.tracker.max.inflight.requests", Integer.toString(parallelism));
+    props.setProperty("router.operation.tracker.terminate.on.not.found.enabled", "true");
+    RouterConfig routerConfig = new RouterConfig(new VerifiableProperties(props));
+    NonBlockingRouterMetrics routerMetrics = new NonBlockingRouterMetrics(mockClusterMap, routerConfig);
     OperationTracker tracker;
     switch (operationTrackerType) {
       case SIMPLE_OP_TRACKER:
-        tracker = new SimpleOperationTracker(localDcName, mockPartition, crossColoEnabled, originatingDcName,
-            includeNonOriginatingDcReplicas, replicasRequired, successTarget, parallelism);
+        tracker =
+            new SimpleOperationTracker(routerConfig, RouterOperation.GetBlobOperation, mockPartition, originatingDcName,
+                true);
         break;
       case ADAPTIVE_OP_TRACKER:
-        tracker = new AdaptiveOperationTracker(localDcName, mockPartition, crossColoEnabled, originatingDcName,
-            includeNonOriginatingDcReplicas, replicasRequired, successTarget, parallelism, time, localColoTracker,
-            crossColoEnabled ? crossColoTracker : null, pastDueCounter, QUANTILE);
+        tracker =
+            new AdaptiveOperationTracker(routerConfig, routerMetrics, RouterOperation.GetBlobOperation, mockPartition,
+                originatingDcName, time);
         break;
       default:
         throw new IllegalArgumentException("Unrecognized operation tracker type - " + operationTrackerType);
