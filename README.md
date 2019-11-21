@@ -1,4 +1,4 @@
-# Ambry
+# Acmedcare+ Ambry
 
 [![Build Status](https://travis-ci.org/linkedin/ambry.svg?branch=master)](https://travis-ci.org/linkedin/ambry) [![codecov.io](https://codecov.io/github/linkedin/ambry/branch/master/graph/badge.svg)](https://codecov.io/github/linkedin/ambry) [![license](https://img.shields.io/github/license/linkedin/ambry.svg)](LICENSE)
 
@@ -23,7 +23,7 @@ Reach out to us at ambrydev@googlegroups.com if you would like us to list a pape
 ##### Step 1: Download the code, build it and prepare for deployment.
 To get the latest code and build it, do
 
-    $ git clone https://github.com/linkedin/ambry.git 
+    $ git clone https://github.com/misselvexu/ambry.git 
     $ cd ambry
     $ ./gradlew allJar
     $ cd target
