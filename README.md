@@ -1,6 +1,9 @@
 # Ambry
 
-[![Build Status](https://travis-ci.org/linkedin/ambry.svg?branch=master)](https://travis-ci.org/linkedin/ambry) [![codecov.io](https://codecov.io/github/linkedin/ambry/branch/master/graph/badge.svg)](https://codecov.io/github/linkedin/ambry) [![license](https://img.shields.io/github/license/linkedin/ambry.svg)](LICENSE)
+[![Build Status](https://travis-ci.com/linkedin/ambry.svg?branch=master)](https://travis-ci.com/linkedin/ambry)
+[![codecov.io](https://codecov.io/github/linkedin/ambry/branch/master/graph/badge.svg)](https://codecov.io/github/linkedin/ambry)
+[ ![Download](https://api.bintray.com/packages/linkedin/maven/ambry/images/download.svg) ](https://bintray.com/linkedin/maven/ambry/_latestVersion)
+[![license](https://img.shields.io/github/license/linkedin/ambry.svg)](LICENSE)
 
 Ambry is a distributed object store that supports storage of trillion of small immutable objects (50K -100K) as well as billions of large objects. It was specifically designed to store and serve media objects in web companies. However, it can be used as a general purpose storage system to store DB backups, search indexes or business reports. The system has the following characterisitics: 
 
@@ -45,7 +48,7 @@ The log will be available at `logs/frontend.log`. Alternately, you can change th
 ##### Step 4: Interact with Ambry !
 We are now ready to store and retrieve data from Ambry. Let us start by storing a simple image. For demonstration purposes, we will use an image `demo.gif` that has been copied into the `target` folder.
 ###### POST
-    $ curl -i -H "x-ambry-blob-size : `wc -c demo.gif | xargs | cut -d" " -f1`" -H "x-ambry-service-id : CUrlUpload"  -H "x-ambry-owner-id : `whoami`" -H "x-ambry-content-type : image/gif" -H "x-ambry-um-description : Demonstration Image" http://localhost:1174/ --data-binary @demo.gif
+    $ curl -i -H "x-ambry-service-id:CUrlUpload"  -H "x-ambry-owner-id:`whoami`" -H "x-ambry-content-type:image/gif" -H "x-ambry-um-description:Demonstration Image" http://localhost:1174/ --data-binary @demo.gif
     HTTP/1.1 201 Created
     Location: AmbryID
     Content-Length: 0

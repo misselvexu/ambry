@@ -14,14 +14,15 @@
 package com.github.ambry.account;
 
 import com.codahale.metrics.Counter;
+import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Histogram;
 import com.codahale.metrics.MetricRegistry;
 
 
 /**
- * {@link HelixAccountService} specific metrics tracking.
+ * {@link AccountService} specific metrics tracking.
  * <p/>
- * Exports metrics that are triggered by the {@link HelixAccountService} to the provided {@link MetricRegistry}.
+ * Exports metrics that are triggered by the {@link AccountService} to the provided {@link MetricRegistry}.
  */
 public class AccountServiceMetrics {
   // Histogram
@@ -38,6 +39,7 @@ public class AccountServiceMetrics {
   public final Counter unrecognizedMessageErrorCount;
   public final Counter notifyAccountDataChangeErrorCount;
   public final Counter updateAccountErrorCount;
+  public final Counter conflictRetryCount;
   public final Counter fetchRemoteAccountErrorCount;
   public final Counter remoteDataCorruptionErrorCount;
   public final Counter backupErrorCount;
@@ -46,8 +48,15 @@ public class AccountServiceMetrics {
   public final Counter accountUpdatesToAmbryServerErrorCount;
   public final Counter accountDeletesToAmbryServerErrorCount;
   public final Counter accountFetchFromAmbryServerErrorCount;
+  public final Counter accountUpdatesToStoreErrorCount;
+  public final Counter getAccountInconsistencyCount;
+
+  Gauge<Integer> accountDataInconsistencyCount;
+
+  private final MetricRegistry metricRegistry;
 
   public AccountServiceMetrics(MetricRegistry metricRegistry) {
+    this.metricRegistry = metricRegistry;
     // Histogram
     startupTimeInMs = metricRegistry.histogram(MetricRegistry.name(HelixAccountService.class, "StartupTimeInMs"));
     updateAccountTimeInMs =
@@ -71,6 +80,9 @@ public class AccountServiceMetrics {
         metricRegistry.counter(MetricRegistry.name(HelixAccountService.class, "NotifyAccountDataChangeErrorCount"));
     updateAccountErrorCount =
         metricRegistry.counter(MetricRegistry.name(HelixAccountService.class, "UpdateAccountErrorCount"));
+    conflictRetryCount = metricRegistry.counter(MetricRegistry.name(HelixAccountService.class, "ConflictRetryCount"));
+    accountUpdatesToStoreErrorCount =
+        metricRegistry.counter(MetricRegistry.name(AbstractAccountService.class, "AccountUpdatesToStoreErrorCount"));
     fetchRemoteAccountErrorCount =
         metricRegistry.counter(MetricRegistry.name(HelixAccountService.class, "FetchRemoteAccountErrorCount"));
     remoteDataCorruptionErrorCount =
@@ -85,5 +97,17 @@ public class AccountServiceMetrics {
         metricRegistry.counter(MetricRegistry.name(HelixAccountService.class, "AccountDeletesToAmbryServerErrorCount"));
     accountFetchFromAmbryServerErrorCount =
         metricRegistry.counter(MetricRegistry.name(HelixAccountService.class, "AccountFetchFromAmbryServerErrorCount"));
+    getAccountInconsistencyCount =
+        metricRegistry.counter(MetricRegistry.name(CompositeAccountService.class, "GetAccountInconsistencyCount"));
+  }
+
+  /**
+   * Tracks the number of accounts different between primary and secondary {@link AccountService}s
+   * @param compositeAccountService instance of {@link CompositeAccountService}
+   */
+  void trackAccountDataInconsistency(CompositeAccountService compositeAccountService) {
+    accountDataInconsistencyCount = compositeAccountService::getAccountsMismatchCount;
+    metricRegistry.register(MetricRegistry.name(CompositeAccountService.class, "AccountDataInconsistencyCount"),
+        accountDataInconsistencyCount);
   }
 }

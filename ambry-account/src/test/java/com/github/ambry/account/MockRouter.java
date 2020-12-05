@@ -17,7 +17,7 @@ import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.ReadableStreamChannelInputStream;
 import com.github.ambry.messageformat.BlobInfo;
 import com.github.ambry.messageformat.BlobProperties;
-import com.github.ambry.router.Callback;
+import com.github.ambry.commons.Callback;
 import com.github.ambry.router.ChunkInfo;
 import com.github.ambry.router.FutureResult;
 import com.github.ambry.router.GetBlobOptions;
@@ -29,7 +29,6 @@ import com.github.ambry.router.RouterErrorCode;
 import com.github.ambry.router.RouterException;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
-import com.github.ambry.utils.UtilsTest;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
@@ -43,7 +42,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-
+// TODO see if this can be removed/replaced with InMemoryRouter
 public class MockRouter implements Router {
   private final static Logger logger = LoggerFactory.getLogger(MockRouter.class);
   private static final Random random = TestUtils.RANDOM;
@@ -107,13 +106,10 @@ public class MockRouter implements Router {
         InputStream input = new ReadableStreamChannelInputStream(channel);
         byte[] bytes = Utils.readBytesFromStream(input, (int) size);
         BlobInfoAndData blob = new BlobInfoAndData(new BlobInfo(blobProperties, userMetadata), bytes);
-        String id = null;
-        while (true) {
-          id = UtilsTest.getRandomString(10);
-          if (allBlobs.putIfAbsent(id, blob) == null) {
-            break;
-          }
-        }
+        String id;
+        do {
+          id = TestUtils.getRandomString(10);
+        } while (allBlobs.putIfAbsent(id, blob) != null);
         future.done(id, null);
         if (callback != null) {
           callback.onCompletion(id, null);
@@ -166,6 +162,11 @@ public class MockRouter implements Router {
   @Override
   public Future<Void> updateBlobTtl(String blobId, String serviceId, long expiresAtMs, Callback<Void> callback) {
     throw new UnsupportedOperationException("updateBlobTtl is not supported by this mock");
+  }
+
+  @Override
+  public Future<Void> undeleteBlob(String blobId, String serviceId, Callback<Void> callback) {
+    throw new UnsupportedOperationException("Undelete is currently unsupported");
   }
 
   /**

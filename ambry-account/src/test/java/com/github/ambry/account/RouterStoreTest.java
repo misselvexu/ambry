@@ -21,6 +21,7 @@ import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.router.GetBlobOptionsBuilder;
 import com.github.ambry.router.RouterErrorCode;
 import com.github.ambry.router.RouterException;
+import com.github.ambry.utils.AccountTestUtils;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
 import java.io.IOException;
@@ -41,7 +42,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.helix.AccessOption;
-import org.apache.helix.ZNRecord;
+import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -84,7 +85,7 @@ public class RouterStoreTest {
     properties.setProperty(HelixAccountServiceConfig.ZK_CLIENT_CONNECT_STRING_KEY, "1000");
     VerifiableProperties verifiableProperties = new VerifiableProperties(properties);
     config = new HelixAccountServiceConfig(verifiableProperties);
-    backup = new BackupFileManager(accountServiceMetrics, config);
+    backup = new BackupFileManager(accountServiceMetrics, config.backupDir, config.maxBackupFileCount);
     helixStore = new MockHelixPropertyStore<>();
     router = new MockRouter();
   }
@@ -113,7 +114,7 @@ public class RouterStoreTest {
   public void testUpdateAndFetch() throws Exception {
     RouterStore store =
         new RouterStore(accountServiceMetrics, backup, helixStore, new AtomicReference<>(router), forBackfill,
-            TOTAL_NUMBER_OF_VERSION_TO_KEEP);
+            TOTAL_NUMBER_OF_VERSION_TO_KEEP, config);
     Map<Short, Account> idToRefAccountMap = new HashMap<>();
     Map<Short, Map<Short, Container>> idtoRefContainerMap = new HashMap<>();
     Set<Short> accountIDSet = new HashSet<>();
@@ -157,7 +158,7 @@ public class RouterStoreTest {
     assumeTrue(!forBackfill);
     RouterStore store =
         new RouterStore(accountServiceMetrics, backup, helixStore, new AtomicReference<>(router), forBackfill,
-            TOTAL_NUMBER_OF_VERSION_TO_KEEP);
+            TOTAL_NUMBER_OF_VERSION_TO_KEEP, config);
     Map<Short, Account> idToRefAccountMap = new HashMap<>();
     Map<Short, Map<Short, Container>> idtoRefContainerMap = new HashMap<>();
     Set<Short> accountIDSet = new HashSet<>();
@@ -185,7 +186,7 @@ public class RouterStoreTest {
   public void testSizeLimitInList() throws Exception {
     RouterStore store =
         new RouterStore(accountServiceMetrics, backup, helixStore, new AtomicReference<>(router), forBackfill,
-            TOTAL_NUMBER_OF_VERSION_TO_KEEP);
+            TOTAL_NUMBER_OF_VERSION_TO_KEEP, config);
 
     Map<Short, Account> idToRefAccountMap = new HashMap<>();
     Map<Short, Map<Short, Container>> idtoRefContainerMap = new HashMap<>();

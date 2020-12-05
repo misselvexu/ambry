@@ -15,6 +15,7 @@ package com.github.ambry.account;
 
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.ReadableStreamChannelInputStream;
+import com.github.ambry.config.HelixAccountServiceConfig;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.router.GetBlobOptionsBuilder;
 import com.github.ambry.router.GetBlobResult;
@@ -38,8 +39,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import org.apache.helix.AccessOption;
-import org.apache.helix.ZNRecord;
 import org.apache.helix.store.HelixPropertyStore;
+import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.apache.zookeeper.data.Stat;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -73,6 +74,7 @@ class RouterStore extends AccountMetadataStore {
   // If forBackFill is true, then when updating the account metadata, we don't create backup files and we don't merge
   // accounts from ambry-server with the provided accounts set.
   private final boolean forBackFill;
+  private final HelixAccountServiceConfig config;
 
   /**
    * Constructor to create the RouterStore.
@@ -85,11 +87,12 @@ class RouterStore extends AccountMetadataStore {
    */
   RouterStore(AccountServiceMetrics accountServiceMetrics, BackupFileManager backupFileManager,
       HelixPropertyStore<ZNRecord> helixStore, AtomicReference<Router> router, boolean forBackFill,
-      int totalNumberOfVersionToKeep) {
+      int totalNumberOfVersionToKeep, HelixAccountServiceConfig config) {
     super(accountServiceMetrics, backupFileManager, helixStore, ACCOUNT_METADATA_BLOB_IDS_PATH);
     this.router = router;
     this.forBackFill = forBackFill;
     this.totalNumberOfVersionToKeep = totalNumberOfVersionToKeep;
+    this.config = config;
   }
 
   @Override
@@ -180,7 +183,7 @@ class RouterStore extends AccountMetadataStore {
    * @return All the versions of {@link Account} metadata.
    */
   public List<Integer> getAllVersions() {
-    List<BlobIDAndVersion> blobIDAndVersions = fetchAllBlobIDAndVersions() ;
+    List<BlobIDAndVersion> blobIDAndVersions = fetchAllBlobIDAndVersions();
     if (blobIDAndVersions == null) {
       return null;
     } else {
@@ -199,12 +202,12 @@ class RouterStore extends AccountMetadataStore {
     if (blobIDAndVersions == null) {
       return null;
     }
-    for (BlobIDAndVersion blobIDAndVersion: blobIDAndVersions) {
+    for (BlobIDAndVersion blobIDAndVersion : blobIDAndVersions) {
       if (blobIDAndVersion.getVersion() == version) {
         return readAccountMetadataFromBlobID(blobIDAndVersion.getBlobID());
       }
     }
-    throw new IllegalArgumentException("Version " + version  + " doesn't exist");
+    throw new IllegalArgumentException("Version " + version + " doesn't exist");
   }
 
   @Override
@@ -329,7 +332,7 @@ class RouterStore extends AccountMetadataStore {
 
         // If there is any conflict with the existing record, fail the update. Exception thrown in this updater will
         // be caught by Helix and helixStore#update will return false.
-        if (localAccountInfoMap.hasConflictingAccount(this.accounts)) {
+        if (localAccountInfoMap.hasConflictingAccount(this.accounts, config.ignoreVersionMismatch)) {
           // Throw exception, so that helixStore can capture and terminate the update operation
           logAndThrowIllegalStateException(
               "Updating accounts failed because one account to update conflicts with existing accounts", null);
@@ -364,8 +367,8 @@ class RouterStore extends AccountMetadataStore {
         while (blobIDAndVersions.size() + 1 > totalNumberOfVersionToKeep) {
           BlobIDAndVersion blobIDAndVersion = iter.next();
           iter.remove();
-          logger.info("Adding blob " + blobIDAndVersion.getBlobID() + " at version " + blobIDAndVersion.getVersion()
-              + " to delete");
+          logger.info("Adding blob {} at version {} to delete", blobIDAndVersion.getBlobID(),
+              blobIDAndVersion.getVersion());
           oldBlobIDsToDelete.add(blobIDAndVersion.getBlobID());
         }
         blobIDAndVersionsJson = blobIDAndVersions.stream().map(BlobIDAndVersion::toJson).collect(Collectors.toList());
@@ -382,11 +385,11 @@ class RouterStore extends AccountMetadataStore {
       if (!isUpdateSucceeded && newBlobID != null) {
         // Delete the ambry blob regardless what error fails the update.
         try {
-          logger.info("Removing blob " + newBlobID + " since the update failed");
+          logger.info("Removing blob {} since the update failed", newBlobID);
           // Block this execution? or maybe wait for a while then get out?
           router.get().deleteBlob(newBlobID, SERVICE_ID).get();
         } catch (Exception e) {
-          logger.error("Failed to delete blob=" + newBlobID, e);
+          logger.error("Failed to delete blob={}", newBlobID, e);
           accountServiceMetrics.accountDeletesToAmbryServerErrorCount.inc();
         }
       }
@@ -395,11 +398,11 @@ class RouterStore extends AccountMetadataStore {
       if (isUpdateSucceeded && oldBlobIDsToDelete != null) {
         for (String blobID : oldBlobIDsToDelete) {
           try {
-            logger.info("Removing blob " + blobID);
+            logger.info("Removing blob {}", blobID);
             // Block this execution? or maybe wait for a while then get out?
             router.get().deleteBlob(blobID, SERVICE_ID).get();
           } catch (Exception e) {
-            logger.error("Failed to delete blob=" + blobID, e);
+            logger.error("Failed to delete blob={}", blobID, e);
             accountServiceMetrics.accountDeletesToAmbryServerErrorCount.inc();
           }
         }

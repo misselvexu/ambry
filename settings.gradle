@@ -12,6 +12,7 @@ include 'ambry-api',
         'ambry-server',
         'ambry-network',
         'ambry-utils',
+        'ambry-test-utils',
         'ambry-store',
         'ambry-commons',
         'ambry-messageformat',
@@ -23,4 +24,8 @@ include 'ambry-api',
         'ambry-router',
         'ambry-frontend',
         'ambry-cloud',
-        'log4j-test-config'
+        'ambry-named-mysql',
+        'log4j-test-config',
+        'ambry-all',
+        'ambry-quota'
+

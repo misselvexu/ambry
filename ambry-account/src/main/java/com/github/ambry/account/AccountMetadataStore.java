@@ -15,10 +15,10 @@ package com.github.ambry.account;
 
 import java.util.Collection;
 import java.util.Map;
-import org.I0Itec.zkclient.DataUpdater;
 import org.apache.helix.AccessOption;
-import org.apache.helix.ZNRecord;
 import org.apache.helix.store.HelixPropertyStore;
+import org.apache.helix.zookeeper.datamodel.ZNRecord;
+import org.apache.helix.zookeeper.zkclient.DataUpdater;
 import org.apache.zookeeper.data.Stat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,7 +50,7 @@ abstract class AccountMetadataStore {
   }
 
   /**
-   * ZKUpdater extends the {@link DataUpdater} with another method to  permform some clean up logic after
+   * ZKUpdater extends the {@link DataUpdater} with another method to perform some clean up logic after
    * an update.
    */
   interface ZKUpdater extends DataUpdater<ZNRecord> {
@@ -87,15 +87,16 @@ abstract class AccountMetadataStore {
     logger.trace("Start reading ZNRecord from path={}", znRecordPath);
     Stat stat = new Stat();
     ZNRecord znRecord = helixStore.get(znRecordPath, stat, AccessOption.PERSISTENT);
-    logger.trace("Fetched ZNRecord from path={}, took time={} ms", znRecordPath,
-        System.currentTimeMillis() - startTimeMs);
+    long helixFetchTime = System.currentTimeMillis() - startTimeMs;
+    accountServiceMetrics.fetchRemoteAccountTimeInMs.update(helixFetchTime);
+    logger.trace("Fetched ZNRecord from path={}, took time={} ms", znRecordPath, helixFetchTime);
     if (znRecord == null) {
       logger.info("The ZNRecord to read does not exist on path={}", znRecordPath);
       return null;
     }
     Map<String, String> newAccountMap = fetchAccountMetadataFromZNRecord(znRecord);
     if (newAccountMap != null) {
-      backupFileManager.persistAccountMap(newAccountMap, stat);
+      backupFileManager.persistAccountMap(newAccountMap, stat.getVersion(), stat.getMtime() / 1000);
     }
     return newAccountMap;
   }
