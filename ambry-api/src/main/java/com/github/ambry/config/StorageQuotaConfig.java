@@ -18,26 +18,15 @@ package com.github.ambry.config;
  */
 public class StorageQuotaConfig {
   public static final String STORAGE_QUOTA_PREFIX = "storage.quota.";
-  public static final String HELIX_PROPERTY_ROOT_PATH = STORAGE_QUOTA_PREFIX + "helix.property.root.path";
-  public static final String ZK_CLIENT_CONNECT_ADDRESS = STORAGE_QUOTA_PREFIX + "zk.client.connect.address";
   public static final String REFRESHER_POLLING_INTERVAL_MS = STORAGE_QUOTA_PREFIX + "refresher.polling.interval.ms";
-  public static final String CONTAINER_STORAGE_QUOTA_IN_JSON = STORAGE_QUOTA_PREFIX + "container.storage.quota.in.json";
-  public static final String SOURCE_POLLING_INTERVAL_MS = STORAGE_QUOTA_PREFIX + "source.polling.interval.ms";
-
-  //////////////// Config for HelixStorageUsageRefresher ///////////////
-
-  /**
-   * The root path of helix property store in ZooKeeper for HelixStorageUsageRefresher. Must start with {@code /}, and
-   * must not end with {@code /}. The root path should be {@code /{clustername}/PROPERTYSTORE}
-   */
-  @Config(HELIX_PROPERTY_ROOT_PATH)
-  public final String helixPropertyRootPath;
-
-  /**
-   * The ZooKeeper server address to connect to. This config is required.
-   */
-  @Config(ZK_CLIENT_CONNECT_ADDRESS)
-  public final String zkClientConnectAddress;
+  public static final String STORAGE_QUOTA_IN_JSON = STORAGE_QUOTA_PREFIX + "storage.quota.in.json";
+  public static final String BACKUP_FILE_DIR = STORAGE_QUOTA_PREFIX + "backup.file.dir";
+  public static final String MYSQL_MONTHLY_BASE_FETCH_OFFSET_SEC =
+      STORAGE_QUOTA_PREFIX + "mysql.monthly.base.fetch.offset.sec";
+  public static final String MYSQL_STORE_RETRY_BACKOFF_MS = STORAGE_QUOTA_PREFIX + "mysql.store.retry.backoff.ms";
+  public static final String MYSQL_STORE_RETRY_MAX_COUNT = STORAGE_QUOTA_PREFIX + "mysql.store.retry.max.count";
+  public static final String SHOULD_THROTTLE = STORAGE_QUOTA_PREFIX + "should.throttle";
+  public static final String USE_PHYSICAL_STORAGE = STORAGE_QUOTA_PREFIX + "use.physical.storage";
 
   /**
    * The interval in milliseconds for refresher to refresh storage usage from its source.
@@ -49,7 +38,7 @@ public class StorageQuotaConfig {
   //////////////// Config for JSONStringStorageQuotaSource ///////////////
 
   /**
-   * A JSON string representing storage quota for all containers. eg:
+   * A JSON string representing storage quota for all accounts and containers. eg:
    * {
    *   "101": {
    *     "1": 1024000000,
@@ -57,36 +46,75 @@ public class StorageQuotaConfig {
    *   },
    *   "102": {
    *     "1": 10737418240
-   *   }
+   *   },
+   *   "103": 10737418240
    * }
-   * The key of the top object is the acount id and the key of the inner object is the container id.
+   * The key of the top object is the account id and the key of the inner object is the container id.
+   * If there is no inner object, then the value is the storage quota in bytes for this account.
    * The value of the each container id is the storage quota in bytes for this container.
    *
-   * If the targeted container doesn't have a storage quota in this JSON string, it's up to StorageQuotaEnforcer
-   * to decide whether to allow uploads or not.
+   * If the targeted account/container doesn't have a storage quota in this JSON string, it's up to
+   * StorageQuotaEnforcer to decide whether to allow uploads or not.
    */
-  @Config(CONTAINER_STORAGE_QUOTA_IN_JSON)
+  @Config(STORAGE_QUOTA_IN_JSON)
   @Default("")
-  public final String containerStorageQuotaInJson;
+  public final String storageQuotaInJson;
 
   /**
-   * The interval in milliseconds for quota source to refresh each container's storage quota.
+   * The directory to store quota related backup files. If empty, then backup files will be disabled.
    */
-  @Config(SOURCE_POLLING_INTERVAL_MS)
-  @Default("30 * 60 * 1000")
-  public final int sourcePollingIntervalMs;
+  @Config(BACKUP_FILE_DIR)
+  @Default("")
+  public final String backupFileDir;
+
+  /**
+   * Duration in milliseconds to backoff if the mysql database query failed.
+   */
+  @Config(MYSQL_STORE_RETRY_BACKOFF_MS)
+  @Default("10*60*1000")
+  public final long mysqlStoreRetryBackoffMs;
+
+  /**
+   * Maximum retry times to execute a mysql database query.
+   */
+  @Config(MYSQL_STORE_RETRY_MAX_COUNT)
+  @Default("1")
+  public final int mysqlStoreRetryMaxCount;
+
+  /**
+   * Offset in seconds to fetch container usage monthly base.
+   */
+  @Config(MYSQL_MONTHLY_BASE_FETCH_OFFSET_SEC)
+  @Default("60 * 60")
+  public final long mysqlMonthlyBaseFetchOffsetSec;
+
+  /**
+   * True to enable throttle for storage quota enforcer.
+   */
+  @Config(SHOULD_THROTTLE)
+  @Default("true")
+  public final boolean shouldThrottle;
+
+  /**
+   * True to use physical storage instead of logical storage usage to enforce storage quota.
+   */
+  @Config(USE_PHYSICAL_STORAGE)
+  @Default("false")
+  public final boolean usePhysicalStorage;
 
   /**
    * Constructor to create a {@link StorageQuotaConfig}.
    * @param verifiableProperties The {@link VerifiableProperties} that contains all the properties.
    */
   public StorageQuotaConfig(VerifiableProperties verifiableProperties) {
-    helixPropertyRootPath = verifiableProperties.getString(HELIX_PROPERTY_ROOT_PATH);
-    zkClientConnectAddress = verifiableProperties.getString(ZK_CLIENT_CONNECT_ADDRESS);
     refresherPollingIntervalMs =
         verifiableProperties.getIntInRange(REFRESHER_POLLING_INTERVAL_MS, 30 * 60 * 1000, 0, Integer.MAX_VALUE);
-    containerStorageQuotaInJson = verifiableProperties.getString(CONTAINER_STORAGE_QUOTA_IN_JSON, "");
-    sourcePollingIntervalMs =
-        verifiableProperties.getIntInRange(SOURCE_POLLING_INTERVAL_MS, 30 * 60 * 1000, 0, Integer.MAX_VALUE);
+    storageQuotaInJson = verifiableProperties.getString(STORAGE_QUOTA_IN_JSON, "");
+    backupFileDir = verifiableProperties.getString(BACKUP_FILE_DIR, "");
+    mysqlStoreRetryBackoffMs = verifiableProperties.getLong(MYSQL_STORE_RETRY_BACKOFF_MS, 10 * 60 * 1000);
+    mysqlStoreRetryMaxCount = verifiableProperties.getInt(MYSQL_STORE_RETRY_MAX_COUNT, 1);
+    mysqlMonthlyBaseFetchOffsetSec = verifiableProperties.getLong(MYSQL_MONTHLY_BASE_FETCH_OFFSET_SEC, 60 * 60);
+    shouldThrottle = verifiableProperties.getBoolean(SHOULD_THROTTLE, true);
+    usePhysicalStorage = verifiableProperties.getBoolean(USE_PHYSICAL_STORAGE, false);
   }
 }

@@ -31,9 +31,11 @@ public class ClusterMapConfig {
   public static final String AMBRY_STATE_MODEL_DEF = "AmbryLeaderStandby";
   public static final String OLD_STATE_MODEL_DEF = "LeaderStandby";
   public static final String DEFAULT_STATE_MODEL_DEF = AMBRY_STATE_MODEL_DEF;
+  public static final String ENABLE_MYSQL_AGGREGATION_TASK = "clustermap.enable.mysql.aggregation.task";
+  public static final String ENABLE_DELETE_INVALID_DATA_IN_MYSQL_AGGREGATION_TASK =
+      "clustermap.enable.delete.invalid.data.in.mysql.aggregation.task";
   public static final String ENABLE_AGGREGATED_MONTHLY_ACCOUNT_REPORT =
       "clustermap.enable.aggregated.monthly.account.report";
-  public static final String ENABLE_MYSQL_AGGREGATION_TASK = "clustermap.enable.mysql.aggregation.task";
   private static final String MAX_REPLICAS_ALL_DATACENTERS = "max-replicas-all-datacenters";
 
   /**
@@ -87,10 +89,18 @@ public class ClusterMapConfig {
 
   /**
    * List of Datacenters to which local node needs SSL encryption to communicate
+   * TODO: retire this config after http2 replication fully enabled
    */
   @Config("clustermap.ssl.enabled.datacenters")
   @Default("")
   public final String clusterMapSslEnabledDatacenters;
+
+  /**
+   * True to enable http2 based replication on a local node.
+   */
+  @Config("clustermap.enable.http2.replication")
+  @Default("false")
+  public final Boolean clusterMapEnableHttp2Replication;
 
   /**
    * The clustermap agent factory to use for instantiating the Cluster Map and the Cluster Participant.
@@ -306,9 +316,19 @@ public class ClusterMapConfig {
   @Default("false")
   public final boolean clustermapEnableAggregatedMonthlyAccountReport;
 
+  /**
+   * True to enable aggregation task of stats data in mysql database.
+   */
   @Config(ENABLE_MYSQL_AGGREGATION_TASK)
   @Default("false")
   public final boolean clustermapEnableMySqlAggregationTask;
+
+  /**
+   * True to enable deleting invalid aggregated data in mysql aggregation task.
+   */
+  @Config(ENABLE_DELETE_INVALID_DATA_IN_MYSQL_AGGREGATION_TASK)
+  @Default("false")
+  public final boolean clustermapEnableDeleteInvalidDataInMysqlAggregationTask;
 
   public ClusterMapConfig(VerifiableProperties verifiableProperties) {
     clusterMapFixedTimeoutDatanodeErrorThreshold =
@@ -329,6 +349,7 @@ public class ClusterMapConfig {
         verifiableProperties.getIntInRange("clustermap.fixedtimeout.replica.retry.backoff.ms", 10 * 60 * 1000, 1,
             30 * 60 * 1000);
     clusterMapSslEnabledDatacenters = verifiableProperties.getString("clustermap.ssl.enabled.datacenters", "");
+    clusterMapEnableHttp2Replication = verifiableProperties.getBoolean("clustermap.enable.http2.replication", false);
     clusterMapClusterAgentsFactory = verifiableProperties.getString("clustermap.clusteragents.factory",
         "com.github.ambry.clustermap.StaticClusterAgentsFactory");
     clusterMapClusterChangeHandlerType =
@@ -375,8 +396,10 @@ public class ClusterMapConfig {
     clustermapRetryDisablePartitionCompletionBackoffMs =
         verifiableProperties.getIntInRange("clustermap.retry.disable.partition.completion.backoff.ms", 10 * 1000, 1,
             Integer.MAX_VALUE);
+    clustermapEnableMySqlAggregationTask = verifiableProperties.getBoolean(ENABLE_MYSQL_AGGREGATION_TASK, false);
     clustermapEnableAggregatedMonthlyAccountReport =
         verifiableProperties.getBoolean(ENABLE_AGGREGATED_MONTHLY_ACCOUNT_REPORT, false);
-    clustermapEnableMySqlAggregationTask = verifiableProperties.getBoolean(ENABLE_MYSQL_AGGREGATION_TASK, false);
+    clustermapEnableDeleteInvalidDataInMysqlAggregationTask =
+        verifiableProperties.getBoolean(ENABLE_DELETE_INVALID_DATA_IN_MYSQL_AGGREGATION_TASK, false);
   }
 }

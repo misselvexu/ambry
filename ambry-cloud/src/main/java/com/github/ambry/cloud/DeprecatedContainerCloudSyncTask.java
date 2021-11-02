@@ -30,6 +30,7 @@ import org.slf4j.LoggerFactory;
  */
 public class DeprecatedContainerCloudSyncTask implements Task {
   private static final Logger logger = LoggerFactory.getLogger(DeprecatedContainerCloudSyncTask.class);
+  public static String COMMAND = DeprecatedContainerCloudSyncTask.class.getSimpleName();
   private final AccountService accountService;
   private final long containerDeletionRetentionDays;
   private final CloudDestination cloudDestination;
@@ -51,6 +52,7 @@ public class DeprecatedContainerCloudSyncTask implements Task {
 
   @Override
   public TaskResult run() {
+    TaskResult taskResult = null;
     Timer.Context deprecationTaskRunTimer = vcrMetrics.deprecationTaskRunTime.time();
     try {
       logger.info("DeprecatedContainerCloudSyncTask run started.");
@@ -60,13 +62,17 @@ public class DeprecatedContainerCloudSyncTask implements Task {
       accountServiceFetchTimer.stop();
       logger.info("Attempting deprecation of {} containers.", deprecatedContainers.size());
       cloudDestination.deprecateContainers(deprecatedContainers);
+      taskResult =
+          new TaskResult(TaskResult.Status.COMPLETED, "DeprecatedContainerCloudSyncTask completed successfully.");
     } catch (CloudStorageException cloudStorageException) {
       logger.error("Error in updating deprecated containers from account service to cloud: ", cloudStorageException);
+      taskResult = new TaskResult(TaskResult.Status.FAILED,
+          "DeprecatedContainerCloudSyncTask failed due to ." + cloudStorageException.getMessage());
     } finally {
       logger.info("DeprecatedContainerCloudSyncTask done.");
       deprecationTaskRunTimer.stop();
     }
-    return null;
+    return taskResult;
   }
 
   @Override

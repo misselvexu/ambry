@@ -13,11 +13,12 @@
  */
 package com.github.ambry.account;
 
-import com.github.ambry.account.mysql.ContainerDao;
 import com.github.ambry.account.mysql.MySqlAccountStore;
 import com.github.ambry.account.mysql.MySqlAccountStoreFactory;
-import com.github.ambry.mysql.MySqlDataAccessor;
+import com.github.ambry.commons.Notifier;
 import com.github.ambry.config.MySqlAccountServiceConfig;
+import com.github.ambry.mysql.MySqlDataAccessor;
+import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.Utils;
 import java.io.IOException;
@@ -26,8 +27,10 @@ import java.sql.SQLException;
 import java.sql.SQLIntegrityConstraintViolationException;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
+import java.util.Collections;
+import java.util.Date;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -51,6 +54,11 @@ import static com.github.ambry.utils.Utils.*;
 public class MySqlAccountService extends AbstractAccountService {
 
   private static final Logger logger = LoggerFactory.getLogger(MySqlAccountService.class);
+  public static final String SEPARATOR = ":";
+  // Cache parameters (initial capacity, load factor and max limit) for recentNotFoundContainersCache
+  private static final int cacheInitialCapacity = 100;
+  private static final float cacheLoadFactor = 0.75f;
+  private static final int cacheMaxLimit = 1000;
   static final String MYSQL_ACCOUNT_UPDATER_PREFIX = "mysql-account-updater";
   private final AtomicBoolean open = new AtomicBoolean(true);
   private final MySqlAccountServiceConfig config;
@@ -61,10 +69,13 @@ public class MySqlAccountService extends AbstractAccountService {
   private volatile MySqlAccountStore mySqlAccountStore;
   private final MySqlAccountStoreFactory mySqlAccountStoreFactory;
   private boolean needRefresh = false;
+  private long lastSyncTime = -1;
+  private final Set<String> recentNotFoundContainersCache;
+  private final boolean writeCacheAfterUpdate;
 
   public MySqlAccountService(AccountServiceMetrics accountServiceMetrics, MySqlAccountServiceConfig config,
-      MySqlAccountStoreFactory mySqlAccountStoreFactory) throws SQLException, IOException {
-    super(config, Objects.requireNonNull(accountServiceMetrics, "accountServiceMetrics cannot be null"));
+      MySqlAccountStoreFactory mySqlAccountStoreFactory, Notifier<String> notifier) throws SQLException, IOException {
+    super(config, Objects.requireNonNull(accountServiceMetrics, "accountServiceMetrics cannot be null"), notifier);
     this.config = config;
     this.mySqlAccountStoreFactory = mySqlAccountStoreFactory;
     try {
@@ -80,10 +91,20 @@ public class MySqlAccountService extends AbstractAccountService {
         throw e;
       }
     }
+    accountServiceMetrics.trackTimeSinceLastSync(this::getTimeInSecondsSinceLastSync);
+    accountServiceMetrics.trackContainerCount(this::getContainerCount);
     this.scheduler =
         config.updaterPollingIntervalSeconds > 0 ? Utils.newScheduler(1, MYSQL_ACCOUNT_UPDATER_PREFIX, false) : null;
     // create backup file manager for persisting and retrieving Account metadata on local disk
     backupFileManager = new BackupFileManager(accountServiceMetrics, config.backupDir, config.maxBackupFileCount);
+    // A local LRA cache of containers not found in mysql db. This is used to avoid repeated queries to db during getContainerByName() calls.
+    recentNotFoundContainersCache = Collections.newSetFromMap(
+        Collections.synchronizedMap(new LinkedHashMap<String, Boolean>(cacheInitialCapacity, cacheLoadFactor, true) {
+          protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+            return size() > cacheMaxLimit;
+          }
+        }));
+    this.writeCacheAfterUpdate = config.writeCacheAfterUpdate;
     // Initialize cache from backup file on disk
     initCacheFromBackupFile();
     // Fetches added or modified accounts and containers from mysql db and schedules to execute it periodically
@@ -91,15 +112,22 @@ public class MySqlAccountService extends AbstractAccountService {
   }
 
   /**
+   * @return set (LRA cache) of containers not found in recent get attempts. Used in only tests.
+   */
+  Set<String> getRecentNotFoundContainersCache() {
+    return Collections.unmodifiableSet(recentNotFoundContainersCache);
+  }
+
+  /**
    * Initializes in-memory {@link AccountInfoMap} with accounts and containers stored in backup copy on local disk.
    */
   private void initCacheFromBackupFile() {
     long aMonthAgo = SystemTime.getInstance().seconds() - TimeUnit.DAYS.toSeconds(30);
-    Map<String, String> accountMapFromFile = backupFileManager.getLatestAccountMap(aMonthAgo);
+    Collection<Account> accounts = backupFileManager.getLatestAccounts(aMonthAgo);
     AccountInfoMap accountInfoMap = null;
-    if (accountMapFromFile != null) {
+    if (accounts != null) {
       try {
-        accountInfoMap = new AccountInfoMap(accountServiceMetrics, accountMapFromFile);
+        accountInfoMap = new AccountInfoMap(accounts);
       } catch (Exception e) {
         logger.warn("Failure in parsing of Account Metadata from local backup file", e);
       }
@@ -123,6 +151,8 @@ public class MySqlAccountService extends AbstractAccountService {
       logger.info("Background account updater will fetch accounts from mysql db at intervals of {} seconds",
           config.updaterPollingIntervalSeconds);
     }
+
+    maybeSubscribeChangeTopic(false);
   }
 
   /**
@@ -132,7 +162,7 @@ public class MySqlAccountService extends AbstractAccountService {
   void fetchAndUpdateCacheNoThrow() {
     try {
       fetchAndUpdateCache();
-    } catch (Exception e) {
+    } catch (Throwable e) {
       logger.error("fetchAndUpdateCache failed", e);
     }
   }
@@ -155,27 +185,36 @@ public class MySqlAccountService extends AbstractAccountService {
     try {
       // Find last modified time of Accounts and containers in cache.
       long lastModifiedTime = accountInfoMapRef.get().getLastModifiedTime();
+      logger.info("Syncing from database using lastModifiedTime = {}", new Date(lastModifiedTime));
 
       long startTimeMs = System.currentTimeMillis();
       // Fetch added/modified accounts and containers from MySql database since LMT
       Collection<Account> updatedAccountsInDB = mySqlAccountStore.getNewAccounts(lastModifiedTime);
       Collection<Container> updatedContainersInDB = mySqlAccountStore.getNewContainers(lastModifiedTime);
-      accountServiceMetrics.fetchRemoteAccountTimeInMs.update(System.currentTimeMillis() - startTimeMs);
+      long endTimeMs = System.currentTimeMillis();
+      accountServiceMetrics.fetchRemoteAccountTimeInMs.update(endTimeMs - startTimeMs);
+      // Close connection and get fresh one next time
+      mySqlAccountStore.closeConnection();
 
       if (!updatedAccountsInDB.isEmpty() || !updatedContainersInDB.isEmpty()) {
-        // Update cache with fetched accounts and containers
-        infoMapLock.writeLock().lock();
-        try {
-          AccountInfoMap accountInfoMap = accountInfoMapRef.get();
-          accountInfoMap.addOrUpdateAccounts(updatedAccountsInDB);
-          accountInfoMap.addOrUpdateContainers(updatedContainersInDB);
-          // Refresh last modified time of Accounts and Containers in cache
-          accountInfoMap.refreshLastModifiedTime();
-        } finally {
-          infoMapLock.writeLock().unlock();
+        logger.info("Found {} accounts and {} containers", updatedAccountsInDB.size(), updatedContainersInDB.size());
+        for (Account account : updatedAccountsInDB) {
+          logger.info("Found account {}", account.getName());
         }
+        for (Container container : updatedContainersInDB) {
+          logger.info("Found container {}", container.getName());
+        }
+
+        // Update cache with fetched accounts and containers
+        updateAccountsInCache(updatedAccountsInDB);
+        updateContainersInCache(updatedContainersInDB);
+
+        // Refresh last modified time of Accounts and Containers in cache
+        accountInfoMapRef.get().refreshLastModifiedTime();
+
         // At this point we can safely say cache is refreshed
         needRefresh = false;
+        lastSyncTime = endTimeMs;
 
         // Notify updated accounts to consumers
         Set<Account> updatedAccounts = new HashSet<>();
@@ -193,11 +232,12 @@ public class MySqlAccountService extends AbstractAccountService {
         } finally {
           infoMapLock.readLock().unlock();
         }
-        Map<String, String> accountMap = new HashMap<>();
-        accountCollection.forEach(
-            account -> accountMap.put(Short.toString(account.getId()), account.toJson(false).toString()));
-        backupFileManager.persistAccountMap(accountMap, backupFileManager.getLatestVersion() + 1,
+        backupFileManager.persistAccountMap(accountCollection, backupFileManager.getLatestVersion() + 1,
             SystemTime.getInstance().seconds());
+      } else {
+        // Cache is up to date
+        needRefresh = false;
+        lastSyncTime = endTimeMs;
       }
     } catch (SQLException e) {
       accountServiceMetrics.fetchRemoteAccountErrorCount.inc();
@@ -280,13 +320,12 @@ public class MySqlAccountService extends AbstractAccountService {
       logger.error("Failed updating accounts={} in MySql DB", accounts, e);
       handleSQLException(e);
     }
+    // Tell the world
+    publishChangeNotice();
 
-    // write added/modified accounts to in-memory cache
-    infoMapLock.writeLock().lock();
-    try {
-      accountInfoMapRef.get().addOrUpdateAccounts(accounts);
-    } finally {
-      infoMapLock.writeLock().unlock();
+    if (writeCacheAfterUpdate) {
+      // Write accounts to in-memory cache. Snapshot version will be out of date until the next DB refresh.
+      updateAccountsInCache(accounts);
     }
   }
 
@@ -305,6 +344,7 @@ public class MySqlAccountService extends AbstractAccountService {
     if (scheduler != null) {
       shutDownExecutorService(scheduler, config.updaterShutDownTimeoutMinutes, TimeUnit.MINUTES);
     }
+    maybeUnsubscribeChangeTopic();
     open.set(false);
   }
 
@@ -320,9 +360,40 @@ public class MySqlAccountService extends AbstractAccountService {
   }
 
   @Override
+  protected void publishChangeNotice() {
+    // TODO: can optimize this by sending the account/container payload as the topic message,
+    // so subscribers can update their cache and avoid the database query.
+    super.publishChangeNotice();
+  }
+
+  @Override
+  protected void onAccountChangeMessage(String topic, String message) {
+    if (!open.get()) {
+      // take no action instead of throwing an exception to silence noisy log messages when a message is received while
+      // closing the AccountService.
+      return;
+    }
+    try {
+      switch (message) {
+        case FULL_ACCOUNT_METADATA_CHANGE_MESSAGE:
+          logger.info("Processing message={} for topic={}", message, topic);
+          fetchAndUpdateCache();
+          logger.trace("Completed processing message={} for topic={}", message, topic);
+          break;
+        default:
+          accountServiceMetrics.unrecognizedMessageErrorCount.inc();
+          throw new RuntimeException("Could not understand message=" + message + " for topic=" + topic);
+      }
+    } catch (Exception e) {
+      logger.error("Exception occurred when processing message={} for topic={}.", message, topic, e);
+      accountServiceMetrics.remoteDataCorruptionErrorCount.inc();
+      accountServiceMetrics.fetchRemoteAccountErrorCount.inc();
+    }
+  }
+
+  @Override
   public Collection<Container> updateContainers(String accountName, Collection<Container> containers)
       throws AccountServiceException {
-    // TODO: make transactional
     try {
       return super.updateContainers(accountName, containers);
     } catch (AccountServiceException ase) {
@@ -345,19 +416,98 @@ public class MySqlAccountService extends AbstractAccountService {
   protected void updateResolvedContainers(Account account, Collection<Container> resolvedContainers)
       throws AccountServiceException {
     try {
-      updateContainersWithMySqlStore(account.getId(), resolvedContainers);
+      updateContainersWithMySqlStore(account, resolvedContainers);
     } catch (SQLException e) {
       logger.error("Failed updating containers {} in MySql DB", resolvedContainers, e);
       handleSQLException(e);
     }
+    // Tell the world
+    publishChangeNotice();
 
-    // write added/modified containers to in-memory cache
-    infoMapLock.writeLock().lock();
-    try {
-      accountInfoMapRef.get().addOrUpdateContainers(resolvedContainers);
-    } finally {
-      infoMapLock.writeLock().unlock();
+    if (writeCacheAfterUpdate) {
+      // Write containers to in-memory cache. Snapshot version will be out of date until the next DB refresh.
+      updateContainersInCache(resolvedContainers);
     }
+  }
+
+  /**
+   * Gets the {@link Container} by its name and parent {@link Account} name by looking up in in-memory cache.
+   * If it is not present in in-memory cache, it queries from mysql db and updates the cache.
+   * @param accountName the name of account which container belongs to.
+   * @param containerName the name of container to get.
+   * @return {@link Container} if found in cache or mysql db. Else, returns {@code null}.
+   * @throws AccountServiceException
+   */
+  @Override
+  public Container getContainerByName(String accountName, String containerName) throws AccountServiceException {
+
+    if (recentNotFoundContainersCache.contains(accountName + SEPARATOR + containerName)) {
+      // If container was not found in recent get attempts, avoid another query to db and return null.
+      return null;
+    }
+
+    Account account = getAccountByName(accountName);
+    if (account == null) {
+      return null;
+    }
+    Container container = account.getContainerByName(containerName);
+    if (container == null) {
+      // If container is not present in the cache, query from mysql db
+      try {
+        container = mySqlAccountStore.getContainerByName(account.getId(), containerName);
+        if (container != null) {
+          // write container to in-memory cache
+          updateContainersInCache(Collections.singletonList(container));
+          logger.info("Container {} in Account {} is not found locally; Fetched from mysql db", containerName,
+              accountName);
+          accountServiceMetrics.onDemandContainerFetchCount.inc();
+        } else {
+          // Add account_container to not-found LRU cache
+          recentNotFoundContainersCache.add(accountName + SEPARATOR + containerName);
+          logger.error("Container {} is not found in Account {}", containerName, accountName);
+        }
+      } catch (SQLException e) {
+        throw translateSQLException(e);
+      }
+    }
+    return container;
+  }
+
+  /**
+   * Gets the {@link Container} by its Id and parent {@link Account} Id by looking up in in-memory cache.
+   * If it is not present in in-memory cache, it queries from mysql db and updates the cache.
+   * @param accountId the name of account which container belongs to.
+   * @param containerId the id of container to get.
+   * @return {@link Container} if found in cache or mysql db. Else, returns {@code null}.
+   * @throws AccountServiceException
+   */
+  @Override
+  public Container getContainerById(short accountId, Short containerId) throws AccountServiceException {
+    Account account = getAccountById(accountId);
+    if (account == null) {
+      return null;
+    }
+    Container container = account.getContainerById(containerId);
+    if (container == null) {
+      // If container is not present in the cache, query from mysql db
+      try {
+        container = mySqlAccountStore.getContainerById(accountId, containerId);
+        if (container != null) {
+          // write container to in-memory cache
+          updateContainersInCache(Collections.singletonList(container));
+          logger.info("Container Id {} in Account {} is not found locally, fetched from mysql db", containerId,
+              account.getName());
+          accountServiceMetrics.onDemandContainerFetchCount.inc();
+        } else {
+          logger.error("Container Id {} is not found in Account {}", containerId, account.getName());
+          // Note: We are not using LRU cache for storing recent unsuccessful get attempts by container Ids since this
+          // will be called in getBlob() path which should have valid account-container in most cases.
+        }
+      } catch (SQLException e) {
+        throw translateSQLException(e);
+      }
+    }
+    return container;
   }
 
   /**
@@ -365,85 +515,146 @@ public class MySqlAccountService extends AbstractAccountService {
    * @param accounts collection of {@link Account}s
    * @throws SQLException
    */
-  private void updateAccountsWithMySqlStore(Collection<Account> accounts) throws SQLException {
+  void updateAccountsWithMySqlStore(Collection<Account> accounts) throws SQLException {
     long startTimeMs = System.currentTimeMillis();
     logger.trace("Start updating accounts={} into MySql DB", accounts);
 
-    // write Accounts and containers to MySql
-    // TODO: make transactional
+    // Get account and container changes info
+    List<AccountUpdateInfo> accountsUpdateInfo = new ArrayList<>();
     for (Account account : accounts) {
-      Account existingAccount = getAccountById(account.getId());
-      if (existingAccount == null) {
-        // new account (insert the containers and account into db tables)
-        mySqlAccountStore.addAccount(account);
-        mySqlAccountStore.addContainers(account.getId(), account.getAllContainers());
+
+      boolean isAccountAdded = false, isAccountUpdated = false;
+      List<Container> addedContainers;
+      List<Container> updatedContainers = new ArrayList<>();
+
+      Account accountInCache = getAccountById(account.getId());
+      if (accountInCache == null) {
+        isAccountAdded = true;
+        addedContainers = new ArrayList<>(account.getAllContainers());
       } else {
-        // existing account (update account table)
-        // Avoid updating account records if only container information changed.
-        if (!AccountCollectionSerde.accountToJsonNoContainers(existingAccount)
-            .similar(AccountCollectionSerde.accountToJsonNoContainers(account))) {
-          // increment the version of account record
-          account = new AccountBuilder(account).snapshotVersion(account.getSnapshotVersion() + 1).build();
-          mySqlAccountStore.updateAccount(account);
+        if (!accountInCache.equalsWithoutContainers(account)) {
+          isAccountUpdated = true;
         }
-        updateContainersWithMySqlStore(account.getId(), account.getAllContainers());
+        // Get list of added and updated containers in the account.
+        Pair<List<Container>, List<Container>> addedOrUpdatedContainers =
+            getUpdatedContainers(account, account.getAllContainers());
+        addedContainers = addedOrUpdatedContainers.getFirst();
+        updatedContainers = addedOrUpdatedContainers.getSecond();
       }
+
+      accountsUpdateInfo.add(
+          new AccountUpdateInfo(account, isAccountAdded, isAccountUpdated, addedContainers, updatedContainers));
     }
 
+    // Write changes to MySql db.
+    mySqlAccountStore.updateAccounts(accountsUpdateInfo);
+
     long timeForUpdate = System.currentTimeMillis() - startTimeMs;
-    logger.trace("Completed updating accounts/containers in MySql DB, took time={} ms", timeForUpdate);
+    logger.trace("Completed updating accounts={} in MySql DB, took time={} ms", accounts, timeForUpdate);
     accountServiceMetrics.updateAccountTimeInMs.update(timeForUpdate);
   }
 
   /**
    * Updates MySql DB with added or modified {@link Container}s of a given account
-   * @param accountId id of the {@link Account} for the {@link Container}s
+   * @param account parent {@link Account} for the {@link Container}s
    * @param containers collection of {@link Container}s
    * @throws SQLException
    */
-  private void updateContainersWithMySqlStore(short accountId, Collection<Container> containers) throws SQLException {
+  private void updateContainersWithMySqlStore(Account account, Collection<Container> containers) throws SQLException {
     long startTimeMs = System.currentTimeMillis();
-    logger.trace("Start updating containers={} for accountId={} into MySql DB", containers, accountId);
+    logger.trace("Start updating containers={} for accountId={} into MySql DB", containers, account.getId());
 
-    //check for account ID in in-memory cache
-    AccountInfoMap accountInfoMap;
-    Account accountInCache;
-    infoMapLock.readLock().lock();
-    try {
-      accountInfoMap = accountInfoMapRef.get();
-      accountInCache = accountInfoMap.getAccountById(accountId);
-    } finally {
-      infoMapLock.readLock().unlock();
-    }
+    // Get list of added and updated containers in the account.
+    Pair<List<Container>, List<Container>> addedOrUpdatedContainers = getUpdatedContainers(account, containers);
+    AccountUpdateInfo accountUpdateInfo =
+        new AccountUpdateInfo(account, false, false, addedOrUpdatedContainers.getFirst(),
+            addedOrUpdatedContainers.getSecond());
+
+    // Write changes to MySql db.
+    mySqlAccountStore.updateAccounts(Collections.singletonList(accountUpdateInfo));
+
+    long timeForUpdate = System.currentTimeMillis() - startTimeMs;
+    logger.trace("Completed updating containers={} for accountId={} in MySqlDB in time={} ms", containers,
+        account.getId(), timeForUpdate);
+    accountServiceMetrics.updateAccountTimeInMs.update(timeForUpdate);
+  }
+
+  /**
+   * Gets lists of added and updated {@link Container}s in the {@link Account} by comparing with in-memory cache.
+   * @param account Id of the account
+   * @param containers {@link Container}s added or updated in the account.
+   * @return {@link Pair} of lists of added and updated {@link Container}s in the given {@link Account}
+   */
+  private Pair<List<Container>, List<Container>> getUpdatedContainers(Account account,
+      Collection<Container> containers) {
+
+    //check for account in in-memory cache
+    Account accountInCache = getAccountById(account.getId());
     if (accountInCache == null) {
-      throw new IllegalArgumentException("Account with ID " + accountId + "doesn't exist");
+      throw new IllegalArgumentException("Account with ID " + account + "doesn't exist");
     }
 
     List<Container> addedContainers = new ArrayList<>();
     List<Container> updatedContainers = new ArrayList<>();
     for (Container containerToUpdate : containers) {
-      Container containerInCache =
-          accountInfoMap.getContainerByIdForAccount(containerToUpdate.getParentAccountId(), containerToUpdate.getId());
+      Container containerInCache = accountInCache.getContainerById(containerToUpdate.getId());
       if (containerInCache == null) {
-        // new container added. Insert record into container table.
         addedContainers.add(containerToUpdate);
       } else {
         if (!containerInCache.equals(containerToUpdate)) {
-          // Existing container modified. Increase the version of container and update container record
-          containerToUpdate =
-              new ContainerBuilder(containerToUpdate).setSnapshotVersion(containerToUpdate.getSnapshotVersion() + 1)
-                  .build();
           updatedContainers.add(containerToUpdate);
         }
       }
     }
 
-    mySqlAccountStore.addContainers(accountId, addedContainers);
-    mySqlAccountStore.updateContainers(accountId, updatedContainers);
+    return new Pair<>(addedContainers, updatedContainers);
+  }
 
-    long timeForUpdate = System.currentTimeMillis() - startTimeMs;
-    logger.trace("Completed updating accounts/containers in MySql DB, took time={} ms", timeForUpdate);
-    accountServiceMetrics.updateAccountTimeInMs.update(timeForUpdate);
+  /**
+   * Updates {@link Account}s to in-memory cache.
+   * @param accounts added or modified {@link Account}s
+   */
+  private void updateAccountsInCache(Collection<Account> accounts) {
+    infoMapLock.writeLock().lock();
+    try {
+      accountInfoMapRef.get().addOrUpdateAccounts(accounts);
+    } finally {
+      infoMapLock.writeLock().unlock();
+    }
+  }
+
+  /**
+   * Updates {@link Container}s to in-memory cache.
+   * @param containers added or modified {@link Container}s
+   */
+  private void updateContainersInCache(Collection<Container> containers) {
+
+    infoMapLock.writeLock().lock();
+    try {
+      accountInfoMapRef.get().addOrUpdateContainers(containers);
+    } finally {
+      infoMapLock.writeLock().unlock();
+    }
+
+    // Remove containers from not-found LRU cache.
+    for (Container container : containers) {
+      recentNotFoundContainersCache.remove(
+          getAccountById(container.getParentAccountId()).getName() + SEPARATOR + container.getName());
+    }
+  }
+
+  /**
+   * @return the time in seconds since the last database sync / cache refresh
+   */
+  public int getTimeInSecondsSinceLastSync() {
+    return lastSyncTime > 0 ? (int) (System.currentTimeMillis() - lastSyncTime) / 1000 : Integer.MAX_VALUE;
+  }
+
+  /**
+   * @return the total number of containers in all accounts.
+   */
+  public int getContainerCount() {
+    return accountInfoMapRef.get().getContainerCount();
   }
 
   /**
@@ -470,17 +681,7 @@ public class MySqlAccountService extends AbstractAccountService {
   public static AccountServiceException translateSQLException(SQLException e) {
     if (e instanceof SQLIntegrityConstraintViolationException || (e instanceof BatchUpdateException
         && e.getCause() instanceof SQLIntegrityConstraintViolationException)) {
-      String message;
-      if (e.getMessage().contains(ContainerDao.INDEX_ACCOUNT_CONTAINER)) {
-        // Example: Duplicate entry '101-5' for key 'containers.accountContainer'
-        message = "Duplicate containerId";
-      } else if (e.getMessage().contains(ContainerDao.INDEX_CONTAINER_NAME)) {
-        // duplicate container name: need to update cache but retry may fail
-        message = "Duplicate container name";
-      } else {
-        message = "Constraint violation";
-      }
-      return new AccountServiceException(message, AccountServiceErrorCode.ResourceConflict);
+      return new AccountServiceException(e.getMessage(), AccountServiceErrorCode.ResourceConflict);
     } else if (MySqlDataAccessor.isCredentialError(e)) {
       return new AccountServiceException("Invalid database credentials", AccountServiceErrorCode.InternalError);
     } else {

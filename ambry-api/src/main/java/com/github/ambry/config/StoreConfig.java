@@ -75,25 +75,18 @@ public class StoreConfig {
   public final double storeIndexBloomMaxFalsePositiveProbability;
 
   /**
-   * How long (in days) a key must be in deleted state before it is hard deleted.
+   * How long (in hours) a key must be in deleted state before it is hard deleted. Minimum value: 1 hour.
    */
-  @Config("store.deleted.message.retention.days")
-  @Default("7")
-  public final int storeDeletedMessageRetentionDays;
+  @Config("store.deleted.message.retention.hours")
+  @Default("168")
+  public final int storeDeletedMessageRetentionHours;
 
   /**
    * How often the HybridCompactionPolicy switch from StatsBasedCompactionPolicy to CompactAllPolicy based on timestamp.
    */
   @Config("store.compaction.policy.switch.timestamp.days")
-  @Default("7")
+  @Default("6")
   public final int storeCompactionPolicySwitchTimestampDays;
-
-  /**
-   * How often the HybridCompactionPolicy switch from StatsBasedCompactionPolicy to CompactAllPolicy based on counter value.
-   */
-  @Config("store.compaction.policy.switch.counter.days")
-  @Default("7")
-  public final int storeCompactionPolicySwitchCounterDays;
 
   /**
    * How long (in days) a container must be in DELETE_IN_PROGRESS state before it's been deleted during compaction.
@@ -110,11 +103,32 @@ public class StoreConfig {
   public final int storeHardDeleteOperationsBytesPerSec;
 
   /**
-   * The rate of I/O allowed per disk for compaction.
+   * The max rate of I/O allowed per disk for compaction.
    */
   @Config("store.compaction.operations.bytes.per.sec")
   @Default("1*1024*1024")
   public final int storeCompactionOperationsBytesPerSec;
+
+  /**
+   * The minimum  I/O rate allowed per disk for compaction.
+   */
+  @Config("store.compaction.min.operations.bytes.per.sec")
+  @Default("512*1024")
+  public final int storeCompactionMinOperationsBytesPerSec;
+
+  /**
+   * The adjustment coefficient to use when compaction calculate desired copy rate.
+   */
+  @Config("store.compaction.operations.adjust.k")
+  @Default("1")
+  public final double storeCompactionOperationsAdjustK;
+
+  /**
+   * The check interval used in compaction rate throttler. -1 means we check rate in every call.
+   */
+  @Config("store.compaction.throttler.check.interval.ms")
+  @Default("-1")
+  public final int storeCompactionThrottlerCheckIntervalMs;
 
   /**
    * Whether direct IO are to be enable or not for compaction.
@@ -123,6 +137,13 @@ public class StoreConfig {
   @Config("store.compaction.enable.direct.io")
   @Default("false")
   public final boolean storeCompactionEnableDirectIO;
+
+  /**
+   * Whether to purge expired delete tombstone in compaction.
+   */
+  @Config("store.compaction.purge.delete.tombstone")
+  @Default("false")
+  public final boolean storeCompactionPurgeDeleteTombstone;
 
   /**
    * The minimum buffer size for compaction copy phase.
@@ -213,6 +234,13 @@ public class StoreConfig {
   public final long storeStatsRecentEntryProcessingIntervalInMinutes;
 
   /**
+   * Period in seconds to specify how frequent the validDataSizeCollector executed.
+   */
+  @Config("store.get.valid.size.interval.in.secs")
+  @Default("2*60")
+  public final long storeGetValidSizeIntervalInSecs;
+
+  /**
    * The upper limit in seconds for requests to wait for a ongoing construction of buckets (that contains the answer)
    * to complete.
    */
@@ -237,6 +265,21 @@ public class StoreConfig {
   @Config("store.index.persisted.entry.min.bytes")
   @Default("115")
   public final int storeIndexPersistedEntryMinBytes;
+
+  /**
+   * The minimum bytes to determine in current log segment only contains the header info.
+   */
+  @Config("store.determine.log.segment.only.contains.header.min.bytes")
+  @Default("20")
+  public final int storeDetermineLogSegmentOnlyContainsHeaderMinBytes;
+
+  /**
+   * Whether to rebuild replication token (if it's been invalidated) based on reset key. If {@code false}, the token
+   * will be reset to the very beginning of whole log.
+   */
+  @Config("store.rebuild.token.based.on.reset.key")
+  @Default("false")
+  public final boolean storeRebuildTokenBasedOnResetKey;
 
   /**
    * Enables or disables accountId and containerId validation for GET/DELETE request.
@@ -304,6 +347,23 @@ public class StoreConfig {
   public final boolean storeSetFilePermissionEnabled;
 
   /**
+   * Whether to enable auto close last log segment during compaction.
+   */
+  @Config(storeAutoCloseLastLogSegmentEnabledName)
+  @Default("false")
+  public final boolean storeAutoCloseLastLogSegmentEnabled;
+  public static final String storeAutoCloseLastLogSegmentEnabledName = "store.auto.close.last.log.segment.enabled";
+
+  /**
+   * Specifies the minimum value of Bytes for maxLagForPartition(max lag refers to local replica is lagging behind remote peers)
+   * which can unseal replica.
+   */
+  @Config(storeUnsealReplicaMinimumLagBytesName)
+  @Default("0")
+  public final long storeUnsealReplicaMinimumLagBytes;
+  public static final String storeUnsealReplicaMinimumLagBytesName = "store.unseal.replica.minimum.lag.bytes";
+
+  /**
    * Specifies the permissions for data files in store. (Data files are user data related files for example, log segment,
    * index segment and bloom filter etc)
    */
@@ -335,6 +395,15 @@ public class StoreConfig {
   public final boolean storeIndexRebuildBloomFilterEnabled;
 
   /**
+   * Maximum page count to invalidate some corrupted bloom files that may compute super large value for number of pages
+   * and cause OutOfMemory issue. If computed page count is larger this value, an exception will be thrown to either
+   * rebuild bloom file or terminate store startup.
+   */
+  @Config("store.bloom.filter.maximum.page.count")
+  @Default("128")
+  public final int storeBloomFilterMaximumPageCount;
+
+  /**
    * True to enable container deletion in store.
    */
   @Config("store.container.deletion.enabled")
@@ -356,11 +425,44 @@ public class StoreConfig {
   @Default("false")
   public final boolean storeEnableBucketForLogSegmentReports;
 
+  @Config("store.enable.current.invalid.size.metric")
+  @Default("false")
+  public final boolean storeEnableCurrentInvalidSizeMetric;
+
   @Config(storeAlwaysEnableTargetIndexDuplicateCheckingName)
   @Default("false")
   public final boolean storeAlwaysEnableTargetIndexDuplicateChecking;
   public static final String storeAlwaysEnableTargetIndexDuplicateCheckingName =
       "store.always.enable.target.index.duplicate.checking";
+
+  @Config(storeCompactionEnableBasicInfoOnMissingDuplicateName)
+  @Default("false")
+  public final boolean storeCompactionEnableBasicInfoOnMissingDuplicate;
+  public static final String storeCompactionEnableBasicInfoOnMissingDuplicateName =
+      "store.compaction.enable.basic.info.on.missing.duplicate";
+
+  /**
+   * A normalized disk IO read latency threshold(per MB). If actual normalized disk read latency is higher than the
+   * threshold, we need to decrease compaction speed.
+   */
+  @Config("store.compaction.io.per.mb.read.latency.threshold.ms")
+  @Default("20")
+  public final int storeCompactionIoPerMbReadLatencyThresholdMs;
+
+  /**
+   * A normalized disk IO write latency threshold(per MB). If actual normalized disk write latency is higher than the
+   * threshold, we need to decrease compaction speed.
+   */
+  @Config("store.compaction.io.per.mb.write.latency.threshold.ms")
+  @Default("20")
+  public final int storeCompactionIoPerMbWriteLatencyThresholdMs;
+
+  /**
+   * The per disk histogram's reservoir time window in millisecond.
+   */
+  @Config("store.disk.io.reservoir.time.window.ms")
+  @Default("200")
+  public final int storeDiskIoReservoirTimeWindowMs;
 
   public StoreConfig(VerifiableProperties verifiableProperties) {
 
@@ -373,11 +475,10 @@ public class StoreConfig {
         verifiableProperties.getDoubleInRange("store.index.bloom.max.false.positive.probability", 0.01, 0.0, 1.0);
     storeMaxNumberOfEntriesToReturnFromJournal =
         verifiableProperties.getIntInRange("store.max.number.of.entries.to.return.from.journal", 5000, 1, 10000);
-    storeDeletedMessageRetentionDays = verifiableProperties.getInt("store.deleted.message.retention.days", 7);
+    storeDeletedMessageRetentionHours =
+        verifiableProperties.getIntInRange("store.deleted.message.retention.hours", 168, 1, Integer.MAX_VALUE);
     storeCompactionPolicySwitchTimestampDays =
-        verifiableProperties.getIntInRange("store.compaction.policy.switch.timestamp.days", 7, 1, 14);
-    storeCompactionPolicySwitchCounterDays =
-        verifiableProperties.getIntInRange("store.compaction.policy.switch.counter.days", 7, 1, 14);
+        verifiableProperties.getIntInRange("store.compaction.policy.switch.timestamp.days", 6, 1, 14);
     storeContainerDeletionRetentionDays = verifiableProperties.getInt("store.container.deletion.retention.days", 14);
     storeHardDeleteOperationsBytesPerSec =
         verifiableProperties.getIntInRange("store.hard.delete.operations.bytes.per.sec", 100 * 1024, 1,
@@ -385,7 +486,16 @@ public class StoreConfig {
     storeCompactionOperationsBytesPerSec =
         verifiableProperties.getIntInRange("store.compaction.operations.bytes.per.sec", 1 * 1024 * 1024, 1,
             Integer.MAX_VALUE);
+    storeCompactionMinOperationsBytesPerSec =
+        verifiableProperties.getIntInRange("store.compaction.min.operations.bytes.per.sec", 512 * 1024, 1,
+            Integer.MAX_VALUE);
+    storeCompactionOperationsAdjustK =
+        verifiableProperties.getDoubleInRange("store.compaction.operations.adjust.k", 1.0, -100.0, 100.0);
+    storeCompactionThrottlerCheckIntervalMs =
+        verifiableProperties.getIntInRange("store.compaction.throttler.check.interval.ms", -1, -1, Integer.MAX_VALUE);
     storeCompactionEnableDirectIO = verifiableProperties.getBoolean("store.compaction.enable.direct.io", false);
+    storeCompactionPurgeDeleteTombstone =
+        verifiableProperties.getBoolean("store.compaction.purge.delete.tombstone", false);
     storeCompactionMinBufferSize =
         verifiableProperties.getIntInRange("store.compaction.min.buffer.size", 10 * 1024 * 1024, 0, Integer.MAX_VALUE);
     storeCompactionFilter =
@@ -407,11 +517,15 @@ public class StoreConfig {
         verifiableProperties.getLongInRange("store.stats.bucket.span.in.minutes", 60, 1, 10000);
     storeStatsRecentEntryProcessingIntervalInMinutes =
         verifiableProperties.getLongInRange("store.stats.recent.entry.processing.interval.in.minutes", 2, 1, 60);
+    storeGetValidSizeIntervalInSecs =
+        verifiableProperties.getLongInRange("store.get.valid.size.interval.in.secs", 2 * 60, 1, 60 * 60);
     storeStatsWaitTimeoutInSecs =
         verifiableProperties.getLongInRange("store.stats.wait.timeout.in.secs", 2 * 60, 0, 30 * 60);
     storeStatsIndexEntriesPerSecond =
         verifiableProperties.getIntInRange("store.stats.index.entries.per.second", 240000, 1, Integer.MAX_VALUE);
     storeIndexPersistedEntryMinBytes = verifiableProperties.getInt("store.index.persisted.entry.min.bytes", 115);
+    storeDetermineLogSegmentOnlyContainsHeaderMinBytes =
+        verifiableProperties.getIntInRange("store.determine.log.segment.only.contains.header.min.bytes", 20, 1, 1000);
     storeReplicaStatusDelegateEnable = verifiableProperties.getBoolean(storeReplicaStatusDelegateEnableName, false);
     storeReadOnlyEnableSizeThresholdPercentage =
         verifiableProperties.getIntInRange(storeReadOnlyEnableSizeThresholdPercentageName, 95, 0, 100);
@@ -427,6 +541,8 @@ public class StoreConfig {
         verifiableProperties.getIntInRange("store.io.error.count.to.trigger.shutdown", Integer.MAX_VALUE, 1,
             Integer.MAX_VALUE);
     storeSetFilePermissionEnabled = verifiableProperties.getBoolean("store.set.file.permission.enabled", false);
+    storeAutoCloseLastLogSegmentEnabled = verifiableProperties.getBoolean(storeAutoCloseLastLogSegmentEnabledName, false);
+    storeUnsealReplicaMinimumLagBytes = verifiableProperties.getLongInRange(storeUnsealReplicaMinimumLagBytesName, 0, 0, Long.MAX_VALUE);
     String storeDataFilePermissionStr = verifiableProperties.getString("store.data.file.permission", "rw-rw----");
     storeDataFilePermission = PosixFilePermissions.fromString(storeDataFilePermissionStr);
     String storeOperationFilePermissionStr =
@@ -435,12 +551,27 @@ public class StoreConfig {
     storeUuidBasedBloomFilterEnabled = verifiableProperties.getBoolean("store.uuid.based.bloom.filter.enabled", false);
     storeIndexRebuildBloomFilterEnabled =
         verifiableProperties.getBoolean("store.index.rebuild.bloom.filter.enabled", false);
+    storeBloomFilterMaximumPageCount =
+        verifiableProperties.getIntInRange("store.bloom.filter.maximum.page.count", 128, 1, Integer.MAX_VALUE);
     storeContainerDeletionEnabled = verifiableProperties.getBoolean("store.container.deletion.enabled", false);
     storeSetLocalPartitionStateEnabled =
         verifiableProperties.getBoolean("store.set.local.partition.state.enabled", false);
     storeEnableBucketForLogSegmentReports =
         verifiableProperties.getBoolean("store.enable.bucket.for.log.segment.reports", false);
+    storeEnableCurrentInvalidSizeMetric =
+        verifiableProperties.getBoolean("store.enable.current.invalid.size.metric", false);
     storeAlwaysEnableTargetIndexDuplicateChecking =
         verifiableProperties.getBoolean(storeAlwaysEnableTargetIndexDuplicateCheckingName, false);
+    storeRebuildTokenBasedOnResetKey = verifiableProperties.getBoolean("store.rebuild.token.based.on.reset.key", false);
+    storeCompactionEnableBasicInfoOnMissingDuplicate =
+        verifiableProperties.getBoolean(storeCompactionEnableBasicInfoOnMissingDuplicateName, false);
+    storeCompactionIoPerMbReadLatencyThresholdMs =
+        verifiableProperties.getIntInRange("store.compaction.io.per.mb.read.latency.threshold.ms", 20, 0,
+            Integer.MAX_VALUE);
+    storeCompactionIoPerMbWriteLatencyThresholdMs =
+        verifiableProperties.getIntInRange("store.compaction.io.per.mb.write.latency.threshold.ms", 20, 0,
+            Integer.MAX_VALUE);
+    storeDiskIoReservoirTimeWindowMs =
+        verifiableProperties.getIntInRange("store.disk.io.reservoir.time.window.ms", 200, 0, Integer.MAX_VALUE);
   }
 }

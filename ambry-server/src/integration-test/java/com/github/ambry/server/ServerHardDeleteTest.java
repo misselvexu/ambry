@@ -94,7 +94,7 @@ public class ServerHardDeleteTest {
     props.setProperty("port", Integer.toString(mockClusterMap.getDataNodes().get(0).getPort()));
     props.setProperty("store.data.flush.interval.seconds", "1");
     props.setProperty("store.enable.hard.delete", "true");
-    props.setProperty("store.deleted.message.retention.days", "7");
+    props.setProperty("store.deleted.message.retention.hours", "168");
     props.setProperty("server.handle.undelete.request.enabled", "true");
     props.setProperty("clustermap.cluster.name", "test");
     props.setProperty("clustermap.datacenter.name", "DC1");
@@ -314,7 +314,10 @@ public class ServerHardDeleteTest {
     //
     // Add 14 here when changing message header version to 3, since the message header version went from 2 to 3 and adds
     // a short to every record, which include 6 puts and 1 delete. (last delete is not included).
-    int expectedTokenValueT1 = 198732 + 14;
+
+    // old value is 198732 + 14. Increased by 48 when adding two fields(4 BYTE CRC for each field) in blobProperty when putBlob.
+    // There are 6 * (4 + 4). 6 stands for the times for putBlob, 4 stands for 4 extra blobProperty Bytes for each field.
+    int expectedTokenValueT1 = 198732 + 14 + 48;
     ensureCleanupTokenCatchesUp(chosenPartition.getReplicaIds().get(0).getReplicaPath(), mockClusterMap,
         expectedTokenValueT1);
 
@@ -351,7 +354,7 @@ public class ServerHardDeleteTest {
 
     time.sleep(TimeUnit.DAYS.toMillis(1));
     // For each future change to this offset, add to this variable and write an explanation of why the number changed.
-    int expectedTokenValueT2 = 298416 + 98 + 28;
+    int expectedTokenValueT2 = 298416 + 98 + 28 + 72;
     // old value: 298400. Increased by 16 (4 * 4) to 298416 because the format for delete record went from 2 to 3 which
     // adds 4 bytes (two shorts) extra. The last record is a delete record so its extra 4 bytes are not added
     //
@@ -362,6 +365,9 @@ public class ServerHardDeleteTest {
     // old value is 298416 + 98. Increased by 28 when changing the message header version from 2 to 3, which adds a short
     // to all the records, which includes 9 puts and 5 deletes and 1 undelete. Undelete is not include since it's the last
     // record.
+
+    // old value is 298416 + 98 + 28. Increased by 72 when adding two fields(4 BYTE CRC for each field) in blobProperty when putBlob.
+    // There are 9 * (4 + 4). 9 stands for the times for putBlob, 4 stands for 4 extra blobProperty Bytes.
     ensureCleanupTokenCatchesUp(chosenPartition.getReplicaIds().get(0).getReplicaPath(), mockClusterMap,
         expectedTokenValueT2);
 
@@ -382,9 +388,7 @@ public class ServerHardDeleteTest {
     PutRequest putRequest0 =
         new PutRequest(1, "client1", blobId, properties, ByteBuffer.wrap(usermetadata), Unpooled.wrappedBuffer(data),
             properties.getBlobSize(), BlobType.DataBlob, encryptionKey == null ? null : ByteBuffer.wrap(encryptionKey));
-    channel.send(putRequest0);
-    InputStream putResponseStream = channel.receive().getInputStream();
-    PutResponse response0 = PutResponse.readFrom(new DataInputStream(putResponseStream));
+    PutResponse response0 = PutResponse.readFrom(channel.sendAndReceive(putRequest0).getInputStream());
     Assert.assertEquals(ServerErrorCode.No_Error, response0.getError());
   }
 
@@ -396,9 +400,7 @@ public class ServerHardDeleteTest {
    */
   void deleteBlob(BlobId blobId, ConnectedChannel channel) throws IOException {
     DeleteRequest deleteRequest = new DeleteRequest(1, "client1", blobId, time.milliseconds());
-    channel.send(deleteRequest);
-    InputStream deleteResponseStream = channel.receive().getInputStream();
-    DeleteResponse deleteResponse = DeleteResponse.readFrom(new DataInputStream(deleteResponseStream));
+    DeleteResponse deleteResponse = DeleteResponse.readFrom(channel.sendAndReceive(deleteRequest).getInputStream());
     Assert.assertEquals(ServerErrorCode.No_Error, deleteResponse.getError());
   }
 
@@ -409,10 +411,9 @@ public class ServerHardDeleteTest {
    * @throws IOException
    */
   void undeleteBlob(BlobId blobId, ConnectedChannel channel) throws IOException {
-    UndeleteRequest deleteRequest = new UndeleteRequest(1, "client1", blobId, time.milliseconds());
-    channel.send(deleteRequest);
-    InputStream undeleteResponseStream = channel.receive().getInputStream();
-    UndeleteResponse undeleteResponse = UndeleteResponse.readFrom(new DataInputStream(undeleteResponseStream));
+    UndeleteRequest unDeleteRequest = new UndeleteRequest(1, "client1", blobId, time.milliseconds());
+    UndeleteResponse undeleteResponse =
+        UndeleteResponse.readFrom(channel.sendAndReceive(unDeleteRequest).getInputStream());
     Assert.assertEquals("BlobId " + blobId + " undelete failed", ServerErrorCode.No_Error, undeleteResponse.getError());
   }
 
@@ -449,9 +450,7 @@ public class ServerHardDeleteTest {
     flags.add(MessageFormatFlags.Blob);
     for (MessageFormatFlags flag : flags) {
       GetRequest getRequest = new GetRequest(1, "clientid2", flag, partitionRequestInfoList, GetOption.Include_All);
-      channel.send(getRequest);
-      InputStream stream = channel.receive().getInputStream();
-      GetResponse resp = GetResponse.readFrom(new DataInputStream(stream), mockClusterMap);
+      GetResponse resp = GetResponse.readFrom(channel.sendAndReceive(getRequest).getInputStream(), mockClusterMap);
       if (flag == MessageFormatFlags.BlobProperties) {
         for (int i = 0; i < blobsCount; i++) {
           BlobProperties propertyOutput = MessageFormatRecord.deserializeBlobProperties(resp.getInputStream());

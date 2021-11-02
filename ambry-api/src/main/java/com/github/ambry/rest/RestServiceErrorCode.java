@@ -209,6 +209,8 @@ public enum RestServiceErrorCode {
       case BlobUndeleted:
       case BlobNotDeleted:
         return Conflict;
+      case TooManyRequests:
+        return TooManyRequests;
       case UnexpectedInternalError:
       case ChannelClosed:
       case LifeVersionConflict:
@@ -232,6 +234,10 @@ public enum RestServiceErrorCode {
         return BadRequest;
       case UpdateDisabled:
         return ServiceUnavailable;
+      case ResourceHasGone:
+        return Deleted;
+      case MethodNotAllowed:
+        return NotAllowed;
       default:
         return InternalServerError;
     }

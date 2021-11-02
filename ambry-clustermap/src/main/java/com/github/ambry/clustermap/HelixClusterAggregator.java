@@ -14,6 +14,7 @@
 
 package com.github.ambry.clustermap;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.ambry.server.StatsHeader;
 import com.github.ambry.server.StatsReportType;
 import com.github.ambry.server.StatsSnapshot;
@@ -25,7 +26,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import org.codehaus.jackson.map.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -69,11 +69,6 @@ public class HelixClusterAggregator {
       }
     }
     return doWorkOnStatsWrapperMap(statsWrappers, type, false);
-  }
-
-  Pair<StatsSnapshot, StatsSnapshot> doWorkOnStatsWrapperMap(Map<String, StatsWrapper> statsWrappers,
-      StatsReportType type) throws IOException {
-    return doWorkOnStatsWrapperMap(statsWrappers, type, true);
   }
 
   Pair<StatsSnapshot, StatsSnapshot> doWorkOnStatsWrapperMap(Map<String, StatsWrapper> statsWrappers,
@@ -128,6 +123,8 @@ public class HelixClusterAggregator {
       default:
         throw new IllegalArgumentException("Unrecognized stats report type: " + type);
     }
+    reducedRawSnapshot.removeZeroValueSnapshots();
+    reducedSnapshot.removeZeroValueSnapshots();
     if (logger.isTraceEnabled()) {
       logger.trace("Reduced raw snapshot {}", mapper.writeValueAsString(reducedRawSnapshot));
       logger.trace("Reduced valid snapshot {}", mapper.writeValueAsString(reducedSnapshot));

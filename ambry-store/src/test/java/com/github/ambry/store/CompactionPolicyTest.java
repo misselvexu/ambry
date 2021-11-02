@@ -14,6 +14,7 @@
 package com.github.ambry.store;
 
 import com.codahale.metrics.MetricRegistry;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.ambry.account.InMemAccountService;
 import com.github.ambry.config.StoreConfig;
 import com.github.ambry.config.VerifiableProperties;
@@ -60,6 +61,8 @@ public class CompactionPolicyTest {
   private static final String MOUNT_PATH = "/tmp/";
   private final Path dataDirPath;
   private static final Logger logger = LoggerFactory.getLogger(CompactionPolicyTest.class);
+  private static final ObjectMapper objectMapper = new ObjectMapper();
+  private static final String COMPACT_POLICY_INFO_FILE_NAME_V2 = "compactionPolicyInfoV2.json";
 
   // the properties that will used to generate a StoreConfig. Clear before use if required.
   private final Properties properties = new Properties();
@@ -89,7 +92,7 @@ public class CompactionPolicyTest {
     properties.setProperty("store.compaction.policy.factory", compactionPolicyFactoryStr);
     Pair<MockBlobStore, StoreConfig> initState = initializeBlobStore(properties, time, -1, -1, DEFAULT_MAX_BLOB_SIZE);
     config = initState.getSecond();
-    messageRetentionTimeInMs = TimeUnit.DAYS.toMillis(config.storeDeletedMessageRetentionDays);
+    messageRetentionTimeInMs = TimeUnit.HOURS.toMillis(config.storeDeletedMessageRetentionHours);
     blobStore = initState.getFirst();
     mockBlobStoreStats = blobStore.getBlobStoreStats();
     CompactionPolicyFactory compactionPolicyFactory = Utils.getObj(compactionPolicyFactoryStr, config, time);
@@ -106,94 +109,43 @@ public class CompactionPolicyTest {
     cleanupBackupFiles();
     // with compaction enabled.
     properties.setProperty("store.compaction.triggers", "Periodic");
-    properties.setProperty("store.compaction.policy.switch.counter.days", "3");
-    properties.setProperty("store.compaction.policy.switch.timestamp.days", "7");
+    properties.setProperty("store.compaction.policy.switch.timestamp.days", "6");
     properties.setProperty("store.compaction.policy.factory", "com.github.ambry.store.HybridCompactionPolicyFactory");
     config = new StoreConfig(new VerifiableProperties(properties));
     MetricRegistry metricRegistry = new MetricRegistry();
     CompactionManager compactionManager = new CompactionManager(MOUNT_PATH, config, Collections.singleton(blobStore),
         new StorageManagerMetrics(metricRegistry), time);
     StoreMetrics metrics = new StoreMetrics(metricRegistry);
-    int numStores = 5;
-    for (int i = 1; i <= numStores; i++) {
-      MockBlobStoreStats mockBlobStoreStats = new MockBlobStoreStats(DEFAULT_MAX_BLOB_SIZE, i);
-      MockBlobStore blobStore =
-          new MockBlobStore(config, metrics, time, CAPACITY_IN_BYTES, SEGMENT_CAPACITY_IN_BYTES, SEGMENT_HEADER_SIZE,
-              DEFAULT_USED_CAPACITY_IN_BYTES,
-              mockBlobStoreStats);      //BlobStore store = Mockito.mock(BlobStore.class);
-      String blobId = mockBlobStoreStats.getStoreId();
-      File tmpFile = new File(MOUNT_PATH + blobId);
-      if (!tmpFile.exists()) {
-        tmpFile.mkdir();
-      }
-      compactionManager.getCompactionDetails(blobStore);
-      assertEquals("Counter value should match with expectation", 1 % config.storeCompactionPolicySwitchCounterDays,
-          ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-              .get(blobId)
-              .getCompactionPolicyCounter()
-              .getCounter());
-      compactionManager.getCompactionDetails(blobStore);
-      assertEquals("Counter value should match with expectation", 2 % config.storeCompactionPolicySwitchCounterDays,
-          ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-              .get(blobId)
-              .getCompactionPolicyCounter()
-              .getCounter());
-      compactionManager.getCompactionDetails(blobStore);
-      assertEquals("Counter value should match with expectation", 3 % config.storeCompactionPolicySwitchCounterDays,
-          ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-              .get(blobId)
-              .getCompactionPolicyCounter()
-              .getCounter());
-      //set last compactAll kick off time to current time to trigger compactAllPolicy
-      ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-          .get(blobId)
-          .setLastCompactAllTime(
-              System.currentTimeMillis() - TimeUnit.DAYS.toMillis(config.storeCompactionPolicySwitchTimestampDays));
-      compactionManager.getCompactionDetails(blobStore);
-      assertEquals("TimeStamp will be set to the compactAllPolicy kick off time",
-          1 % config.storeCompactionPolicySwitchCounterDays,
-          ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-              .get(blobId)
-              .getCompactionPolicyCounter()
-              .getCounter());
-      //set last compactAll kick off time to current time to trigger compactAllPolicy
-      ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-          .get(blobId)
-          .setLastCompactAllTime(
-              System.currentTimeMillis() - TimeUnit.DAYS.toMillis(config.storeCompactionPolicySwitchTimestampDays));
-      compactionManager.getCompactionDetails(blobStore);
-      assertEquals("TimeStamp will be set to the compactAllPolicy kick off time",
-          1 % config.storeCompactionPolicySwitchTimestampDays,
-          ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-              .get(blobId)
-              .getCompactionPolicyCounter()
-              .getCounter());
-      //add one more round to check if compaction will be recovered from backup file
-      compactionManager.getCompactionDetails(blobStore);
-      assertEquals("Counter value should match with expectation", 2 % config.storeCompactionPolicySwitchCounterDays,
-          ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-              .get(blobId)
-              .getCompactionPolicyCounter()
-              .getCounter());
-    }
-    //check BlobToCompactionPolicySwitchInfoMap match with expectation.
-    assertEquals("map size should equals to number of stores", numStores,
-        ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-            .size());
-
-    //add one more round to check if compaction will be recovered from backup file
     MockBlobStoreStats mockBlobStoreStats = new MockBlobStoreStats(DEFAULT_MAX_BLOB_SIZE, 1);
     MockBlobStore blobStore =
         new MockBlobStore(config, metrics, time, CAPACITY_IN_BYTES, SEGMENT_CAPACITY_IN_BYTES, SEGMENT_HEADER_SIZE,
-            DEFAULT_USED_CAPACITY_IN_BYTES, mockBlobStoreStats);      //BlobStore store = Mockito.mock(BlobStore.class);
+            DEFAULT_USED_CAPACITY_IN_BYTES, mockBlobStoreStats);
     String blobId = mockBlobStoreStats.getStoreId();
+    File tmpDir = new File(MOUNT_PATH + blobId);
+    if (!tmpDir.exists()) {
+      tmpDir.mkdir();
+    }
+    compactionManager.getCompactionDetails(blobStore);
+    File compactionPolicyInfoFile = new File(tmpDir.toString(), COMPACT_POLICY_INFO_FILE_NAME_V2);
+    CompactionPolicySwitchInfo compactionPolicySwitchInfo =
+        objectMapper.readValue(compactionPolicyInfoFile, CompactionPolicySwitchInfo.class);
+    assertFalse("Next round of compaction is not compactAll", compactionPolicySwitchInfo.isNextRoundCompactAllPolicy());
+    //set last compactAll kick off time to current time to trigger compactAllPolicy
+    compactionPolicySwitchInfo.setLastCompactAllTime(
+        compactionPolicySwitchInfo.getLastCompactAllTime() - TimeUnit.DAYS.toMillis(
+            config.storeCompactionPolicySwitchTimestampDays));
+    ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
+        .put(mockBlobStoreStats.getStoreId(), compactionPolicySwitchInfo);
+    objectMapper.writerWithDefaultPrettyPrinter().writeValue(compactionPolicyInfoFile, compactionPolicySwitchInfo);
+    compactionManager.getCompactionDetails(blobStore);
+    compactionPolicySwitchInfo = objectMapper.readValue(compactionPolicyInfoFile, CompactionPolicySwitchInfo.class);
+    assertTrue("Next round of compaction is not compactAll", compactionPolicySwitchInfo.isNextRoundCompactAllPolicy());
+
+    //add one more round to check if compaction will be recovered from backup file
     ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap().clear();
     compactionManager.getCompactionDetails(blobStore);
-    assertEquals("Counter value should match with expectation", 3 % config.storeCompactionPolicySwitchCounterDays,
-        ((HybridCompactionPolicy) compactionManager.getCompactionPolicy()).getBlobToCompactionPolicySwitchInfoMap()
-            .get(blobId)
-            .getCompactionPolicyCounter()
-            .getCounter());
+    compactionPolicySwitchInfo = objectMapper.readValue(compactionPolicyInfoFile, CompactionPolicySwitchInfo.class);
+    assertFalse("Next round of compaction is not compactAll", compactionPolicySwitchInfo.isNextRoundCompactAllPolicy());
   }
 
   /**
@@ -203,7 +155,7 @@ public class CompactionPolicyTest {
    */
   @Test
   public void testDifferentUsedCapacities() throws StoreException {
-    List<String> bestCandidates = null;
+    List<LogSegmentName> bestCandidates = null;
     if (compactionPolicy instanceof StatsBasedCompactionPolicy) {
       bestCandidates = setUpStateForStatsBasedCompactionPolicy(blobStore, mockBlobStoreStats);
     } else if (compactionPolicy instanceof CompactAllPolicy) {
@@ -222,8 +174,9 @@ public class CompactionPolicyTest {
           * blobStore.capacityInBytes)) {
         verifyCompactionDetails(null, blobStore, compactionPolicy);
       } else {
-        verifyCompactionDetails(new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates),
-            blobStore, compactionPolicy);
+        verifyCompactionDetails(
+            new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates, null), blobStore,
+            compactionPolicy);
       }
     }
   }
@@ -238,7 +191,7 @@ public class CompactionPolicyTest {
     int[] minLogSizeToTriggerCompactionInPercentages = new int[]{10, 20, 35, 40, 50, 59, 60, 61, 65, 70, 80, 95};
     // when used capacity(60%) is <= (minLogSize) % of total capacity, compactionDetails is expected to be null.
     // If not, logSegmentsNotInJournal needs to be returned
-    List<String> bestCandidates = null;
+    List<LogSegmentName> bestCandidates = null;
     for (int minLogSize : minLogSizeToTriggerCompactionInPercentages) {
       initializeBlobStore(properties, time, minLogSize, -1, DEFAULT_MAX_BLOB_SIZE);
       if (compactionPolicy instanceof StatsBasedCompactionPolicy) {
@@ -251,24 +204,25 @@ public class CompactionPolicyTest {
           * blobStore.capacityInBytes)) {
         verifyCompactionDetails(null, blobStore, compactionPolicy);
       } else {
-        verifyCompactionDetails(new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates),
-            blobStore, compactionPolicy);
+        verifyCompactionDetails(
+            new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates, null), blobStore,
+            compactionPolicy);
       }
     }
   }
 
   /**
    * Tests {@link CompactionManager#getCompactionDetails(BlobStore)} for different values for
-   * {@link StoreConfig#storeDeletedMessageRetentionDays}
+   * {@link StoreConfig#storeDeletedMessageRetentionHours}
    */
   @Test
   public void testDifferentMessageRetentionDays() throws StoreException, InterruptedException {
-    List<String> bestCandidates = null;
-    int[] messageRetentionDayValues = new int[]{1, 2, 3, 6, 9};
-    for (int messageRetentionDays : messageRetentionDayValues) {
+    List<LogSegmentName> bestCandidates = null;
+    int[] messageRetentionHoursValues = new int[]{1, 2, 3, 6, 9};
+    for (int messageRetentionHours : messageRetentionHoursValues) {
       time = new MockTime();
       Pair<MockBlobStore, StoreConfig> initState =
-          initializeBlobStore(properties, time, -1, messageRetentionDays, DEFAULT_MAX_BLOB_SIZE);
+          initializeBlobStore(properties, time, -1, messageRetentionHours, DEFAULT_MAX_BLOB_SIZE);
       if (compactionPolicy instanceof StatsBasedCompactionPolicy) {
         bestCandidates = setUpStateForStatsBasedCompactionPolicy(blobStore, mockBlobStoreStats);
         compactionPolicy = new StatsBasedCompactionPolicy(initState.getSecond(), time);
@@ -278,8 +232,8 @@ public class CompactionPolicyTest {
         compactionPolicy = new CompactAllPolicy(initState.getSecond(), time);
       }
       verifyCompactionDetails(
-          new CompactionDetails(time.milliseconds() - TimeUnit.DAYS.toMillis(messageRetentionDays), bestCandidates),
-          blobStore, compactionPolicy);
+          new CompactionDetails(time.milliseconds() - TimeUnit.HOURS.toMillis(messageRetentionHours), bestCandidates,
+              null), blobStore, compactionPolicy);
     }
   }
 
@@ -289,22 +243,22 @@ public class CompactionPolicyTest {
    * Initializes {@link BlobStore}
    * @param minLogSizeToTriggerCompactionInPercentage Property value to be set for
    * {@link StoreConfig#storeMinUsedCapacityToTriggerCompactionInPercentage}
-   * @param messageRetentionInDays Property value to be set for {@link StoreConfig#storeDeletedMessageRetentionDays
+   * @param messageRetentionInHours Property value to be set for {@link StoreConfig#storeDeletedMessageRetentionHours
    * @throws InterruptedException
    */
   static Pair<MockBlobStore, StoreConfig> initializeBlobStore(Properties properties, Time time,
-      int minLogSizeToTriggerCompactionInPercentage, int messageRetentionInDays, long maxBlobSize)
+      int minLogSizeToTriggerCompactionInPercentage, int messageRetentionInHours, long maxBlobSize)
       throws InterruptedException {
 
     if (minLogSizeToTriggerCompactionInPercentage != -1) {
       properties.setProperty("store.min.log.size.to.trigger.compaction.in.percent",
           String.valueOf(minLogSizeToTriggerCompactionInPercentage));
     }
-    if (messageRetentionInDays != -1) {
-      properties.setProperty("store.deleted.message.retention.days", String.valueOf(messageRetentionInDays));
+    if (messageRetentionInHours != -1) {
+      properties.setProperty("store.deleted.message.retention.hours", String.valueOf(messageRetentionInHours));
     }
     StoreConfig config = new StoreConfig(new VerifiableProperties(properties));
-    time.sleep(2 * TimeUnit.DAYS.toMillis(config.storeDeletedMessageRetentionDays));
+    time.sleep(10 * TimeUnit.HOURS.toMillis(config.storeDeletedMessageRetentionHours));
     MetricRegistry metricRegistry = new MetricRegistry();
     StoreMetrics metrics = new StoreMetrics(metricRegistry);
     MockBlobStoreStats mockBlobStoreStats = new MockBlobStoreStats(maxBlobSize);
@@ -328,7 +282,7 @@ public class CompactionPolicyTest {
     File[] files = backupDir.listFiles(tempFileFilter);
     if (files != null) {
       for (File file : files) {
-        File deleteFile = new File(MOUNT_PATH + file.getName() + File.separator + "compactionPolicyInfo.json");
+        File deleteFile = new File(MOUNT_PATH + file.getName(), "compactionPolicyInfo.json");
         logger.trace("Delete temp file {}", deleteFile.getName());
         deleteFile(deleteFile.toPath());
       }
@@ -356,7 +310,7 @@ public class CompactionPolicyTest {
    * {@link StatsBasedCompactionPolicy}
    * @return a {@link List} of log segment names referring to the best candidate to compact
    */
-  private List<String> setUpStateForStatsBasedCompactionPolicy(MockBlobStore blobStore,
+  private List<LogSegmentName> setUpStateForStatsBasedCompactionPolicy(MockBlobStore blobStore,
       MockBlobStoreStats mockBlobStoreStats) {
     long maxLogSegmentCapacity =
         blobStore.segmentCapacity - blobStore.segmentHeaderSize - mockBlobStoreStats.getMaxBlobSize();
@@ -367,11 +321,11 @@ public class CompactionPolicyTest {
     int bestCandidateStartIndex = TestUtils.RANDOM.nextInt((int) logSegmentCount - bestCandidateRange + 1);
     int bestCandidateEndIndex = bestCandidateStartIndex + bestCandidateRange - 1;
 
-    List<String> bestCandidates =
+    List<LogSegmentName> bestCandidates =
         blobStore.logSegmentsNotInJournal.subList(bestCandidateStartIndex, bestCandidateEndIndex + 1);
     long bestCost = maxLogSegmentCapacity / bestCandidates.size();
     // this best cost is to ensure that no of segments reclaimed will be "bestCandidates" count - 1
-    NavigableMap<String, Long> validDataSize =
+    NavigableMap<LogSegmentName, Long> validDataSize =
         generateValidDataSize(blobStore.logSegmentsNotInJournal, bestCandidates, bestCost, maxLogSegmentCapacity);
     mockBlobStoreStats.validDataSizeByLogSegments = validDataSize;
     return bestCandidates;
@@ -382,16 +336,13 @@ public class CompactionPolicyTest {
    * @param count the total number of random log segment names that needs to be generated
    * @return a {@link List} of random log segment name of size {@code count}
    */
-  static List<String> generateRandomLogSegmentName(int count) {
-    List<String> randomLogSegmentNames = new ArrayList<>();
+  static List<LogSegmentName> generateRandomLogSegmentName(int count) {
+    List<LogSegmentName> randomLogSegmentNames = new ArrayList<>();
     while (randomLogSegmentNames.size() < count) {
-      String logSegmentName =
-          LogSegmentNameHelper.getName(TestUtils.RANDOM.nextInt(count * 1000), TestUtils.RANDOM.nextInt(count * 1000));
-      if (!randomLogSegmentNames.contains(logSegmentName)) {
-        randomLogSegmentNames.add(logSegmentName);
-      }
+      LogSegmentName logSegmentName = StoreTestUtils.getRandomLogSegmentName(randomLogSegmentNames);
+      randomLogSegmentNames.add(logSegmentName);
     }
-    Collections.sort(randomLogSegmentNames, LogSegmentNameHelper.COMPARATOR);
+    Collections.sort(randomLogSegmentNames);
     return randomLogSegmentNames;
   }
 
@@ -402,10 +353,10 @@ public class CompactionPolicyTest {
    * @param validDataSizeForBest valid data size to be set for best candidate
    * @return a {@link NavigableMap} of log segment name to valid data size
    */
-  static NavigableMap<String, Long> generateValidDataSize(List<String> logSegmentNames, List<String> bestCandidates,
-      long validDataSizeForBest, long maxLogSegmentCapacity) {
-    NavigableMap<String, Long> validDataSize = new TreeMap<>(LogSegmentNameHelper.COMPARATOR);
-    for (String logSegmentName : logSegmentNames) {
+  static NavigableMap<LogSegmentName, Long> generateValidDataSize(List<LogSegmentName> logSegmentNames,
+      List<LogSegmentName> bestCandidates, long validDataSizeForBest, long maxLogSegmentCapacity) {
+    NavigableMap<LogSegmentName, Long> validDataSize = new TreeMap<>();
+    for (LogSegmentName logSegmentName : logSegmentNames) {
       if (bestCandidates.contains(logSegmentName)) {
         validDataSize.put(logSegmentName, validDataSizeForBest);
       } else {
@@ -421,9 +372,9 @@ public class CompactionPolicyTest {
    * @param logSegmentsToUpdate log segments to be updated
    * @param newValidDataSize new valid data size that needs to be updated
    */
-  static void updateValidDataSize(NavigableMap<String, Long> validDataSizePerLogSegment,
-      List<String> logSegmentsToUpdate, long newValidDataSize) {
-    for (String logSegmentName : logSegmentsToUpdate) {
+  static void updateValidDataSize(NavigableMap<LogSegmentName, Long> validDataSizePerLogSegment,
+      List<LogSegmentName> logSegmentsToUpdate, long newValidDataSize) {
+    for (LogSegmentName logSegmentName : logSegmentsToUpdate) {
       validDataSizePerLogSegment.put(logSegmentName, newValidDataSize);
     }
   }
@@ -456,14 +407,14 @@ class MockBlobStore extends BlobStore {
   long segmentCapacity;
   long segmentHeaderSize;
   long capacityInBytes;
-  List<String> logSegmentsNotInJournal = null;
+  List<LogSegmentName> logSegmentsNotInJournal = null;
   MockBlobStoreStats mockBlobStoreStats;
 
   MockBlobStore(StoreConfig config, StoreMetrics metrics, Time time, long capacityInBytes, long segmentCapacity,
       long segmentHeaderSize, long usedCapacity, MockBlobStoreStats mockBlobStoreStats) {
     super(StoreTestUtils.createMockReplicaId(mockBlobStoreStats.getStoreId(), 0,
         "/tmp/" + mockBlobStoreStats.getStoreId() + "/"), config, null, null, null, null, metrics, metrics, null, null,
-        null, null, time, new InMemAccountService(false, false));
+        null, null, time, new InMemAccountService(false, false), null);
     this.capacityInBytes = capacityInBytes;
     this.segmentCapacity = segmentCapacity;
     this.segmentHeaderSize = segmentHeaderSize;
@@ -486,35 +437,35 @@ class MockBlobStore extends BlobStore {
  * Mock {@link BlobStoreStats} for test purposes
  */
 class MockBlobStoreStats extends BlobStoreStats {
+  private final long maxBlobSize;
 
-  NavigableMap<String, Long> validDataSizeByLogSegments;
-  private long maxBlobSize;
+  NavigableMap<LogSegmentName, Long> validDataSizeByLogSegments;
   private String storeId = "";
 
   MockBlobStoreStats(long maxBlobSize) {
-    super("", null, 0, 0, 0, 0, 0, true, null, null, null, null, null);
+    super("", null, 0, 0, 0, 0, 0, true, true, null, null, null, null, null, 1, false);
     this.maxBlobSize = maxBlobSize;
   }
 
   MockBlobStoreStats(long maxBlobSize, int i) {
-    super("storeId" + i, null, 0, 0, 0, 0, 0, true, null, null, null, null, null);
-    this.maxBlobSize = maxBlobSize;
+    super("storeId" + i, null, 0, 0, 0, 0, 0, true, true, null, null, null, null, null, 1, false);
     this.storeId = "storeId" + i;
+    this.maxBlobSize = maxBlobSize;
   }
 
   @Override
-  Pair<Long, NavigableMap<String, Long>> getValidDataSizeByLogSegment(TimeRange timeRange) throws StoreException {
+  public long getMaxBlobSize() {
+    return maxBlobSize;
+  }
+
+  @Override
+  Pair<Long, NavigableMap<LogSegmentName, Long>> getValidDataSizeByLogSegment(TimeRange timeRange) {
     long deleteReferenceTimeInMs = timeRange.getEndTimeInMs();
     if (validDataSizeByLogSegments != null) {
-      return new Pair<>(deleteReferenceTimeInMs, validDataSizeByLogSegments);
+      return new Pair<Long, NavigableMap<LogSegmentName, Long>>(deleteReferenceTimeInMs, validDataSizeByLogSegments);
     } else {
       return null;
     }
-  }
-
-  @Override
-  long getMaxBlobSize() {
-    return maxBlobSize;
   }
 
   String getStoreId() {

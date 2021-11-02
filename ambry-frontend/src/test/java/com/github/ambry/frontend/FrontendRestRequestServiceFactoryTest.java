@@ -13,19 +13,28 @@
  */
 package com.github.ambry.frontend;
 
+import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.account.AccountService;
 import com.github.ambry.account.InMemAccountService;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.commons.CommonTestUtils;
 import com.github.ambry.config.FrontendConfig;
+import com.github.ambry.config.QuotaConfig;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.quota.AmbryQuotaManager;
+import com.github.ambry.quota.MaxThrottlePolicy;
+import com.github.ambry.quota.QuotaManager;
+import com.github.ambry.quota.QuotaMode;
+import com.github.ambry.quota.QuotaTestUtils;
 import com.github.ambry.rest.RestRequestService;
 import com.github.ambry.router.InMemoryRouter;
 import com.github.ambry.router.Router;
+import java.util.Collections;
 import java.util.Properties;
 import org.json.JSONObject;
 import org.junit.Test;
+import org.mockito.Mockito;
 
 import static org.junit.Assert.*;
 
@@ -34,6 +43,18 @@ import static org.junit.Assert.*;
  * Unit tests for {@link FrontendRestRequestServiceFactory}.
  */
 public class FrontendRestRequestServiceFactoryTest {
+  private final static QuotaManager QUOTA_MANAGER;
+
+  static {
+    try {
+      QuotaConfig quotaConfig = QuotaTestUtils.createQuotaConfig(Collections.emptyMap(), false, QuotaMode.TRACKING);
+      QUOTA_MANAGER =
+          new AmbryQuotaManager(quotaConfig, new MaxThrottlePolicy(quotaConfig), Mockito.mock(AccountService.class),
+              null, new MetricRegistry());
+    } catch (Exception e) {
+      throw new IllegalStateException(e);
+    }
+  }
 
   /**
    * Tests the instantiation of an {@link FrontendRestRequestService} instance through the

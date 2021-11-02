@@ -44,16 +44,16 @@ import com.github.ambry.protocol.ReplicaMetadataRequestInfo;
 import com.github.ambry.protocol.ReplicaMetadataResponse;
 import com.github.ambry.protocol.ReplicaMetadataResponseInfo;
 import com.github.ambry.server.ServerErrorCode;
+import com.github.ambry.store.BlobStore;
 import com.github.ambry.store.MessageInfo;
 import com.github.ambry.store.StoreErrorCodes;
 import com.github.ambry.store.StoreException;
 import com.github.ambry.store.StoreKey;
 import com.github.ambry.store.StoreKeyConverter;
 import com.github.ambry.store.Transformer;
-import com.github.ambry.utils.ByteBufferInputStream;
+import com.github.ambry.utils.NettyByteBufDataInputStream;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
-import java.io.DataInputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -272,7 +272,11 @@ public class ReplicaThread implements Runnable {
       if (!replicasToReplicateGroupedByNode.computeIfAbsent(dataNodeId, key -> new HashSet<>())
           .add(remoteReplicaInfo)) {
         replicationMetrics.remoteReplicaInfoAddError.inc();
-        logger.error("ReplicaThread: {}, RemoteReplicaInfo {} already exists.", threadName, remoteReplicaInfo);
+        // Since VCR is also listening Ambry Clustermap change, this may happen if events happens in following order:
+        // 1. VCR in memory ambry-clustermap updated
+        // 2. VcrClusterParticipantListener adds remote replicas for the newly added partition
+        // 3. ClusterMapChangeListener adds remote replicas
+        logger.warn("ReplicaThread: {}, RemoteReplicaInfo {} already exists.", threadName, remoteReplicaInfo);
       }
     } finally {
       lock.unlock();
@@ -601,22 +605,16 @@ public class ReplicaThread implements Runnable {
                     && remoteReplicaInfo.getLocalStore().getCurrentState() == ReplicaState.BOOTSTRAP) {
                   ReplicaId localReplica = remoteReplicaInfo.getLocalReplicaId();
                   ReplicaId remoteReplica = remoteReplicaInfo.getReplicaId();
-                  boolean updated = replicaSyncUpManager.updateLagBetweenReplicas(localReplica, remoteReplica,
-                      exchangeMetadataResponse.localLagFromRemoteInBytes);
-                  // if updated is false, it means local replica is not found in replicaSyncUpManager and is therefore not
-                  // in bootstrap state.
-                  if (updated && replicaSyncUpManager.isSyncUpComplete(localReplica)) {
+                  boolean isSyncCompleted =
+                      replicaSyncUpManager.updateReplicaLagAndCheckSyncStatus(localReplica, remoteReplica,
+                          exchangeMetadataResponse.localLagFromRemoteInBytes, ReplicaState.STANDBY);
+                  // if catchup is completed by this update call, we can complete bootstrap in local store
+                  if (isSyncCompleted) {
                     // complete BOOTSTRAP -> STANDBY transition
                     remoteReplicaInfo.getLocalStore().setCurrentState(ReplicaState.STANDBY);
-                    replicaSyncUpManager.onBootstrapComplete(localReplica);
                     remoteReplicaInfo.getLocalStore().completeBootstrap();
                   }
                 }
-
-                // add exchangeMetadataResponse to list after replicaSyncUpManager(if not null) has completed update. The
-                // reason is replicaSyncUpManager may also throw exception and add one more exchangeMetadataResponse
-                // associated with same RemoteReplicaInfo.
-                exchangeMetadataResponseList.add(exchangeMetadataResponse);
 
                 // If remote token has not moved forward, wait for back off time before resending next metadata request
                 if (remoteReplicaInfo.getToken().equals(exchangeMetadataResponse.remoteToken)) {
@@ -642,6 +640,11 @@ public class ReplicaThread implements Runnable {
                           .get(replicaMetadataResponseInfo.getMessageInfoList().size() - 1)
                           .getOperationTimeMs());
                 }
+
+                // Add exchangeMetadataResponse to list at the end after operations such as replicaSyncUpManager(if not null)
+                // has completed update, etc. The reason is we may get exceptions in between (for ex: replicaSyncUpManager may
+                // throw exception) and end up adding one more exchangeMetadataResponse associated with same RemoteReplicaInfo.
+                exchangeMetadataResponseList.add(exchangeMetadataResponse);
               } catch (Exception e) {
                 if (e instanceof StoreException
                     && ((StoreException) e).getErrorCode() == StoreErrorCodes.Store_Not_Started) {
@@ -707,6 +710,7 @@ public class ReplicaThread implements Runnable {
       List<ExchangeMetadataResponse> exchangeMetadataResponseList, boolean remoteColoGetRequestForStandby)
       throws IOException, ReplicationException {
     long fixMissingStoreKeysStartTimeInMs = time.milliseconds();
+    GetResponse getResponse = null;
     try {
       if (exchangeMetadataResponseList.size() != replicasToReplicatePerNode.size()
           || replicasToReplicatePerNode.size() == 0) {
@@ -715,12 +719,16 @@ public class ReplicaThread implements Runnable {
             + " should be the same and greater than zero");
       }
       DataNodeId remoteNode = replicasToReplicatePerNode.get(0).getReplicaId().getDataNodeId();
-      GetResponse getResponse =
+      getResponse =
           getMessagesForMissingKeys(connectedChannel, exchangeMetadataResponseList, replicasToReplicatePerNode,
               remoteNode, remoteColoGetRequestForStandby);
       writeMessagesToLocalStoreAndAdvanceTokens(exchangeMetadataResponseList, getResponse, replicasToReplicatePerNode,
           remoteNode, remoteColoGetRequestForStandby);
     } finally {
+      if (getResponse != null && getResponse.getInputStream() instanceof NettyByteBufDataInputStream) {
+        // if the InputStream is NettyByteBufDataInputStream based, it's time to release its buffer.
+        ((NettyByteBufDataInputStream) (getResponse.getInputStream())).getBuffer().release();
+      }
       long fixMissingStoreKeysTime = time.milliseconds() - fixMissingStoreKeysStartTimeInMs;
       replicationMetrics.updateFixMissingStoreKeysTime(fixMissingStoreKeysTime, replicatingFromRemoteColo,
           replicatingOverSsl, datacenterName);
@@ -751,19 +759,17 @@ public class ReplicaThread implements Runnable {
           remoteNode, threadName, remoteReplicaInfo.getReplicaId(), remoteReplicaInfo.getToken());
     }
 
+    ChannelOutput channelOutput = null;
     try {
       ReplicaMetadataRequest request = new ReplicaMetadataRequest(correlationIdGenerator.incrementAndGet(),
           "replication-metadata-" + dataNodeId.getHostname() + "[" + dataNodeId.getDatacenterName() + "]",
           replicaMetadataRequestInfoList, replicationConfig.replicationFetchSizeInBytes,
           replicationConfig.replicaMetadataRequestVersion);
-      connectedChannel.send(request);
-      ChannelOutput channelOutput = connectedChannel.receive();
-      ByteBufferInputStream byteBufferInputStream =
-          new ByteBufferInputStream(channelOutput.getInputStream(), (int) channelOutput.getStreamSize());
-      logger.trace("Remote node: {} Thread name: {} Remote replicas: {} ByteBuffer size after deserialization: {} ",
-          remoteNode, threadName, replicasToReplicatePerNode, byteBufferInputStream.available());
+      channelOutput = connectedChannel.sendAndReceive(request);
+      logger.trace("Remote node: {} Thread name: {} Remote replicas: {} Stream size after deserialization: {} ",
+          remoteNode, threadName, replicasToReplicatePerNode, channelOutput.getInputStream().available());
       ReplicaMetadataResponse response =
-          ReplicaMetadataResponse.readFrom(new DataInputStream(byteBufferInputStream), findTokenHelper, clusterMap);
+          ReplicaMetadataResponse.readFrom(channelOutput.getInputStream(), findTokenHelper, clusterMap);
 
       long metadataRequestTime = time.milliseconds() - replicaMetadataRequestStartTime;
       replicationMetrics.updateMetadataRequestTime(metadataRequestTime, replicatingFromRemoteColo, replicatingOverSsl,
@@ -780,9 +786,14 @@ public class ReplicaThread implements Runnable {
         throw new ReplicationException("Replica Metadata Response Error " + response.getError());
       }
       return response;
-    } catch (IOException e) {
+    } catch (Exception e) {
       responseHandler.onEvent(replicasToReplicatePerNode.get(0).getReplicaId(), e);
       throw e;
+    } finally {
+      if (channelOutput != null && (channelOutput.getInputStream() instanceof NettyByteBufDataInputStream)) {
+        // Release buffer if and only if the inputStream is NettyByteBuf based.
+        ((NettyByteBufDataInputStream) channelOutput.getInputStream()).getBuffer().release();
+      }
     }
   }
 
@@ -1055,9 +1066,8 @@ public class ReplicaThread implements Runnable {
           replicationConfig.replicationIncludeAll ? GetOption.Include_All : GetOption.None);
       long startTime = time.milliseconds();
       try {
-        connectedChannel.send(getRequest);
-        ChannelOutput channelOutput = connectedChannel.receive();
-        getResponse = GetResponse.readFrom(new DataInputStream(channelOutput.getInputStream()), clusterMap);
+        ChannelOutput channelOutput = connectedChannel.sendAndReceive(getRequest);
+        getResponse = GetResponse.readFrom(channelOutput.getInputStream(), clusterMap);
         long getRequestTime = time.milliseconds() - startTime;
         replicationMetrics.updateGetRequestTime(getRequestTime, replicatingFromRemoteColo, replicatingOverSsl,
             datacenterName, remoteColoGetRequestForStandby);

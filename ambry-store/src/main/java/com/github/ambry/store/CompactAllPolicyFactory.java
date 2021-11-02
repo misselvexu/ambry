@@ -53,17 +53,17 @@ class CompactAllPolicy implements CompactionPolicy {
   CompactAllPolicy(StoreConfig storeConfig, Time time) {
     this.storeConfig = storeConfig;
     this.time = time;
-    this.messageRetentionTimeInMs = TimeUnit.DAYS.toMillis(storeConfig.storeDeletedMessageRetentionDays);
+    this.messageRetentionTimeInMs = TimeUnit.HOURS.toMillis(storeConfig.storeDeletedMessageRetentionHours);
   }
 
   @Override
   public CompactionDetails getCompactionDetails(long totalCapacity, long usedCapacity, long segmentCapacity,
-      long segmentHeaderSize, List<String> logSegmentsNotInJournal, BlobStoreStats blobStoreStats, String dataDir) {
+      long segmentHeaderSize, List<LogSegmentName> logSegmentsNotInJournal, BlobStoreStats blobStoreStats, String dataDir) {
     CompactionDetails details = null;
     logger.trace("UsedCapacity {} vs TotalCapacity {}", usedCapacity, totalCapacity);
     if (usedCapacity >= (storeConfig.storeMinUsedCapacityToTriggerCompactionInPercentage / 100.0) * totalCapacity) {
       if (logSegmentsNotInJournal != null) {
-        details = new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, logSegmentsNotInJournal);
+        details = new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, logSegmentsNotInJournal, null);
         logger.info("Generating CompactionDetails {} using CompactAllPolicy", details);
       }
     }

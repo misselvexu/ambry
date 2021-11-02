@@ -16,8 +16,10 @@ package com.github.ambry.rest;
 import com.github.ambry.account.Account;
 import com.github.ambry.account.Container;
 import com.github.ambry.account.InMemAccountService;
+import com.github.ambry.frontend.Operations;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.protocol.GetOption;
+import com.github.ambry.quota.QuotaName;
 import com.github.ambry.router.ByteRange;
 import com.github.ambry.router.ByteRanges;
 import com.github.ambry.router.GetBlobOptions;
@@ -27,18 +29,22 @@ import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
 import java.io.UnsupportedEncodingException;
 import java.net.URISyntaxException;
+import java.net.URLDecoder;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.stream.Collectors;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.junit.Test;
@@ -54,6 +60,41 @@ import static org.mockito.Mockito.*;
 public class RestUtilsTest {
   private static final Random RANDOM = new Random();
   private static final String ALPHABET = "abcdefghijklmnopqrstuvwxyz";
+
+  /**
+   * Method to easily create {@link RestRequest} objects containing a specific request.
+   * @param restMethod the {@link RestMethod} desired.
+   * @param uri string representation of the desired URI.
+   * @param headers any associated headers as a {@link org.json.JSONObject}.
+   * @return A {@link RestRequest} object that defines the request required by the input.
+   * @throws JSONException
+   * @throws UnsupportedEncodingException
+   * @throws URISyntaxException
+   */
+  static RestRequest createRestRequest(RestMethod restMethod, String uri, JSONObject headers)
+      throws JSONException, UnsupportedEncodingException, URISyntaxException {
+    JSONObject request = new JSONObject();
+    request.put(MockRestRequest.REST_METHOD_KEY, restMethod.name());
+    request.put(MockRestRequest.URI_KEY, uri);
+    if (headers != null) {
+      request.put(MockRestRequest.HEADERS_KEY, headers);
+    }
+    return new MockRestRequest(request, null);
+  }
+
+  /**
+   * Sets entries from the passed in HashMap to the @{link JSONObject} headers
+   * @param headers  {@link JSONObject} to which the new headers are to be added
+   * @param userMetadata {@link Map} which has the new entries that has to be added
+   * @throws org.json.JSONException
+   */
+  public static void setUserMetadataHeaders(JSONObject headers, Map<String, String> userMetadata) throws JSONException {
+    if (userMetadata != null) {
+      for (String key : userMetadata.keySet()) {
+        headers.put(key, userMetadata.get(key));
+      }
+    }
+  }
 
   /**
    * Tests building of {@link BlobProperties} given good input (all arguments in the number and format expected).
@@ -361,10 +402,9 @@ public class RestUtilsTest {
 
   /**
    * Tests deserializing user metadata from byte array
-   * @throws Exception
    */
   @Test
-  public void getUserMetadataFromByteArrayComplexTest() throws Exception {
+  public void getUserMetadataFromByteArrayComplexTest() {
 
     Map<String, String> userMetadataMap = null;
     // user metadata of size 1 byte
@@ -726,8 +766,9 @@ public class RestUtilsTest {
     // user metadata that needs to be encoded
     usermetadataMap.clear();
     headers = new JSONObject();
+    String umHeader = "filename";
     String filenameValue = "death\nstar";
-    usermetadataMap.put(RestUtils.Headers.USER_META_DATA_HEADER_PREFIX + "filename", filenameValue);
+    usermetadataMap.put(RestUtils.Headers.USER_META_DATA_HEADER_PREFIX + umHeader, filenameValue);
     setUserMetadataHeaders(headers, usermetadataMap);
     restRequest = createRestRequest(RestMethod.POST, "/", headers);
     userMetadata = RestUtils.buildUserMetadata(restRequest.getArgs());
@@ -736,34 +777,181 @@ public class RestUtilsTest {
     assertTrue("Should report that headers are set", RestUtils.setUserMetadataHeaders(userMetadata, responseChannel));
     Map<String, Object> encodedHeaders = responseChannel.getResponseHeaders();
     assertEquals("Expected a header", 1, encodedHeaders.size());
-    Object encodedValue = encodedHeaders.get(RestUtils.Headers.USER_META_DATA_ENCODED_HEADER_PREFIX + "filename");
+    Object encodedValue = encodedHeaders.get(RestUtils.Headers.USER_META_DATA_ENCODED_HEADER_PREFIX + umHeader);
     assertNotNull("Expected encoded header", encodedValue);
     assertNotSame("Expected different value", filenameValue, encodedValue);
   }
 
-  // helpers.
-  // general.
+  /**
+   * Tests for {@link RestUtils#setUserMetadataHeaders(Map<String, String>, RestResponseChannel)}
+   */
+  @Test
+  public void setUserMetadataHeadersMapTest() throws UnsupportedEncodingException {
+    // Call method that takes map input and verify headers are prefixed.
+    String rawName = "customer";
+    String customerName = "Walmart";
+    String umFilename = RestUtils.Headers.USER_META_DATA_HEADER_PREFIX + "filename";
+    String nonAsciiFilename = "å∫ \uD83D\uDE1D\uD83D\uDE31abcd";
+    Map<String, String> userMetadata = new HashMap<>();
+    userMetadata.put(rawName, customerName);
+    userMetadata.put(umFilename, nonAsciiFilename);
+    MockRestResponseChannel responseChannel = new MockRestResponseChannel();
+    RestUtils.setUserMetadataHeaders(userMetadata, responseChannel);
+    Map<String, Object> responseHeaders = responseChannel.getResponseHeaders();
+    assertEquals("Expected one header", 2, responseHeaders.size());
+    assertEquals("Header did not get prefixed", customerName,
+        responseHeaders.get(RestUtils.Headers.USER_META_DATA_HEADER_PREFIX + rawName));
+    Object encodedValue = responseHeaders.get(RestUtils.Headers.USER_META_DATA_ENCODED_HEADER_PREFIX + "filename");
+    assertNotNull("Expected encoded header", encodedValue);
+    assertEquals("Mismatch in non-ascii filename", nonAsciiFilename,
+        URLDecoder.decode((String) encodedValue, StandardCharsets.UTF_8.name()));
+  }
 
   /**
-   * Method to easily create {@link RestRequest} objects containing a specific request.
-   * @param restMethod the {@link RestMethod} desired.
-   * @param uri string representation of the desired URI.
-   * @param headers any associated headers as a {@link org.json.JSONObject}.
-   * @return A {@link RestRequest} object that defines the request required by the input.
-   * @throws JSONException
-   * @throws UnsupportedEncodingException
-   * @throws URISyntaxException
+   * Tests for {@link RestUtils#setRequestCostHeader} method.
    */
-  static RestRequest createRestRequest(RestMethod restMethod, String uri, JSONObject headers)
-      throws JSONException, UnsupportedEncodingException, URISyntaxException {
-    JSONObject request = new JSONObject();
-    request.put(MockRestRequest.REST_METHOD_KEY, restMethod.name());
-    request.put(MockRestRequest.URI_KEY, uri);
-    if (headers != null) {
-      request.put(MockRestRequest.HEADERS_KEY, headers);
+  @Test
+  public void setRequestCostHeaderTest() {
+    Map<QuotaName, Double> costMap = new HashMap<>();
+
+    // test for valid cost map
+    costMap.put(QuotaName.READ_CAPACITY_UNIT, 1.9);
+    costMap.put(QuotaName.STORAGE_IN_GB, 3.0);
+    String expectedQuotaHeaderValue = "READ_CAPACITY_UNIT=1.9; STORAGE_IN_GB=3.0";
+    MockRestResponseChannel responseChannel = new MockRestResponseChannel();
+    RestUtils.setRequestCostHeader(costMap, responseChannel);
+    Map<String, Object> responseHeaders = responseChannel.getResponseHeaders();
+    assertEquals("Expected one header", 1, responseHeaders.size());
+    assertEquals("Unexpected quota header value", expectedQuotaHeaderValue,
+        responseHeaders.get(RestUtils.RequestCostHeaders.REQUEST_COST));
+
+    // test for null cost map
+    try {
+      RestUtils.setRequestCostHeader(null, responseChannel);
+      fail("Null costMap should throw error");
+    } catch (NullPointerException npEx) {
+      assertEquals("Expected one header", 1, responseHeaders.size());
     }
-    return new MockRestRequest(request, null);
+
+    // test for empty cost map
+    costMap = new HashMap<>();
+    RestUtils.setRequestCostHeader(costMap, responseChannel);
+    responseHeaders = responseChannel.getResponseHeaders();
+    assertEquals("Expected one header", 1, responseHeaders.size());
+    assertEquals("Unexpected quota header value", "", responseHeaders.get(RestUtils.RequestCostHeaders.REQUEST_COST));
   }
+
+  /**
+   * Tests for {@link RestUtils.KVHeaderValueEncoderDecoder#encodeKVHeaderValue(Map)}.
+   */
+  @Test
+  public void encodeKVHeaderValueTest() {
+    // test for empty map
+    Map<String, String> headerValue = new HashMap<>();
+    assertEquals("Invalid encoded value", "", RestUtils.KVHeaderValueEncoderDecoder.encodeKVHeaderValue(headerValue));
+
+    // test for null map
+    try {
+      RestUtils.KVHeaderValueEncoderDecoder.encodeKVHeaderValue(null);
+      fail("Null value should throw error");
+    } catch (NullPointerException npEx) {
+    }
+
+    // test for valid map
+    headerValue.put(QuotaName.READ_CAPACITY_UNIT.name(), String.valueOf(1.9));
+    headerValue.put(QuotaName.STORAGE_IN_GB.name(), String.valueOf(3.0));
+    assertEquals("Invalid encoded value", "READ_CAPACITY_UNIT=1.9; STORAGE_IN_GB=3.0",
+        RestUtils.KVHeaderValueEncoderDecoder.encodeKVHeaderValue(headerValue));
+
+    // test for single value in map
+    headerValue.remove(QuotaName.STORAGE_IN_GB.name());
+    assertEquals("Invalid encoded value", "READ_CAPACITY_UNIT=1.9",
+        RestUtils.KVHeaderValueEncoderDecoder.encodeKVHeaderValue(headerValue));
+  }
+
+  /**
+   * Tests for {@link RestUtils.KVHeaderValueEncoderDecoder#decodeKVHeaderValue(String)}.
+   */
+  @Test
+  public void decodeKVHeaderValueTest() {
+    // test for empty string
+    assertTrue("Invalid encoded value", RestUtils.KVHeaderValueEncoderDecoder.decodeKVHeaderValue("").isEmpty());
+
+    // test for null string
+    try {
+      RestUtils.KVHeaderValueEncoderDecoder.decodeKVHeaderValue(null);
+      fail("Null value should throw error");
+    } catch (NullPointerException npEx) {
+    }
+
+    // test for valid string
+    String validEncodedHeader = "READ_CAPACITY_UNIT=1.9; STORAGE_IN_GB=3.0; ";
+    Map<String, String> decodedMap = new HashMap<>();
+    decodedMap.put("READ_CAPACITY_UNIT", "1.9");
+    decodedMap.put("STORAGE_IN_GB", "3.0");
+    assertEquals("Invalid encoded value", RestUtils.KVHeaderValueEncoderDecoder.decodeKVHeaderValue(validEncodedHeader),
+        decodedMap);
+
+    // test for single value
+    validEncodedHeader = "READ_CAPACITY_UNIT=1.9";
+    decodedMap = new HashMap<>();
+    decodedMap.put("READ_CAPACITY_UNIT", "1.9");
+    assertEquals("Invalid encoded value", RestUtils.KVHeaderValueEncoderDecoder.decodeKVHeaderValue(validEncodedHeader),
+        decodedMap);
+
+    // test for invalid strings.
+    String[] invalidEncodedHeaders = new String[]{"invalid", "; ", "bad; bad; ", ";", "="};
+    for (String invalidEncodedHeader : invalidEncodedHeaders) {
+      try {
+        RestUtils.KVHeaderValueEncoderDecoder.decodeKVHeaderValue(invalidEncodedHeader);
+        fail("Decode of invalid encoded header " + invalidEncodedHeader + " should fail.");
+      } catch (IllegalArgumentException iaEx) {
+      }
+    }
+  }
+
+  /**
+   * Test request is upload request.
+   * @throws Exception
+   */
+  @Test
+  public void testIsUploadRequest() throws Exception {
+    List<String> operations = Utils.getStaticFieldValuesAsStrings(Operations.class).collect(Collectors.toList());
+    RestMethod[] methods = RestMethod.values();
+
+    for (String operation : operations) {
+      for (RestMethod method : methods) {
+        JSONObject header = new JSONObject();
+        header.put(RestUtils.InternalKeys.REQUEST_PATH,
+            RequestPath.parse("/" + operation, Collections.emptyMap(), Collections.emptyList(), "ambry-test"));
+        RestRequest request = createRestRequest(method, "/" + operation, header);
+        boolean isUpload = RestUtils.isUploadRequest(request);
+        assertEquals(operation.equals(Operations.NAMED_BLOB) && method == RestMethod.PUT, isUpload);
+      }
+    }
+    // One exception for PUT named blob
+    {
+      JSONObject header = new JSONObject();
+      header.put(RestUtils.InternalKeys.REQUEST_PATH,
+          RequestPath.parse("/" + Operations.NAMED_BLOB, Collections.emptyMap(), Collections.emptyList(),
+              "ambry-test"));
+      header.put(RestUtils.Headers.UPLOAD_NAMED_BLOB_MODE, "STITCH");
+      RestRequest request = createRestRequest(RestMethod.PUT, "/" + Operations.NAMED_BLOB, header);
+      assertFalse(RestUtils.isUploadRequest(request));
+    }
+
+    for (RestMethod method : methods) {
+      JSONObject header = new JSONObject();
+      header.put(RestUtils.InternalKeys.REQUEST_PATH,
+          RequestPath.parse("/", Collections.emptyMap(), Collections.emptyList(), "ambry-test"));
+      RestRequest request = createRestRequest(method, "/", header);
+      boolean isUpload = RestUtils.isUploadRequest(request);
+      assertEquals(method == RestMethod.POST, isUpload);
+    }
+  }
+
+  // helpers.
+  // general.
 
   /**
    * Generates a string of size {@code length} with random characters from {@link #ALPHABET}.
@@ -851,6 +1039,8 @@ public class RestUtilsTest {
     assertEquals("Target container id does not match", container.getId(), blobProperties.getContainerId());
   }
 
+  // getBlobPropertiesVariedInputTest() helpers.
+
   /**
    * Verifies that a request with headers defined by {@code headers} builds UserMetadata successfully and
    * matches the values with those in {@code headers}.
@@ -872,8 +1062,6 @@ public class RestUtilsTest {
           userMetadataMap.get(keyInOutputMap));
     }
   }
-
-  // getBlobPropertiesVariedInputTest() helpers.
 
   /**
    * Verifies that {@link RestUtils#buildBlobProperties(Map<String,Object>)} fails if given a request with bad
@@ -1031,20 +1219,6 @@ public class RestUtilsTest {
         fail("Should have encountered exception when building Content-Range");
       } catch (RestServiceException e) {
         assertEquals("Unexpected error code.", RestServiceErrorCode.RangeNotSatisfiable, e.getErrorCode());
-      }
-    }
-  }
-
-  /**
-   * Sets entries from the passed in HashMap to the @{link JSONObject} headers
-   * @param headers  {@link JSONObject} to which the new headers are to be added
-   * @param userMetadata {@link Map} which has the new entries that has to be added
-   * @throws org.json.JSONException
-   */
-  public static void setUserMetadataHeaders(JSONObject headers, Map<String, String> userMetadata) throws JSONException {
-    if (userMetadata != null) {
-      for (String key : userMetadata.keySet()) {
-        headers.put(key, userMetadata.get(key));
       }
     }
   }

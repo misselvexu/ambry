@@ -34,8 +34,10 @@ import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.notification.NotificationBlobType;
 import com.github.ambry.notification.NotificationSystem;
+import com.github.ambry.protocol.Crc32Impl;
 import com.github.ambry.protocol.PutRequest;
 import com.github.ambry.protocol.PutResponse;
+import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.store.StoreKey;
 import com.github.ambry.utils.Pair;
@@ -109,6 +111,7 @@ class PutOperation {
   private final Time time;
   private BlobProperties finalBlobProperties;
   private boolean isEncryptionEnabled;
+  private final QuotaChargeCallback quotaChargeCallback;
 
   // Parameters associated with the state.
 
@@ -179,6 +182,7 @@ class PutOperation {
    * @param time the Time instance to use.
    * @param blobProperties the BlobProperties associated with the put operation.
    * @param partitionClass the partition class to choose partitions from. Can be {@code null} if no affinity is required
+   * @param quotaChargeCallback {@link QuotaChargeCallback} to listen to events that should result in charging quota.
    * @return the {@link PutOperation}.
    */
   static PutOperation forUpload(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics,
@@ -187,10 +191,10 @@ class PutOperation {
       Callback<String> callback, RouterCallback routerCallback,
       ByteBufferAsyncWritableChannel.ChannelEventListener writableChannelEventListener, KeyManagementService kms,
       CryptoService cryptoService, CryptoJobHandler cryptoJobHandler, Time time, BlobProperties blobProperties,
-      String partitionClass) {
+      String partitionClass, QuotaChargeCallback quotaChargeCallback) {
     return new PutOperation(routerConfig, routerMetrics, clusterMap, notificationSystem, accountService, userMetadata,
         channel, null, options, futureResult, callback, routerCallback, writableChannelEventListener, kms,
-        cryptoService, cryptoJobHandler, time, blobProperties, partitionClass);
+        cryptoService, cryptoJobHandler, time, blobProperties, partitionClass, quotaChargeCallback);
   }
 
   /**
@@ -215,16 +219,18 @@ class PutOperation {
    * @param time the Time instance to use.
    * @param blobProperties the BlobProperties associated with the put operation.
    * @param partitionClass the partition class to choose partitions from. Can be {@code null} if no affinity is required
+   * @param quotaChargeCallback {@link QuotaChargeCallback} to listen to events that should result in charging quota.
    * @return the {@link PutOperation}.
    */
   static PutOperation forStitching(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics,
       ClusterMap clusterMap, NotificationSystem notificationSystem, AccountService accountService, byte[] userMetadata,
       List<ChunkInfo> chunksToStitch, FutureResult<String> futureResult, Callback<String> callback,
       RouterCallback routerCallback, KeyManagementService kms, CryptoService cryptoService,
-      CryptoJobHandler cryptoJobHandler, Time time, BlobProperties blobProperties, String partitionClass) {
+      CryptoJobHandler cryptoJobHandler, Time time, BlobProperties blobProperties, String partitionClass,
+      QuotaChargeCallback quotaChargeCallback) {
     return new PutOperation(routerConfig, routerMetrics, clusterMap, notificationSystem, accountService, userMetadata,
         null, chunksToStitch, PutBlobOptions.DEFAULT, futureResult, callback, routerCallback, null, kms, cryptoService,
-        cryptoJobHandler, time, blobProperties, partitionClass);
+        cryptoJobHandler, time, blobProperties, partitionClass, quotaChargeCallback);
   }
 
   /**
@@ -249,6 +255,7 @@ class PutOperation {
    * @param time the Time instance to use.
    * @param blobProperties the BlobProperties associated with the put operation.
    * @param partitionClass the partition class to choose partitions from. Can be {@code null} if no affinity is required
+   * @param quotaChargeCallback {@link QuotaChargeCallback} to listen to events that should result in charging quota.
    */
   private PutOperation(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics, ClusterMap clusterMap,
       NotificationSystem notificationSystem, AccountService accountService, byte[] userMetadata,
@@ -256,7 +263,7 @@ class PutOperation {
       FutureResult<String> futureResult, Callback<String> callback, RouterCallback routerCallback,
       ByteBufferAsyncWritableChannel.ChannelEventListener writableChannelEventListener, KeyManagementService kms,
       CryptoService cryptoService, CryptoJobHandler cryptoJobHandler, Time time, BlobProperties blobProperties,
-      String partitionClass) {
+      String partitionClass, QuotaChargeCallback quotaChargeCallback) {
     submissionTimeMs = time.milliseconds();
     this.routerConfig = routerConfig;
     this.routerMetrics = routerMetrics;
@@ -276,6 +283,7 @@ class PutOperation {
     this.cryptoService = cryptoService;
     this.cryptoJobHandler = cryptoJobHandler;
     this.time = time;
+    this.quotaChargeCallback = quotaChargeCallback;
     bytesFilledSoFar = 0;
     chunkCounter = -1;
     putChunks = new ConcurrentLinkedQueue<>();
@@ -1126,8 +1134,7 @@ class PutOperation {
             passedInBlobProperties.getContainerId(), passedInBlobProperties.isEncrypted(),
             passedInBlobProperties.getExternalAssetTag(), passedInBlobProperties.getContentEncoding(),
             passedInBlobProperties.getFilename());
-        operationTracker =
-            new SimpleOperationTracker(routerConfig, RouterOperation.PutOperation, partitionId, null, true);
+        operationTracker = getOperationTracker();
         correlationIdToChunkPutRequestInfo.clear();
         state = ChunkState.Ready;
       } catch (RouterException e) {
@@ -1136,6 +1143,28 @@ class PutOperation {
         setOperationExceptionAndComplete(
             new RouterException("Prepare for sending failed", e, RouterErrorCode.UnexpectedInternalError));
       }
+    }
+
+    /**
+     * Gets an {@link OperationTracker} based on the config;
+     * @return an {@link OperationTracker} based on the config;
+     */
+    protected OperationTracker getOperationTracker() {
+      OperationTracker operationTracker;
+      String trackerType = routerConfig.routerPutOperationTrackerType;
+      String originatingDcName = clusterMap.getDatacenterName(clusterMap.getLocalDatacenterId());
+      if (trackerType.equals(SimpleOperationTracker.class.getSimpleName())) {
+        operationTracker =
+            new SimpleOperationTracker(routerConfig, RouterOperation.PutOperation, partitionId, originatingDcName, true,
+                routerMetrics);
+      } else if (trackerType.equals(AdaptiveOperationTracker.class.getSimpleName())) {
+        operationTracker =
+            new AdaptiveOperationTracker(routerConfig, routerMetrics, RouterOperation.PutOperation, partitionId,
+                originatingDcName, time);
+      } else {
+        throw new IllegalArgumentException("Unrecognized tracker type: " + trackerType);
+      }
+      return operationTracker;
     }
 
     /**
@@ -1204,7 +1233,7 @@ class PutOperation {
         cryptoJobHandler.submitJob(
             new EncryptJob(passedInBlobProperties.getAccountId(), passedInBlobProperties.getContainerId(),
                 isMetadataChunk() ? null : buf.retainedDuplicate(), ByteBuffer.wrap(chunkUserMetadata),
-                kms.getRandomKey(), cryptoService, kms, encryptJobMetricsTracker, this::encryptionCallback));
+                kms.getRandomKey(), cryptoService, kms, options, encryptJobMetricsTracker, this::encryptionCallback));
       } catch (GeneralSecurityException e) {
         encryptJobMetricsTracker.incrementOperationError();
         logger.trace("Exception thrown while generating random key for chunk at index {}", chunkIndex, e);
@@ -1292,6 +1321,15 @@ class PutOperation {
         }
       }
       if (done) {
+        // the chunk is complete now. We can charge against quota for the chunk if its not a metadata chunk.
+        if (quotaChargeCallback != null && !(this instanceof MetadataPutChunk) && chunkException == null) {
+          try {
+            quotaChargeCallback.chargeQuota(chunkBlobProperties.getBlobSize());
+          } catch (RouterException rEx) {
+            // For now we only log for quota charge exceptions for in progress requests.
+            logger.info("Exception {} while handling quota charge event", rEx.toString());
+          }
+        }
         state = ChunkState.Complete;
       }
     }
@@ -1381,7 +1419,9 @@ class PutOperation {
     protected PutRequest createPutRequest() {
       return new PutRequest(NonBlockingRouter.correlationIdGenerator.incrementAndGet(), routerConfig.routerHostname,
           chunkBlobId, chunkBlobProperties, ByteBuffer.wrap(chunkUserMetadata), buf.retainedDuplicate(),
-          buf.readableBytes(), BlobType.DataBlob, encryptedPerBlobKey != null ? encryptedPerBlobKey.duplicate() : null);
+          buf.readableBytes(), BlobType.DataBlob, encryptedPerBlobKey != null ? encryptedPerBlobKey.duplicate() : null,
+          routerConfig.routerPutRequestUseJavaNativeCrc32 ? Crc32Impl.getJavaNativeInstance()
+              : Crc32Impl.getAmbryInstance());
     }
 
     /**

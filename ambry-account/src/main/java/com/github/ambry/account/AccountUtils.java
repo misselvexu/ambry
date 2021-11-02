@@ -13,10 +13,13 @@
  */
 package com.github.ambry.account;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.ambry.server.StatsSnapshot;
+import java.io.IOException;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -31,6 +34,7 @@ import org.slf4j.LoggerFactory;
  */
 public class AccountUtils {
   private static final Logger logger = LoggerFactory.getLogger(AccountUtils.class);
+  private static final ObjectMapper objectMapper = new ObjectMapper();
 
   /**
    * Checks if there are duplicate accountId or accountName in the given collection of {@link Account}s.
@@ -99,69 +103,72 @@ public class AccountUtils {
 
       StringBuilder accountsInfo = new StringBuilder();
 
-      if (!accountsMissingInSecondary.isEmpty()) {
-        accountsInfo.append("[");
-        for (Account account : accountsMissingInSecondary) {
-          accountsInfo.append(AccountCollectionSerde.accountToJsonNoContainers(account).toString()).append(",");
-        }
-        accountsInfo.append("]");
-        logger.warn("Accounts found in primary and absent in secondary = {}", accountsInfo.toString());
-        mismatchCount += accountsMissingInSecondary.size();
-      }
-
-      if (!accountsDifferentInSecondary.isEmpty()) {
-        accountsInfo.setLength(0);
-        accountsInfo.append("[");
-        for (Account account : accountsDifferentInSecondary) {
-          accountsInfo.append("{Account = ")
-              .append(account.toString())
-              .append(", primary = ")
-              .append(AccountCollectionSerde.accountToJsonNoContainers(account).toString())
-              .append(", secondary = ")
-              .append(AccountCollectionSerde.accountToJsonNoContainers(secondaryAccountMap.get(account.getName()))
-                  .toString());
-
-          Set<Container> containersMissingInSecondary = account.getAllContainers()
-              .stream()
-              .filter(container -> secondaryAccountMap.get(account.getName()).getContainerByName(container.getName())
-                  == null)
-              .collect(Collectors.toSet());
-
-          Set<Container> containersDifferentInSecondary = new HashSet<>(account.getAllContainers());
-          containersDifferentInSecondary.removeAll(secondaryAccountMap.get(account.getName()).getAllContainers());
-          containersDifferentInSecondary.removeAll(containersMissingInSecondary);
-
-          if (!containersMissingInSecondary.isEmpty()) {
-            accountsInfo.append(", Containers missing in secondary: [");
-            for (Container container : containersMissingInSecondary) {
-              accountsInfo.append(container.toJson().toString()).append(",");
-            }
-            accountsInfo.append("]");
-            mismatchCount += containersMissingInSecondary.size();
+      try {
+        if (!accountsMissingInSecondary.isEmpty()) {
+          accountsInfo.append("[");
+          for (Account account : accountsMissingInSecondary) {
+            accountsInfo.append(new String(AccountCollectionSerde.serializeAccountsInJsonNoContainers(account)))
+                .append(",");
           }
-
-          if (!containersDifferentInSecondary.isEmpty()) {
-            accountsInfo.append(", Containers different in secondary: [");
-            for (Container container : containersDifferentInSecondary) {
-              accountsInfo.append("{container = ")
-                  .append(container.toString())
-                  .append(", primary = ")
-                  .append(container.toJson().toString())
-                  .append(", secondary = ")
-                  .append(secondaryAccountMap.get(account.getName())
-                      .getContainerByName(container.getName())
-                      .toJson()
-                      .toString())
-                  .append("},");
-            }
-            accountsInfo.append("]");
-            mismatchCount += containersDifferentInSecondary.size();
-          }
-          accountsInfo.append("}");
+          accountsInfo.append("]");
+          logger.warn("Accounts found in primary and absent in secondary = {}", accountsInfo.toString());
+          mismatchCount += accountsMissingInSecondary.size();
         }
-        accountsInfo.append("]");
 
-        logger.warn("Accounts mismatch in primary and secondary = {}", accountsInfo.toString());
+        if (!accountsDifferentInSecondary.isEmpty()) {
+          accountsInfo.setLength(0);
+          accountsInfo.append("[");
+          for (Account account : accountsDifferentInSecondary) {
+            accountsInfo.append("{Account = ")
+                .append(account.toString())
+                .append(", primary = ")
+                .append(new String(AccountCollectionSerde.serializeAccountsInJsonNoContainers(account)))
+                .append(", secondary = ")
+                .append(new String(AccountCollectionSerde.serializeAccountsInJsonNoContainers(
+                    secondaryAccountMap.get(account.getName()))));
+
+            Set<Container> containersMissingInSecondary = account.getAllContainers()
+                .stream()
+                .filter(container -> secondaryAccountMap.get(account.getName()).getContainerByName(container.getName())
+                    == null)
+                .collect(Collectors.toSet());
+
+            Set<Container> containersDifferentInSecondary = new HashSet<>(account.getAllContainers());
+            containersDifferentInSecondary.removeAll(secondaryAccountMap.get(account.getName()).getAllContainers());
+            containersDifferentInSecondary.removeAll(containersMissingInSecondary);
+
+            if (!containersMissingInSecondary.isEmpty()) {
+              accountsInfo.append(", Containers missing in secondary: [");
+              for (Container container : containersMissingInSecondary) {
+                accountsInfo.append(objectMapper.writeValueAsString(container)).append(",");
+              }
+              accountsInfo.append("]");
+              mismatchCount += containersMissingInSecondary.size();
+            }
+
+            if (!containersDifferentInSecondary.isEmpty()) {
+              accountsInfo.append(", Containers different in secondary: [");
+              for (Container container : containersDifferentInSecondary) {
+                accountsInfo.append("{container = ")
+                    .append(container.toString())
+                    .append(", primary = ")
+                    .append(objectMapper.writeValueAsString(container))
+                    .append(", secondary = ")
+                    .append(objectMapper.writeValueAsString(
+                        secondaryAccountMap.get(account.getName()).getContainerByName(container.getName())))
+                    .append("},");
+              }
+              accountsInfo.append("]");
+              mismatchCount += containersDifferentInSecondary.size();
+            }
+            accountsInfo.append("}");
+          }
+          accountsInfo.append("]");
+
+          logger.warn("Accounts mismatch in primary and secondary = {}", accountsInfo.toString());
+        }
+      } catch (IOException e) {
+        throw new RuntimeException("Fail to serialize accounts", e);
       }
     }
     return mismatchCount;
@@ -212,6 +219,62 @@ public class AccountUtils {
           searchNonEmptyContainers(nonEmptyContainersByAccount, entry.getValue(), entry.getKey());
         }
       }
+    }
+  }
+
+  /**
+   * Holds information updated for an Account
+   */
+  public static class AccountUpdateInfo {
+    private final Account account;
+    private final boolean isAdded;
+    private final boolean isUpdated;
+    private final List<Container> addedContainers;
+    private final List<Container> updatedContainers;
+
+    public AccountUpdateInfo(Account account, boolean isAdded, boolean isUpdated, List<Container> addedContainers,
+        List<Container> updatedContainers) {
+      this.account = account;
+      this.isAdded = isAdded;
+      this.isUpdated = isUpdated;
+      this.addedContainers = addedContainers;
+      this.updatedContainers = updatedContainers;
+    }
+
+    /**
+     * @return {@link Account} object.
+     */
+    public Account getAccount() {
+      return account;
+    }
+
+    /**
+     * @return true if {@link Account} is a new account added.
+     */
+    public boolean isAdded() {
+      return isAdded;
+    }
+
+    /**
+     *
+     * @return true if {@link Account} account fields are modified.
+     */
+    public boolean isUpdated() {
+      return isUpdated;
+    }
+
+    /**
+     * @return list of added {@link Container}s
+     */
+    public List<Container> getAddedContainers() {
+      return addedContainers;
+    }
+
+    /**
+     * @return list of modified {@link Container}s
+     */
+    public List<Container> getUpdatedContainers() {
+      return updatedContainers;
     }
   }
 }

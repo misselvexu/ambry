@@ -40,7 +40,7 @@ public class CompactAllPolicyTest {
   public CompactAllPolicyTest() throws InterruptedException {
     Pair<MockBlobStore, StoreConfig> initState = CompactionPolicyTest.initializeBlobStore(properties, time, -1, -1, -1);
     config = initState.getSecond();
-    messageRetentionTimeInMs = TimeUnit.DAYS.toMillis(config.storeDeletedMessageRetentionDays);
+    messageRetentionTimeInMs = TimeUnit.HOURS.toMillis(config.storeDeletedMessageRetentionHours);
     blobStore = initState.getFirst();
     compactionPolicy = new CompactAllPolicy(config, time);
   }
@@ -54,7 +54,7 @@ public class CompactAllPolicyTest {
   public void testGetCompactionDetailsTest() throws StoreException, InterruptedException {
     blobStore.logSegmentsNotInJournal = CompactionPolicyTest.generateRandomLogSegmentName(1);
     CompactionPolicyTest.verifyCompactionDetails(
-        new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, blobStore.logSegmentsNotInJournal),
+        new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, blobStore.logSegmentsNotInJournal, null),
         blobStore, compactionPolicy);
 
     // random no of valid logSegments
@@ -62,7 +62,7 @@ public class CompactAllPolicyTest {
       int logSegmentCount = TestUtils.RANDOM.nextInt(10) + 1;
       blobStore.logSegmentsNotInJournal = CompactionPolicyTest.generateRandomLogSegmentName(logSegmentCount);
       CompactionPolicyTest.verifyCompactionDetails(
-          new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, blobStore.logSegmentsNotInJournal),
+          new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, blobStore.logSegmentsNotInJournal, null),
           blobStore, compactionPolicy);
     }
   }

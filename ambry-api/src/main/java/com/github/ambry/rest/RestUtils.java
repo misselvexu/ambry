@@ -15,13 +15,16 @@ package com.github.ambry.rest;
 
 import com.github.ambry.account.Account;
 import com.github.ambry.account.Container;
-import com.github.ambry.frontend.NamedBlobPath;
+import com.github.ambry.frontend.Operations;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.protocol.GetOption;
+import com.github.ambry.quota.QuotaName;
+import com.github.ambry.quota.ThrottlingRecommendation;
 import com.github.ambry.router.ByteRange;
 import com.github.ambry.router.ByteRanges;
 import com.github.ambry.router.GetBlobOptions;
 import com.github.ambry.router.GetBlobOptionsBuilder;
+import com.github.ambry.server.StatsReportType;
 import com.github.ambry.utils.Crc32;
 import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.Utils;
@@ -41,6 +44,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -250,6 +254,22 @@ public class RestUtils {
      * (0 byte) blob instead of returning a 416 error.
      */
     public final static String RESOLVE_RANGE_ON_EMPTY_BLOB = "x-ambry-resolve-range-on-empty-blob";
+
+    /**
+     * Request header to carry clusterName.
+     */
+    public final static String CLUSTER_NAME = "x-ambry-cluster-name";
+
+    /**
+     * Request header to carry {@link StatsReportType} for GetStatsReport request.
+     */
+    public final static String GET_STATS_REPORT_TYPE = "x-ambry-stats-type";
+
+    /**
+     * Request header to request new format. Set it to be true so that ambry would return new format stats that includes
+     * new storage stats information.
+     */
+    public final static String GET_STATS_NEW_FORMAT = "x-ambry-stats-new-format";
   }
 
   public static final class TrackingHeaders {
@@ -280,6 +300,38 @@ public class RestUtils {
         throw new IllegalStateException("Could not get values of the tracking headers", e);
       }
     }
+  }
+
+  /**
+   * Headers with information about cost incurred in serving a request.
+   */
+  public static final class RequestCostHeaders {
+
+    /**
+     * Response header indicating cost incurred by the request against capacity unit and storage quotas.
+     */
+    public static final String REQUEST_COST = "x-ambry-request-cost";
+  }
+
+  /**
+   * Headers with information about request quota and usage.
+   */
+  public static final class RequestQuotaHeaders {
+
+    /**
+     * Response header indicating user quota usage information.
+     */
+    public static final String USER_QUOTA_USAGE = "x-ambry-user-quota-usage";
+
+    /**
+     * Response header indicating user quota warning.
+     */
+    public static final String USER_QUOTA_WARNING = "x-ambry-user-quota-warning";
+
+    /**
+     * Response header indicating retry after interval in milliseconds.
+     */
+    public static final String RETRY_AFTER_MS = "x-ambry-retry-after-ms";
   }
 
   /**
@@ -397,6 +449,22 @@ public class RestUtils {
     String contentEncoding = getHeader(args, Headers.AMBRY_CONTENT_ENCODING, false);
     String filename = getHeader(args, Headers.AMBRY_FILENAME, false);
 
+    long ttl = getTtlFromRequestHeader(args);
+
+    // This field should not matter on newly created blobs, because all privacy/cacheability decisions should be made
+    // based on the container properties and ACLs. For now, BlobProperties still includes this field, though.
+    boolean isPrivate = !container.isCacheable();
+    return new BlobProperties(-1, serviceId, ownerId, contentType, isPrivate, ttl, account.getId(), container.getId(),
+        container.isEncrypted(), externalAssetTag, contentEncoding, filename);
+  }
+
+  /**
+   * An util method to get ttl from arguments associated with a request.
+   * @param args the arguments associated with the request. Cannot be {@code null}.
+   * @return the ttl extracted from the arguments.
+   * @throws RestServiceException if required arguments aren't present or if they aren't in the format expected.
+   */
+  public static long getTtlFromRequestHeader(Map<String, Object> args) throws RestServiceException {
     long ttl = Utils.Infinite_Time;
     Long ttlFromHeader = getLongHeader(args, Headers.TTL, false);
     if (ttlFromHeader != null) {
@@ -406,12 +474,7 @@ public class RestUtils {
       }
       ttl = ttlFromHeader;
     }
-
-    // This field should not matter on newly created blobs, because all privacy/cacheability decisions should be made
-    // based on the container properties and ACLs. For now, BlobProperties still includes this field, though.
-    boolean isPrivate = !container.isCacheable();
-    return new BlobProperties(-1, serviceId, ownerId, contentType, isPrivate, ttl, account.getId(), container.getId(),
-        container.isEncrypted(), externalAssetTag, contentEncoding, filename);
+    return ttl;
   }
 
   /**
@@ -613,6 +676,42 @@ public class RestUtils {
   public static RequestPath getRequestPath(RestRequest restRequest) {
     return (RequestPath) Objects.requireNonNull(restRequest.getArgs().get(InternalKeys.REQUEST_PATH),
         InternalKeys.REQUEST_PATH + " not set in " + restRequest);
+  }
+
+  /**
+   * Return true if this request is uploading a blob. We now have two ways of uploading a blob
+   * 1. A POST request to root path
+   * 2. A PUT request to namedBlob path
+   * Notice that stitch requests are not uploads since chunks are uploaded through signed url post.
+   * @param restRequest The {@link RestRequest}.
+   * @return
+   */
+  public static boolean isUploadRequest(RestRequest restRequest) {
+    RequestPath requestPath = RestUtils.getRequestPath(restRequest);
+    RestMethod method = restRequest.getRestMethod();
+    // For POST request, when the operation is "", it's upload
+    // For PUT request, when the operation is named blob, it's named upload upload. However, we have to exclude the
+    // case for stitch named blob.
+    return method == RestMethod.POST && requestPath.getOperationOrBlobId(true).isEmpty()
+        || method == RestMethod.PUT && requestPath.matchesOperation(Operations.NAMED_BLOB) && !isNamedBlobStitchRequest(
+        restRequest);
+  }
+
+  /**
+   * Return true when the given named blob request is a stitch request. The {@code restRequest} has to be a named blob upload
+   * request, which means it's PUT request and the operation in requestPath is namedBlob.
+   * Notice that this method doesn't enforce this precondition.
+   * @param restRequest
+   * @return
+   */
+  public static boolean isNamedBlobStitchRequest(RestRequest restRequest) {
+    // This request has to be NamedBlob Request, which means it's PUT request and the operation in requestPath is namedBlob.
+    final String STITCH = "STITCH";
+    try {
+      return STITCH.equals(RestUtils.getHeader(restRequest.getArgs(), RestUtils.Headers.UPLOAD_NAMED_BLOB_MODE, false));
+    } catch (RestServiceException e) {
+      return false;
+    }
   }
 
   /**
@@ -878,54 +977,91 @@ public class RestUtils {
 
   /**
    * Sets the user metadata in the headers of the response.
-   * @param userMetadata the user metadata that needs to be sent.
+   * @param userMetadata byte array containing user metadata that needs to be sent.
    * @param restResponseChannel the {@link RestResponseChannel} that is used for sending the response.
    * @return {@code true} if the user metadata was successfully deserialized into headers, {@code false} if not.
    * @throws RestServiceException if there are any problems setting the header.
    */
-  public static boolean setUserMetadataHeaders(byte[] userMetadata, RestResponseChannel restResponseChannel)
-      throws RestServiceException {
+  public static boolean setUserMetadataHeaders(byte[] userMetadata, RestResponseChannel restResponseChannel) {
     Map<String, String> userMetadataMap = buildUserMetadata(userMetadata);
-    boolean setHeaders = userMetadataMap != null;
-    if (setHeaders) {
-      for (Map.Entry<String, String> entry : userMetadataMap.entrySet()) {
-        String headerName = entry.getKey();
-        String headerValue = entry.getValue();
-        try {
-          restResponseChannel.setHeader(headerName, headerValue);
-        } catch (IllegalArgumentException iae) {
-          try {
-            // Value may require encoding to set in response header.
-            // Set in special header designated for encoded values.  The client receiving the response
-            // will need to check these headers and perform the decode.
-            headerName = headerName.replaceFirst(Headers.USER_META_DATA_HEADER_PREFIX,
-                Headers.USER_META_DATA_ENCODED_HEADER_PREFIX);
-            headerValue = URLEncoder.encode(headerValue, CHARSET.name());
-            restResponseChannel.setHeader(headerName, headerValue);
-            logger.debug("Set encoded value in response header {}", headerName);
-          } catch (Exception e) {
-            logger.error("Unable to set response header {} to value {}", headerName, headerValue, e);
-          }
-        }
-      }
+    if (userMetadataMap != null) {
+      setUserMetadataHeaders(userMetadataMap, restResponseChannel);
+      return true;
+    } else {
+      return false;
     }
-    return setHeaders;
   }
 
   /**
-   * Parse the input if it's the named blob request.
-   * @param input the url that needs to be parsed.
-   * @return the {@link NamedBlobPath} indicates the parsing result from blobUrl.
+   * Sets the user metadata in the headers of the response.
+   * @param userMetadataMap map of user metadata that needs to be sent.
+   * @param restResponseChannel the {@link RestResponseChannel} that is used for sending the response.
+   * @throws RestServiceException if there are any problems setting the header.
    */
-  public static NamedBlobPath parseInput(String input) {
-    Objects.requireNonNull(input, "input should not be null");
-    String[] slashFields = input.split("/");
-    if (slashFields.length < 4) {
-      throw new IllegalArgumentException(
-          "File must have name format '/named/<account_name>/<container_name>/<blob_name>'.  Received: '" + input
-              + "'");
+  public static void setUserMetadataHeaders(Map<String, String> userMetadataMap,
+      RestResponseChannel restResponseChannel) {
+    Objects.requireNonNull(userMetadataMap, "user metadata must be supplied");
+    for (Map.Entry<String, String> entry : userMetadataMap.entrySet()) {
+      String headerName = entry.getKey();
+      String headerValue = entry.getValue();
+      // Ensure um prefix is prepended to header name
+      if (!headerName.startsWith(Headers.USER_META_DATA_HEADER_PREFIX)) {
+        headerName = Headers.USER_META_DATA_HEADER_PREFIX + headerName;
+      }
+      if (StandardCharsets.US_ASCII.newEncoder().canEncode(headerValue)) {
+        try {
+          restResponseChannel.setHeader(headerName, headerValue);
+        } catch (IllegalArgumentException iae) {
+          // if responseChannel fails to set header due to special characters like "\n\r", we encode it and add to a special header
+          encodeMetadataValueAndSetHeader(headerName, headerValue, restResponseChannel);
+        }
+      } else {
+        // if the header value contains non-ascii character, we explicitly encode the value and set in response header
+        encodeMetadataValueAndSetHeader(headerName, headerValue, restResponseChannel);
+      }
     }
-    return new NamedBlobPath(slashFields[2], slashFields[3], slashFields[4]);
+  }
+
+  /**
+   * Sets the request cost header in response.
+   * @param costMap {@link Map} of cost for each quota.
+   * @param restResponseChannel the {@link RestResponseChannel} that is used for sending the response.
+   */
+  public static void setRequestCostHeader(Map<QuotaName, Double> costMap, RestResponseChannel restResponseChannel) {
+    Objects.requireNonNull(costMap, "cost map cannot be null");
+    restResponseChannel.setHeader(RequestCostHeaders.REQUEST_COST, KVHeaderValueEncoderDecoder.encodeKVHeaderValue(
+        costMap.entrySet()
+            .stream()
+            .collect(Collectors.toMap(e -> e.getKey().name(), e -> String.valueOf(e.getValue())))));
+  }
+
+  /**
+   * Build the user quota headers map.
+   * @param throttlingRecommendation {@link ThrottlingRecommendation} object.
+   * @return Map of request headers key-value pair related to request quota.
+   */
+  public static Map<String, String> buildUserQuotaHeadersMap(ThrottlingRecommendation throttlingRecommendation) {
+    if (throttlingRecommendation.getQuotaUsagePercentage().isEmpty()) {
+      return Collections.emptyMap();
+    }
+
+    Map<String, String> quotaHeadersMap = new HashMap<>();
+    // set usage headers.
+    quotaHeadersMap.put(RequestQuotaHeaders.USER_QUOTA_USAGE, KVHeaderValueEncoderDecoder.encodeKVHeaderValue(
+        throttlingRecommendation.getQuotaUsagePercentage()
+            .entrySet()
+            .stream()
+            .collect(Collectors.toMap(e -> e.getKey().name(), e -> String.valueOf(e.getValue())))));
+
+    // set retry header if present.
+    if (throttlingRecommendation.getRetryAfterMs() != ThrottlingRecommendation.NO_RETRY_AFTER_MS) {
+      quotaHeadersMap.put(RequestQuotaHeaders.RETRY_AFTER_MS,
+          String.valueOf(throttlingRecommendation.getRetryAfterMs()));
+    }
+
+    // set the warning header.
+    quotaHeadersMap.put(RequestQuotaHeaders.USER_QUOTA_WARNING, throttlingRecommendation.getQuotaUsageLevel().name());
+    return quotaHeadersMap;
   }
 
   /**
@@ -960,7 +1096,7 @@ public class RestUtils {
    * @throws RestServiceException if no range header was found, or if a valid range could not be parsed from the header
    *                              value,
    */
-  private static ByteRange buildByteRange(String rangeHeaderValue) throws RestServiceException {
+  public static ByteRange buildByteRange(String rangeHeaderValue) throws RestServiceException {
     if (!rangeHeaderValue.startsWith(BYTE_RANGE_PREFIX)) {
       throw new RestServiceException("Invalid byte range syntax; does not start with '" + BYTE_RANGE_PREFIX + "'",
           RestServiceErrorCode.InvalidArgs);
@@ -986,6 +1122,27 @@ public class RestUtils {
   }
 
   /**
+   * The header value may require encoding to set in response header (i.e it contains non-ascii character, newline, etc)
+   * The encoded value will be set in special header (USER_META_DATA_ENCODED_HEADER_PREFIX). The client receiving the
+   * response will need to check these headers and perform the decode.
+   * @param headerName the user metadata key
+   * @param headerValue the user metadata value
+   * @param restResponseChannel the {@link RestResponseChannel} that is used for sending the response.
+   */
+  private static void encodeMetadataValueAndSetHeader(String headerName, String headerValue,
+      RestResponseChannel restResponseChannel) {
+    try {
+      headerName =
+          headerName.replaceFirst(Headers.USER_META_DATA_HEADER_PREFIX, Headers.USER_META_DATA_ENCODED_HEADER_PREFIX);
+      headerValue = URLEncoder.encode(headerValue, CHARSET.name());
+      restResponseChannel.setHeader(headerName, headerValue);
+      logger.debug("Set encoded value in response header {}", headerName);
+    } catch (Exception e) {
+      logger.error("Unable to set response header {} to value {}", headerName, headerValue, e);
+    }
+  }
+
+  /**
    * Drops the leading slash and extension (if any) in the blob ID.
    * @param blobIdWithExtension the blob ID possibly with an extension.
    * @return {@code blobIdWithExtension} without an extension if there was one.
@@ -995,5 +1152,52 @@ public class RestUtils {
     int startIndex = blobIdWithExtension.startsWith("/") ? 1 : 0;
     int endIndex = extensionIndex != -1 ? extensionIndex : blobIdWithExtension.length();
     return blobIdWithExtension.substring(startIndex, endIndex);
+  }
+
+  /**
+   * Class to encode decode kv header values.
+   */
+  public static class KVHeaderValueEncoderDecoder {
+    private static String DELIM = "; ";
+    private static String KV_SEPERATOR = "=";
+
+    /**
+     * Encode a map of {@link String}s as http header value.
+     * @param map {@link Map} of {@link String}s to encode.
+     * @return encoded http header value.
+     */
+    public static String encodeKVHeaderValue(Map<String, String> map) {
+      Objects.requireNonNull(map);
+      String value =
+          map.entrySet().stream().map(e -> e.getKey() + KV_SEPERATOR + e.getValue()).collect(Collectors.joining(DELIM));
+      return value;
+    }
+
+    /**
+     * Decode a kv header value.
+     * @param value {@link String} containing the encoded kv values.
+     * @return decoded kv {@link Map}.
+     */
+    public static Map<String, String> decodeKVHeaderValue(String value) {
+      Objects.requireNonNull(value);
+      Map<String, String> valueMap = new HashMap<>();
+      if (value.isEmpty()) {
+        return valueMap;
+      }
+      for (String kvStr : value.split(DELIM)) {
+        if (!kvStr.contains(KV_SEPERATOR)) {
+          throw new IllegalArgumentException("Invalid kv header value: " + value);
+        }
+        String[] kv = kvStr.split(KV_SEPERATOR);
+        if (kv.length == 0) {
+          throw new IllegalArgumentException("Invalid kv header value: " + value);
+        }
+        valueMap.put(kv[0], kv[1]);
+      }
+      if (valueMap.isEmpty()) {
+        throw new IllegalArgumentException("Invalid kv header value: " + value);
+      }
+      return valueMap;
+    }
   }
 }

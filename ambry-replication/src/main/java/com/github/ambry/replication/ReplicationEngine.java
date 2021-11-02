@@ -14,8 +14,8 @@
 package com.github.ambry.replication;
 
 import com.codahale.metrics.MetricRegistry;
-import com.github.ambry.clustermap.CloudReplica;
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.clustermap.ClusterMapChangeListener;
 import com.github.ambry.clustermap.ClusterParticipant;
 import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.clustermap.PartitionId;
@@ -25,6 +25,7 @@ import com.github.ambry.clustermap.ReplicaSyncUpManager;
 import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.ReplicationConfig;
+import com.github.ambry.config.StoreConfig;
 import com.github.ambry.network.ConnectionPool;
 import com.github.ambry.notification.NotificationSystem;
 import com.github.ambry.server.StoreManager;
@@ -48,13 +49,18 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Predicate;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static com.github.ambry.clustermap.VcrClusterParticipant.*;
 
 
 /**
@@ -65,8 +71,10 @@ import org.slf4j.LoggerFactory;
  * 4. Initialize and shutdown all the components required to perform replication
  */
 public abstract class ReplicationEngine implements ReplicationAPI {
-
+  protected CountDownLatch startupLatch = new CountDownLatch(1);
+  protected boolean started = false;
   protected final ReplicationConfig replicationConfig;
+  protected final StoreConfig storeConfig;
   protected final ClusterMap clusterMap;
   protected final ScheduledExecutorService scheduler;
   private final AtomicInteger correlationIdGenerator;
@@ -78,6 +86,7 @@ public abstract class ReplicationEngine implements ReplicationAPI {
   protected final Map<String, AtomicInteger> nextReplicaThreadIndexByDc;
   private final StoreKeyFactory storeKeyFactory;
   private final List<String> sslEnabledDatacenters;
+  protected final ClusterMapConfig clusterMapConfig;
   protected final StoreKeyConverterFactory storeKeyConverterFactory;
   private final String transformerClassName;
   private final Predicate<MessageInfo> skipPredicate;
@@ -101,23 +110,26 @@ public abstract class ReplicationEngine implements ReplicationAPI {
   protected LeaderBasedReplicationAdmin leaderBasedReplicationAdmin = null;
 
   public ReplicationEngine(ReplicationConfig replicationConfig, ClusterMapConfig clusterMapConfig,
-      StoreKeyFactory storeKeyFactory, ClusterMap clusterMap, ScheduledExecutorService scheduler, DataNodeId dataNode,
-      List<? extends ReplicaId> replicaIds, ConnectionPool connectionPool, MetricRegistry metricRegistry,
-      NotificationSystem requestNotification, StoreKeyConverterFactory storeKeyConverterFactory,
-      String transformerClassName, ClusterParticipant clusterParticipant, StoreManager storeManager,
-      Predicate<MessageInfo> skipPredicate) throws ReplicationException {
-    this(replicationConfig, clusterMapConfig, storeKeyFactory, clusterMap, scheduler, dataNode, replicaIds,
+      StoreConfig storeConfig, StoreKeyFactory storeKeyFactory, ClusterMap clusterMap,
+      ScheduledExecutorService scheduler, DataNodeId dataNode, List<? extends ReplicaId> replicaIds,
+      ConnectionPool connectionPool, MetricRegistry metricRegistry, NotificationSystem requestNotification,
+      StoreKeyConverterFactory storeKeyConverterFactory, String transformerClassName,
+      ClusterParticipant clusterParticipant, StoreManager storeManager, Predicate<MessageInfo> skipPredicate,
+      boolean enableClusterMapListener) throws ReplicationException {
+    this(replicationConfig, clusterMapConfig, storeConfig, storeKeyFactory, clusterMap, scheduler, dataNode, replicaIds,
         connectionPool, metricRegistry, requestNotification, storeKeyConverterFactory, transformerClassName,
-        clusterParticipant, storeManager, skipPredicate, null, SystemTime.getInstance());
+        clusterParticipant, storeManager, skipPredicate, null, SystemTime.getInstance(), enableClusterMapListener);
   }
 
   public ReplicationEngine(ReplicationConfig replicationConfig, ClusterMapConfig clusterMapConfig,
-      StoreKeyFactory storeKeyFactory, ClusterMap clusterMap, ScheduledExecutorService scheduler, DataNodeId dataNode,
-      List<? extends ReplicaId> replicaIds, ConnectionPool connectionPool, MetricRegistry metricRegistry,
-      NotificationSystem requestNotification, StoreKeyConverterFactory storeKeyConverterFactory,
-      String transformerClassName, ClusterParticipant clusterParticipant, StoreManager storeManager,
-      Predicate<MessageInfo> skipPredicate, FindTokenHelper findTokenHelper, Time time) throws ReplicationException {
+      StoreConfig storeConfig, StoreKeyFactory storeKeyFactory, ClusterMap clusterMap,
+      ScheduledExecutorService scheduler, DataNodeId dataNode, List<? extends ReplicaId> replicaIds,
+      ConnectionPool connectionPool, MetricRegistry metricRegistry, NotificationSystem requestNotification,
+      StoreKeyConverterFactory storeKeyConverterFactory, String transformerClassName,
+      ClusterParticipant clusterParticipant, StoreManager storeManager, Predicate<MessageInfo> skipPredicate,
+      FindTokenHelper findTokenHelper, Time time, boolean enableClusterMapListener) throws ReplicationException {
     this.replicationConfig = replicationConfig;
+    this.storeConfig = storeConfig;
     this.storeKeyFactory = storeKeyFactory;
     if (findTokenHelper == null) {
       try {
@@ -142,6 +154,7 @@ public abstract class ReplicationEngine implements ReplicationAPI {
     this.metricRegistry = metricRegistry;
     this.dataNodeIdToReplicaThread = new ConcurrentHashMap<>();
     this.nextReplicaThreadIndexByDc = new ConcurrentHashMap<>();
+    this.clusterMapConfig = clusterMapConfig;
     this.sslEnabledDatacenters = Utils.splitString(clusterMapConfig.clusterMapSslEnabledDatacenters, ",");
     this.storeKeyConverterFactory = storeKeyConverterFactory;
     this.transformerClassName = transformerClassName;
@@ -149,6 +162,9 @@ public abstract class ReplicationEngine implements ReplicationAPI {
     this.skipPredicate = skipPredicate;
     replicaSyncUpManager = clusterParticipant == null ? null : clusterParticipant.getReplicaSyncUpManager();
     this.time = time;
+    if (enableClusterMapListener) {
+      clusterMap.registerClusterMapListener(new ClusterMapChangeListenerImpl());
+    }
   }
 
   /**
@@ -186,30 +202,17 @@ public abstract class ReplicationEngine implements ReplicationAPI {
         if (localStore.getCurrentState() == ReplicaState.INACTIVE) {
           // if local store is in INACTIVE state, that means deactivation process is initiated and in progress on this
           // replica. We update SyncUpManager by peer's lag from last PUT offset in local store.
-          // it's ok if deactivation has completed and subsequent metadata request attempts to update lag of same replica
-          // again. The reason is, in previous request, onDeactivationComplete method should have removed local replica
-          // from SyncUpManager and it should be no-op and "updated" should be false when calling updateLagBetweenReplicas()
-          // for subsequent request. Hence, it won't call onDeactivationComplete() twice.
-          boolean updated =
-              replicaSyncUpManager.updateLagBetweenReplicas(localReplica, remoteReplicaInfo.getReplicaId(),
-                  localStore.getEndPositionOfLastPut() - totalBytesRead);
-          // if updated = false, it means the replica is not present in SyncUpManager and therefore doesn't need to
-          // complete transition. We don't throw exception here because Standby-To-Inactive transition may already be
-          // complete but local store's state is still INACTIVE since it will be updated at the beginning of
-          // Inactive-To-Offline transition.
-          if (updated && replicaSyncUpManager.isSyncUpComplete(localReplica)) {
-            replicaSyncUpManager.onDeactivationComplete(localReplica);
-          }
+          // it's ok if deactivation has completed and concurrent metadata request attempts to update lag of same replica
+          // again. The reason is, SyncUpManager has a lock to ensure only one request will call onDeactivationComplete()
+          // method. The local replica should have been removed when another request acquires the lock.
+          replicaSyncUpManager.updateReplicaLagAndCheckSyncStatus(localReplica, remoteReplicaInfo.getReplicaId(),
+              localStore.getEndPositionOfLastPut() - totalBytesRead, ReplicaState.INACTIVE);
         } else if (localStore.getCurrentState() == ReplicaState.OFFLINE && localStore.isDecommissionInProgress()) {
           // if local store is in OFFLINE state, we need more info to determine if replica is really in Inactive-To-Offline
           // transition. So we check if decommission file is present. If present, we update SyncUpManager by peer's lag
           // from end offset in local store.
-          boolean updated =
-              replicaSyncUpManager.updateLagBetweenReplicas(localReplica, remoteReplicaInfo.getReplicaId(),
-                  localStore.getSizeInBytes() - totalBytesRead);
-          if (updated && replicaSyncUpManager.isSyncUpComplete(localReplica)) {
-            replicaSyncUpManager.onDisconnectionComplete(localReplica);
-          }
+          replicaSyncUpManager.updateReplicaLagAndCheckSyncStatus(localReplica, remoteReplicaInfo.getReplicaId(),
+              localStore.getSizeInBytes() - totalBytesRead, ReplicaState.OFFLINE);
         }
       }
     }
@@ -244,7 +247,7 @@ public abstract class ReplicationEngine implements ReplicationAPI {
         break;
       }
     }
-    if (foundRemoteReplicaInfo == null && !replicaPath.startsWith(CloudReplica.Cloud_Replica_Keyword)) {
+    if (foundRemoteReplicaInfo == null && !replicaPath.startsWith(Cloud_Replica_Keyword)) {
       replicationMetrics.unknownRemoteReplicaRequestCount.inc();
       logger.error("ReplicaMetaDataRequest from unknown Replica {}, with path {}", hostName, replicaPath);
     }
@@ -356,9 +359,7 @@ public abstract class ReplicationEngine implements ReplicationAPI {
     ResponseHandler responseHandler = new ResponseHandler(clusterMap);
     for (int i = 0; i < numberOfThreads; i++) {
       boolean replicatingOverSsl = sslEnabledDatacenters.contains(datacenter);
-      String threadIdentity =
-          (startThread ? "Vcr" : "") + "ReplicaThread-" + (dataNodeId.getDatacenterName().equals(datacenter) ? "Intra-"
-              : "Inter-") + i + "-" + datacenter;
+      String threadIdentity = getReplicaThreadName(datacenter, i);
       try {
         StoreKeyConverter threadSpecificKeyConverter = storeKeyConverterFactory.getStoreKeyConverter();
         Transformer threadSpecificTransformer =
@@ -381,6 +382,17 @@ public abstract class ReplicationEngine implements ReplicationAPI {
     replicationMetrics.trackLiveThreadsCount(replicaThreads, datacenter);
     replicationMetrics.populateSingleColoMetrics(datacenter);
     return replicaThreads;
+  }
+
+  /**
+   * Chooses a name for a new replica thread.
+   * @param datacenterToReplicateFrom The datacenter that we replicate from in this thread.
+   * @param threadIndexWithinPool The index of the thread within the thread pool.
+   * @return The name of the thread.
+   */
+  protected String getReplicaThreadName(String datacenterToReplicateFrom, int threadIndexWithinPool) {
+    return "ReplicaThread-" + (dataNodeId.getDatacenterName().equals(datacenterToReplicateFrom) ? "Intra-" : "Inter-")
+        + threadIndexWithinPool + "-" + datacenterToReplicateFrom;
   }
 
   /**
@@ -675,4 +687,138 @@ public abstract class ReplicationEngine implements ReplicationAPI {
       return peerLeaderReplicaSet;
     }
   }
+
+  /**
+   * Implementation of {@link ClusterMapChangeListener} that helps replication manager react to cluster map changes.
+   */
+  class ClusterMapChangeListenerImpl implements ClusterMapChangeListener {
+
+    /**
+     * {@inheritDoc}
+     * Note that, this method should be thread-safe because multiple threads (from different cluster change handlers) may
+     * concurrently update remote replica infos.
+     */
+    @Override
+    public void onReplicaAddedOrRemoved(List<ReplicaId> addedReplicas, List<ReplicaId> removedReplicas) {
+      logger.trace("onReplicaAddedOrRemoved added: {}, removed: {}", addedReplicas, removedReplicas);
+      // 1. wait for start() to complete
+      try {
+        startupLatch.await();
+      } catch (InterruptedException e) {
+        logger.warn("Waiting for startup is interrupted.");
+        throw new IllegalStateException("Replication manager startup is interrupted while updating remote replicas");
+      }
+      if (started) {
+        // Read-write lock avoids contention between addReplica()/removeReplica() and onReplicaAddedOrRemoved() methods.
+        // Read lock for current method should suffice because multiple threads from cluster change handlers should be able
+        // to access partitionToPartitionInfo map. Each thread only updates PartitionInfo of certain partition and synchronization
+        // is only required within PartitionInfo. addRemoteReplicaInfoToReplicaThread() is thread-safe which allows
+        // several threads from cluster change handlers to add remoteReplicaInfo, but addRemoteReplicaInfoToReplicaThread
+        // and partitionToPartitionInfo read/write should be within the same transaction to avoid race condition.
+        rwLock.readLock().lock();
+        try {
+          // 2. determine if added/removed replicas have peer replica on local node.
+          //    We skip the replica on current node because it should already be added/removed by state transition thread.
+          Set<ReplicaId> addedPeerReplicas = addedReplicas.stream()
+              .filter(r -> partitionToPartitionInfo.containsKey(r.getPartitionId()) && r.getDataNodeId() != dataNodeId
+                  && shouldReplicateFromDc(r.getDataNodeId().getDatacenterName()))
+              .collect(Collectors.toSet());
+          Set<ReplicaId> removedPeerReplicas = removedReplicas.stream()
+              .filter(r -> partitionToPartitionInfo.containsKey(r.getPartitionId()) && r.getDataNodeId() != dataNodeId)
+              .collect(Collectors.toSet());
+
+          // No additional synchronization is required because cluster change handler of each dc only updates replica-threads
+          // belonging to certain dc. Hence, there is only one thread adding/removing remote replicas within a certain dc.
+
+          // 3. create replicaInfo for new remote replicas and assign them to replica-threads.
+          List<RemoteReplicaInfo> replicaInfosToAdd = new ArrayList<>();
+          for (ReplicaId remoteReplica : addedPeerReplicas) {
+            logger.info("Attempting to add remote replica in replication manager: " + remoteReplica);
+            PartitionInfo partitionInfo = partitionToPartitionInfo.get(remoteReplica.getPartitionId());
+            // create findToken, remoteReplicaInfo
+            FindToken findToken =
+                tokenHelper.getFindTokenFactoryFromReplicaType(remoteReplica.getReplicaType()).getNewFindToken();
+            RemoteReplicaInfo remoteReplicaInfo =
+                new RemoteReplicaInfo(remoteReplica, partitionInfo.getLocalReplicaId(), partitionInfo.getStore(),
+                    findToken,
+                    TimeUnit.SECONDS.toMillis(storeConfig.storeDataFlushIntervalSeconds) * Replication_Delay_Multiplier,
+                    SystemTime.getInstance(), remoteReplica.getDataNodeId().getPortToConnectTo());
+            logger.info("Adding remote replica {} on {} to partition info.", remoteReplica.getReplicaPath(),
+                remoteReplica.getDataNodeId());
+            if (partitionInfo.addReplicaInfoIfAbsent(remoteReplicaInfo)) {
+              replicationMetrics.addMetricsForRemoteReplicaInfo(remoteReplicaInfo,
+                  replicationConfig.replicationTrackPerDatacenterLagFromLocal);
+              replicaInfosToAdd.add(remoteReplicaInfo);
+            }
+          }
+          addRemoteReplicaInfoToReplicaThread(replicaInfosToAdd, true);
+
+          // 4. remove replicaInfo from existing partitionInfo and replica-threads
+          List<RemoteReplicaInfo> replicaInfosToRemove = new ArrayList<>();
+          for (ReplicaId remoteReplica : removedPeerReplicas) {
+            logger.info("Attempting to remove remote replica from replication manager: " + remoteReplica);
+            PartitionInfo partitionInfo = partitionToPartitionInfo.get(remoteReplica.getPartitionId());
+            RemoteReplicaInfo removedReplicaInfo = partitionInfo.removeReplicaInfoIfPresent(remoteReplica);
+            if (removedReplicaInfo != null) {
+              replicationMetrics.removeMetricsForRemoteReplicaInfo(removedReplicaInfo);
+              logger.info("Removing remote replica {} on {} from replica threads.", remoteReplica.getReplicaPath(),
+                  remoteReplica.getDataNodeId());
+              replicaInfosToRemove.add(removedReplicaInfo);
+            }
+          }
+          removeRemoteReplicaInfoFromReplicaThread(replicaInfosToRemove);
+          logger.info("{} peer replicas are added and {} peer replicas are removed in replication manager",
+              addedPeerReplicas.size(), removedPeerReplicas.size());
+        } finally {
+          rwLock.readLock().unlock();
+        }
+      }
+    }
+
+    /**
+     * {@inheritDoc}
+     * Note that, this method should be thread-safe because multiple threads (from different cluster change handlers) may
+     * concurrently call this method.
+     */
+    @Override
+    public void onRoutingTableChange() {
+
+      // wait for start() to complete
+      try {
+        startupLatch.await();
+      } catch (InterruptedException e) {
+        logger.warn("Waiting for startup is interrupted.");
+        throw new IllegalStateException(
+            "Replication manager startup is interrupted while handling routing table change");
+      }
+
+      if (leaderBasedReplicationAdmin != null) {
+        // Refreshes the remote leader information for all local leader partitions maintained in the in-mem structure in LeaderBasedReplicationAdmin.
+        // Thread safety is ensured in LeaderBasedReplicationAdmin::refreshPeerLeadersForAllPartitions().
+        leaderBasedReplicationAdmin.refreshPeerLeadersForLeaderPartitions();
+      }
+    }
+  }
+
+  /**
+   * Update {@link PartitionInfo} related maps including {@link ReplicationEngine#partitionToPartitionInfo} and
+   * {@link ReplicationEngine#mountPathToPartitionInfos}
+   * @param remoteReplicaInfos the {@link RemoteReplicaInfo}(s) of the local {@link ReplicaId}
+   * @param replicaId the local replica
+   */
+  protected void updatePartitionInfoMaps(List<RemoteReplicaInfo> remoteReplicaInfos, ReplicaId replicaId) {
+    PartitionId partition = replicaId.getPartitionId();
+    PartitionInfo partitionInfo =
+        new PartitionInfo(remoteReplicaInfos, partition, storeManager.getStore(partition), replicaId);
+    partitionToPartitionInfo.put(partition, partitionInfo);
+    mountPathToPartitionInfos.computeIfAbsent(replicaId.getMountPath(), key -> ConcurrentHashMap.newKeySet())
+        .add(partitionInfo);
+  }
+
+  /**
+   * Check if replication is allowed from given datacenter.
+   * @param datacenterName datacenter name to check.
+   * @return true if replication is allowed. false otherwise.
+   */
+  protected abstract boolean shouldReplicateFromDc(String datacenterName);
 }

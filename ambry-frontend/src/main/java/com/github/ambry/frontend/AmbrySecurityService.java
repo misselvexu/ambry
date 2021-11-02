@@ -16,10 +16,18 @@ package com.github.ambry.frontend;
 import com.github.ambry.account.Account;
 import com.github.ambry.account.Container;
 import com.github.ambry.commons.Callback;
+import com.github.ambry.commons.HostLevelThrottler;
 import com.github.ambry.config.FrontendConfig;
 import com.github.ambry.messageformat.BlobInfo;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.protocol.GetOption;
+import com.github.ambry.quota.QuotaManager;
+import com.github.ambry.quota.QuotaMode;
+import com.github.ambry.quota.QuotaName;
+import com.github.ambry.quota.QuotaUtils;
+import com.github.ambry.quota.RequestCostPolicy;
+import com.github.ambry.quota.ThrottlingRecommendation;
+import com.github.ambry.quota.UserQuotaRequestCostPolicy;
 import com.github.ambry.rest.RequestPath;
 import com.github.ambry.rest.ResponseStatus;
 import com.github.ambry.rest.RestMethod;
@@ -35,6 +43,7 @@ import com.github.ambry.utils.Utils;
 import java.util.Collections;
 import java.util.Date;
 import java.util.GregorianCalendar;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
@@ -48,24 +57,25 @@ import static com.github.ambry.router.GetBlobOptions.*;
  * sets the respective headers on response.
  */
 class AmbrySecurityService implements SecurityService {
-
   static final Set<String> OPERATIONS = Collections.unmodifiableSet(
       Utils.getStaticFieldValuesAsStrings(Operations.class)
           .collect(Collectors.toCollection(() -> new TreeSet<>(String.CASE_INSENSITIVE_ORDER))));
   private final FrontendConfig frontendConfig;
   private final FrontendMetrics frontendMetrics;
   private final UrlSigningService urlSigningService;
+  private final HostLevelThrottler hostLevelThrottler;
   private final QuotaManager quotaManager;
+  private final RequestCostPolicy requestCostPolicy;
   private boolean isOpen;
-  private static final String NAMED_BLOB_PREFIX = "/named";
-
 
   AmbrySecurityService(FrontendConfig frontendConfig, FrontendMetrics frontendMetrics,
-      UrlSigningService urlSigningService, QuotaManager quotaManager) {
+      UrlSigningService urlSigningService, HostLevelThrottler hostLevelThrottler, QuotaManager quotaManager) {
     this.frontendConfig = frontendConfig;
     this.frontendMetrics = frontendMetrics;
     this.urlSigningService = urlSigningService;
+    this.hostLevelThrottler = hostLevelThrottler;
     this.quotaManager = quotaManager;
+    this.requestCostPolicy = new UserQuotaRequestCostPolicy(quotaManager.getQuotaConfig());
     isOpen = true;
   }
 
@@ -110,35 +120,62 @@ class AmbrySecurityService implements SecurityService {
 
   @Override
   public void postProcessRequest(RestRequest restRequest, Callback<Void> callback) {
+    if (restRequest == null || callback == null) {
+      throw new IllegalArgumentException("RestRequest or Callback is null");
+    }
     Exception exception = null;
     frontendMetrics.securityServicePostProcessRequestRate.mark();
     long startTimeMs = System.currentTimeMillis();
-    if (!isOpen) {
-      exception = new RestServiceException("SecurityService is closed", RestServiceErrorCode.ServiceUnavailable);
-    } else if (restRequest == null || callback == null) {
-      throw new IllegalArgumentException("RestRequest or Callback is null");
-    } else if (quotaManager.shouldThrottle(restRequest)) {
-      exception = new RestServiceException("Too many requests", RestServiceErrorCode.TooManyRequests);
-    } else if (restRequest.getRestMethod() == RestMethod.DELETE || restRequest.getRestMethod() == RestMethod.PUT) {
-      try {
-        accountAndContainerNamePreconditionCheck(restRequest);
-      } catch (Exception e) {
-        exception = e;
-      }
-    } else if (restRequest.getRestMethod() == RestMethod.GET) {
-      RequestPath requestPath = getRequestPath(restRequest);
-      String operationOrBlobId = requestPath.getOperationOrBlobId(true);
-      // ensure that secure path validation is only performed when getting blobs rather than other operations.
-      if (!operationOrBlobId.isEmpty() && !OPERATIONS.contains(operationOrBlobId)) {
-        try {
-          validateSecurePathIfRequired(restRequest, requestPath.getPrefix(), frontendConfig.securePathPrefix);
-        } catch (Exception e) {
-          exception = e;
+    try {
+      if (!isOpen) {
+        exception = new RestServiceException("SecurityService is closed", RestServiceErrorCode.ServiceUnavailable);
+      } else if (hostLevelThrottler.shouldThrottle(restRequest)) {
+        exception = new RestServiceException("Too many requests", RestServiceErrorCode.TooManyRequests);
+      } else {
+        if (QuotaUtils.isRequestResourceQuotaManaged(restRequest) && quotaManager != null) {
+          ThrottlingRecommendation throttlingRecommendation = quotaManager.getThrottleRecommendation(restRequest);
+          if (throttlingRecommendation != null && throttlingRecommendation.shouldThrottle()
+              && quotaManager.getQuotaMode() == QuotaMode.THROTTLING) {
+            Map<String, String> quotaHeaderMap = RestUtils.buildUserQuotaHeadersMap(throttlingRecommendation);
+            throw new RestServiceException("User Quota Exceeded", RestServiceErrorCode.TooManyRequests, true, true,
+                quotaHeaderMap);
+          }
+        }
+        if (restRequest.getRestMethod() == RestMethod.DELETE || restRequest.getRestMethod() == RestMethod.PUT) {
+          accountAndContainerNamePreconditionCheck(restRequest);
+        } else if (restRequest.getRestMethod() == RestMethod.GET) {
+          RequestPath requestPath = getRequestPath(restRequest);
+          String operationOrBlobId = requestPath.getOperationOrBlobId(true);
+          // ensure that secure path validation is only performed when getting blobs rather than other operations.
+          if (!operationOrBlobId.isEmpty() && !OPERATIONS.contains(operationOrBlobId)) {
+            validateSecurePathIfRequired(restRequest, requestPath.getPrefix(), frontendConfig.securePathPrefix);
+          }
         }
       }
+    } catch (Exception e) {
+      exception = e;
+    } finally {
+      frontendMetrics.securityServicePostProcessRequestTimeInMs.update(System.currentTimeMillis() - startTimeMs);
+      callback.onCompletion(null, exception);
     }
-    frontendMetrics.securityServicePostProcessRequestTimeInMs.update(System.currentTimeMillis() - startTimeMs);
-    callback.onCompletion(null, exception);
+  }
+
+  @Override
+  public void processRequestCharges(RestRequest restRequest, RestResponseChannel responseChannel, BlobInfo blobInfo) {
+    Map<QuotaName, Double> requestCost = requestCostPolicy.calculateRequestCost(restRequest, responseChannel, blobInfo)
+        .entrySet()
+        .stream()
+        .collect(Collectors.toMap(entry -> QuotaName.valueOf(entry.getKey()), entry -> entry.getValue()));
+    setRequestCostHeader(requestCost, responseChannel);
+    if (QuotaUtils.isRequestResourceQuotaManaged(restRequest) && quotaManager != null) {
+      ThrottlingRecommendation throttlingRecommendation = quotaManager.getThrottleRecommendation(restRequest);
+      if (throttlingRecommendation != null) {
+        RestUtils.buildUserQuotaHeadersMap(throttlingRecommendation)
+            .entrySet()
+            .stream()
+            .forEach(headerEntry -> responseChannel.setHeader(headerEntry.getKey(), headerEntry.getValue()));
+      }
+    }
   }
 
   @Override
@@ -199,6 +236,7 @@ class AmbrySecurityService implements SecurityService {
                 setCacheHeaders(restRequest, responseChannel);
               } else {
                 if (subResource.equals(RestUtils.SubResource.BlobInfo)) {
+                  setBlobInfoHeaders(blobInfo.getBlobProperties(), responseChannel);
                   setBlobPropertiesHeaders(blobInfo.getBlobProperties(), responseChannel);
                   setAccountAndContainerHeaders(restRequest, responseChannel);
                   responseChannel.setHeader(RestUtils.Headers.LIFE_VERSION, blobInfo.getLifeVersion());
@@ -221,7 +259,7 @@ class AmbrySecurityService implements SecurityService {
             break;
           case OPTIONS:
           case PUT:
-            if (requestPath.getOperationOrBlobId(false).startsWith(NAMED_BLOB_PREFIX)) {
+            if (requestPath.matchesOperation(Operations.NAMED_BLOB)) {
               responseChannel.setStatus(ResponseStatus.Created);
               responseChannel.setHeader(RestUtils.Headers.CONTENT_LENGTH, 0);
               responseChannel.setHeader(RestUtils.Headers.CREATION_TIME,
@@ -236,6 +274,7 @@ class AmbrySecurityService implements SecurityService {
         exception = e;
       }
     }
+    processRequestCharges(restRequest, responseChannel, blobInfo);
     frontendMetrics.securityServiceProcessResponseTimeInMs.update(System.currentTimeMillis() - startTimeMs);
     callback.onCompletion(null, exception);
   }
@@ -360,11 +399,19 @@ class AmbrySecurityService implements SecurityService {
     if (blobProperties.getContentType() != null) {
       restResponseChannel.setHeader(RestUtils.Headers.AMBRY_CONTENT_TYPE, blobProperties.getContentType());
     }
-    if (blobProperties.getContentEncoding() != null) {
-      restResponseChannel.setHeader(Headers.CONTENT_ENCODING, blobProperties.getContentEncoding());
-    }
     if (blobProperties.getOwnerId() != null) {
       restResponseChannel.setHeader(RestUtils.Headers.OWNER_ID, blobProperties.getOwnerId());
+    }
+  }
+
+  /**
+   * Set the specific required headers for get blob info in the response.
+   * @param blobProperties the {@link BlobProperties} that need to be set in the headers.
+   * @param restResponseChannel the {@link RestResponseChannel} that is used for sending the response.
+   */
+  private void setBlobInfoHeaders(BlobProperties blobProperties, RestResponseChannel restResponseChannel) {
+    if (blobProperties.getContentEncoding() != null) {
+      restResponseChannel.setHeader(Headers.AMBRY_CONTENT_ENCODING, blobProperties.getContentEncoding());
     }
   }
 

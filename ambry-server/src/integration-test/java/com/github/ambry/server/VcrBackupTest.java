@@ -101,6 +101,8 @@ public class VcrBackupTest {
   public void setup() throws Exception {
     Properties props = new Properties();
     TestSSLUtils.addHttp2Properties(props, SSLFactory.Mode.SERVER, true);
+    // VCR use this mockCluster to initiate cluster map.
+    props.setProperty("clustermap.enable.http2.replication", "true");
     mockCluster = new MockCluster(props, false, SystemTime.getInstance(), 1, 1, numOfPartitions);
     notificationSystem = new MockNotificationSystem(mockCluster.getClusterMap());
     mockCluster.initializeServers(notificationSystem);
@@ -133,7 +135,7 @@ public class VcrBackupTest {
     // Start the VCR and CloudBackupManager
     Properties props =
         VcrTestUtil.createVcrProperties(dataNode.getDatacenterName(), vcrClusterName, zkConnectString, clusterMapPort,
-            12410, null, vcrHelixStateModelFactoryClass);
+            12410, null, vcrHelixStateModelFactoryClass, true);
     LatchBasedInMemoryCloudDestination latchBasedInMemoryCloudDestination =
         new LatchBasedInMemoryCloudDestination(blobIds, mockCluster.getClusterMap());
     CloudDestinationFactory cloudDestinationFactory =
@@ -167,7 +169,7 @@ public class VcrBackupTest {
     // Start the VCR with token persistor off.
     Properties props =
         VcrTestUtil.createVcrProperties(dataNode.getDatacenterName(), vcrClusterName, zkConnectString, clusterMapPort,
-            12410, null, vcrHelixStateModelFactoryClass);
+            12410, null, vcrHelixStateModelFactoryClass, true);
     props.setProperty("replication.persist.token.on.shutdown.or.replica.remove", "false");
     MockNotificationSystem vcrNotificationSystem = new MockNotificationSystem(mockCluster.getClusterMap());
     VcrServer vcrServer =
@@ -246,7 +248,7 @@ public class VcrBackupTest {
     // Start the VCR with token persistor on.
     Properties props =
         VcrTestUtil.createVcrProperties(dataNode.getDatacenterName(), vcrClusterName, zkConnectString, clusterMapPort,
-            12410, null, vcrHelixStateModelFactoryClass);
+            12410, null, vcrHelixStateModelFactoryClass, true);
     props.setProperty("replication.persist.token.on.shutdown.or.replica.remove", "true");
     MockNotificationSystem vcrNotificationSystem = new MockNotificationSystem(mockCluster.getClusterMap());
     VcrServer vcrServer =
@@ -329,7 +331,7 @@ public class VcrBackupTest {
     for (int port = 12310; port < 12310 + initialNumOfVcrs; port++) {
       Properties props =
           VcrTestUtil.createVcrProperties(dataNode.getDatacenterName(), vcrClusterName, zkConnectString, port,
-              port + 100, null, vcrHelixStateModelFactoryClass);
+              port + 100, null, vcrHelixStateModelFactoryClass, true);
       MockNotificationSystem vcrNotificationSystem = new MockNotificationSystem(mockCluster.getClusterMap());
       VcrServer vcrServer =
           VcrTestUtil.createVcrServer(new VerifiableProperties(props), mockCluster.getClusterAgentsFactory(),
@@ -356,16 +358,16 @@ public class VcrBackupTest {
         }
       }).collect(Collectors.toSet());
       assertTrue("Each VCR should have some assignment.",
-          vcrServers.get(i).getVirtualReplicatorCluster().getAssignedPartitionIds().size() > 0);
+          vcrServers.get(i).getVcrClusterParticipant().getAssignedPartitionIds().size() > 0);
       assertTrue("Each VCR should only backup its assigned partitions.",
-          new HashSet<>(vcrServers.get(i).getVirtualReplicatorCluster().getAssignedPartitionIds()).containsAll(
+          new HashSet<>(vcrServers.get(i).getVcrClusterParticipant().getAssignedPartitionIds()).containsAll(
               partitionIdSet));
     }
     logger.info("Phase 1 done.");
 
     // 2nd phase: Add a new VCR to cluster.
     Properties props = VcrTestUtil.createVcrProperties(dataNode.getDatacenterName(), vcrClusterName, zkConnectString,
-        12310 + initialNumOfVcrs, 12310 + initialNumOfVcrs + 100, null, vcrHelixStateModelFactoryClass);
+        12310 + initialNumOfVcrs, 12310 + initialNumOfVcrs + 100, null, vcrHelixStateModelFactoryClass, true);
     MockNotificationSystem vcrNotificationSystem = new MockNotificationSystem(mockCluster.getClusterMap());
     VcrServer vcrServer =
         VcrTestUtil.createVcrServer(new VerifiableProperties(props), mockCluster.getClusterAgentsFactory(),
@@ -422,9 +424,9 @@ public class VcrBackupTest {
    * @param vcrServer a sample server to detect ideal state change.
    * @param helixBalanceVerifier helix balance verifier.
    */
-  private void makeSureHelixBalance(VcrServer vcrServer, StrictMatchExternalViewVerifier helixBalanceVerifier) {
+  static void makeSureHelixBalance(VcrServer vcrServer, StrictMatchExternalViewVerifier helixBalanceVerifier) {
     Assert.assertTrue("Helix topology change timeout.", TestUtils.checkAndSleep(true,
-        () -> vcrServer.getVirtualReplicatorCluster().getAssignedPartitionIds().size() > 0, 15000));
+        () -> vcrServer.getVcrClusterParticipant().getAssignedPartitionIds().size() > 0, 15000));
     assertTrue("Helix balance timeout.", helixBalanceVerifier.verify(15000));
   }
 

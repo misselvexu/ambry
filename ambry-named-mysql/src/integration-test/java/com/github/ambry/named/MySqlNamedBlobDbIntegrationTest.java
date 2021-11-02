@@ -23,6 +23,7 @@ import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.frontend.Page;
 import com.github.ambry.rest.RestServiceErrorCode;
 import com.github.ambry.rest.RestServiceException;
 import com.github.ambry.utils.TestUtils;
@@ -86,6 +87,7 @@ public class MySqlNamedBlobDbIntegrationTest {
               i % 2 == 0 ? Utils.Infinite_Time : System.currentTimeMillis() + TimeUnit.HOURS.toMillis(1);
           NamedBlobRecord record =
               new NamedBlobRecord(account.getName(), container.getName(), blobName, blobId, expirationTime);
+
           namedBlobDb.put(record).get();
           records.add(record);
         }
@@ -103,8 +105,8 @@ public class MySqlNamedBlobDbIntegrationTest {
     for (Account account : accountService.getAllAccounts()) {
       for (Container container : account.getAllContainers()) {
         Page<NamedBlobRecord> page = namedBlobDb.list(account.getName(), container.getName(), "name", null).get();
-        assertNull("No continuation token expected", page.getContinuationToken());
-        assertEquals("Unexpected number of blobs in container", blobsPerContainer, page.getElements().size());
+        assertNull("No continuation token expected", page.getNextPageToken());
+        assertEquals("Unexpected number of blobs in container", blobsPerContainer, page.getEntries().size());
       }
     }
 
@@ -123,14 +125,29 @@ public class MySqlNamedBlobDbIntegrationTest {
 
     // delete the records and check that they cannot be fetched with a get call.
     for (NamedBlobRecord record : records) {
-      namedBlobDb.delete(record.getAccountName(), record.getContainerName(), record.getBlobName()).get();
+      DeleteResult deleteResult =
+          namedBlobDb.delete(record.getAccountName(), record.getContainerName(), record.getBlobName()).get();
+      assertEquals("Unexpected deleted ID", record.getBlobId(), deleteResult.getBlobId());
+      assertFalse("Unexpected alreadyDeleted value", deleteResult.isAlreadyDeleted());
       checkErrorCode(() -> namedBlobDb.get(record.getAccountName(), record.getContainerName(), record.getBlobName()),
           RestServiceErrorCode.Deleted);
     }
 
     // deletes should be idempotent and additional delete calls should succeed
     for (NamedBlobRecord record : records) {
-      namedBlobDb.delete(record.getAccountName(), record.getContainerName(), record.getBlobName()).get();
+      DeleteResult deleteResult =
+          namedBlobDb.delete(record.getAccountName(), record.getContainerName(), record.getBlobName()).get();
+      assertEquals("Unexpected deleted ID", record.getBlobId(), deleteResult.getBlobId());
+      assertTrue("Unexpected alreadyDeleted value", deleteResult.isAlreadyDeleted());
+    }
+
+    // delete and get for non existent blobs should return not found.
+    for (NamedBlobRecord record : records) {
+      String nonExistentName = record.getBlobName() + "-other";
+      checkErrorCode(() -> namedBlobDb.get(record.getAccountName(), record.getContainerName(), nonExistentName),
+          RestServiceErrorCode.NotFound);
+      checkErrorCode(() -> namedBlobDb.delete(record.getAccountName(), record.getContainerName(), nonExistentName),
+          RestServiceErrorCode.NotFound);
     }
 
     records.clear();
@@ -149,6 +166,33 @@ public class MySqlNamedBlobDbIntegrationTest {
         }
       }
     }
+  }
+
+  /**
+   * Test behavior with expired blobs
+   */
+  @Test
+  public void testExpiredBlobs() throws Exception {
+    Account account = accountService.getAllAccounts().iterator().next();
+    Container container = account.getAllContainers().iterator().next();
+
+    String blobId = getBlobId(account, container);
+    String blobName = "name";
+    long expirationTime = System.currentTimeMillis();
+    NamedBlobRecord record =
+        new NamedBlobRecord(account.getName(), container.getName(), blobName, blobId, expirationTime);
+    namedBlobDb.put(record).get();
+
+    Thread.sleep(100);
+    checkErrorCode(() -> namedBlobDb.get(account.getName(), container.getName(), blobName),
+        RestServiceErrorCode.Deleted);
+
+    // replacement should succeed
+    blobId = getBlobId(account, container);
+    record = new NamedBlobRecord(account.getName(), container.getName(), blobName, blobId, Utils.Infinite_Time);
+    namedBlobDb.put(record).get();
+    assertEquals("Record should have been replaced", record,
+        namedBlobDb.get(account.getName(), container.getName(), blobName).get());
   }
 
   /**

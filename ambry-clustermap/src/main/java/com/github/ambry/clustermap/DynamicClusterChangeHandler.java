@@ -302,6 +302,8 @@ public class DynamicClusterChangeHandler implements HelixClusterChangeHandler {
     }
     // if this is not initial InstanceConfig change and any replicas are added or removed, we should invoke callbacks
     // for different clustermap change listeners (i.e replication manager, partition selection helper)
+    logger.info("In total, {} replicas are being added and {} replicas are being removed. instanceConfigInitialized: {}", totalAddedReplicas.size(),
+        totalRemovedReplicas.size(), instanceConfigInitialized);
     if (instanceConfigInitialized && (!totalAddedReplicas.isEmpty() || !totalRemovedReplicas.isEmpty())) {
       for (ClusterMapChangeListener listener : clusterMapChangeListeners) {
         listener.onReplicaAddedOrRemoved(totalAddedReplicas, totalRemovedReplicas);
@@ -338,6 +340,14 @@ public class DynamicClusterChangeHandler implements HelixClusterChangeHandler {
             instanceName);
         // TODO support dynamically adding disk in the future
         continue;
+      }
+      // update disk capacity if needed
+      if (disk.getRawCapacityInBytes() != diskConfig.getDiskCapacityInBytes()) {
+        long prevDiskCapacity = disk.getRawCapacityInBytes();
+        logger.info("Capacity of disk at {} on {} has changed. Previous was: {} bytes, new capacity is {} bytes",
+            mountPath, instanceName, prevDiskCapacity, diskConfig.getDiskCapacityInBytes());
+        disk.setDiskCapacityInBytes(diskConfig.getDiskCapacityInBytes());
+        clusterChangeHandlerCallback.addClusterWideRawCapacity(diskConfig.getDiskCapacityInBytes() - prevDiskCapacity);
       }
       for (Map.Entry<String, DataNodeConfig.ReplicaConfig> replicaEntry : diskConfig.getReplicaConfigs().entrySet()) {
         // partition name and replica name are the same.

@@ -100,7 +100,8 @@ public class Http2MultiplexedChannelPool implements ChannelPool {
       ChannelInitializer streamChannelInitializer) {
     this(new SimpleChannelPool(createBootStrap(eventLoopGroup, http2ClientConfig, inetSocketAddress),
             new Http2ChannelPoolHandler(sslFactory, inetSocketAddress.getHostName(), inetSocketAddress.getPort(),
-                http2ClientConfig)), eventLoopGroup, ConcurrentHashMap.newKeySet(), inetSocketAddress, http2ClientConfig,
+                http2ClientConfig, http2ClientMetrics)),
+        eventLoopGroup, ConcurrentHashMap.newKeySet(), inetSocketAddress, http2ClientConfig,
         http2ClientMetrics, streamChannelInitializer);
   }
 
@@ -469,7 +470,7 @@ public class Http2MultiplexedChannelPool implements ChannelPool {
      */
     @Override
     public void channelInactive(ChannelHandlerContext ctx) {
-      log.info("Connection {} become inactive.", ctx.channel());
+      log.trace("Connection {} become inactive.", ctx.channel());
       closeAndReleaseParent(ctx, new ClosedChannelException());
     }
 

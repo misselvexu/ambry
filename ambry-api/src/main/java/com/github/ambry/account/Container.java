@@ -13,13 +13,12 @@
  */
 package com.github.ambry.account;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.Objects;
 import java.util.Set;
-import org.json.JSONArray;
-import org.json.JSONException;
-import org.json.JSONObject;
 
 
 /**
@@ -33,10 +32,6 @@ import org.json.JSONObject;
  *   Container name is provided by a user as an external reference to that container. Container id is an internal
  *   identifier of the container, and is one-to-one mapped to a container name. Container name/id has to be distinct
  *   within the same {@link Account}, but can be the same across different {@link Account}s.
- * </p>
- * <p>
- *   Container is serialized into {@link JSONObject} in the {@code currentJsonVersion}, which is version 1
- *   for now. Below lists all the metadata versions and their formats:
  * </p>
  *  <pre><code>
  *  {
@@ -54,6 +49,7 @@ import org.json.JSONObject;
  *  {@link AccountBuilder}.
  *  </p>
  */
+@JsonDeserialize(builder = ContainerBuilder.class)
 public class Container {
 
   // constants
@@ -72,6 +68,8 @@ public class Container {
   static final String REPLICATION_POLICY_KEY = "replicationPolicy";
   static final String TTL_REQUIRED_KEY = "ttlRequired";
   static final String SECURE_PATH_REQUIRED_KEY = "securePathRequired";
+  static final String OVERRIDE_ACCOUNT_ACL_KEY = "overrideAccountAcl";
+  static final String NAMED_BLOB_MODE_KEY = "namedBlobMode";
   static final String CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD = "contentTypeWhitelistForFilenamesOnDownload";
   static final String PARENT_ACCOUNT_ID_KEY = "parentAccountId";
   static final String LAST_MODIFIED_TIME_KEY = "lastModifiedTime";
@@ -83,6 +81,8 @@ public class Container {
   static final boolean TTL_REQUIRED_DEFAULT_VALUE = true;
   static final long CONTAINER_DELETE_TRIGGER_TIME_DEFAULT_VALUE = 0;
   static final boolean SECURE_PATH_REQUIRED_DEFAULT_VALUE = false;
+  static final boolean OVERRIDE_ACCOUNT_ACL_DEFAULT_VALUE = false;
+  static final NamedBlobMode NAMED_BLOB_MODE_DEFAULT_VALUE = NamedBlobMode.DISABLED;
   static final boolean CACHEABLE_DEFAULT_VALUE = true;
   static final Set<String> CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD_DEFAULT_VALUE = Collections.emptySet();
   static final long LAST_MODIFIED_TIME_DEFAULT_VALUE = 0;
@@ -295,7 +295,9 @@ public class Container {
           UNKNOWN_CONTAINER_PREVIOUSLY_ENCRYPTED_SETTING, UNKNOWN_CONTAINER_CACHEABLE_SETTING,
           UNKNOWN_CONTAINER_MEDIA_SCAN_DISABLED_SETTING, null, UNKNOWN_CONTAINER_TTL_REQUIRED_SETTING,
           SECURE_PATH_REQUIRED_DEFAULT_VALUE, CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD_DEFAULT_VALUE,
-          BACKUP_ENABLED_DEFAULT_VALUE, UNKNOWN_CONTAINER_PARENT_ACCOUNT_ID, UNKNOWN_CONTAINER_DELETE_TRIGGER_TIME);
+          BACKUP_ENABLED_DEFAULT_VALUE, OVERRIDE_ACCOUNT_ACL_DEFAULT_VALUE, NAMED_BLOB_MODE_DEFAULT_VALUE,
+          UNKNOWN_CONTAINER_PARENT_ACCOUNT_ID, UNKNOWN_CONTAINER_DELETE_TRIGGER_TIME, LAST_MODIFIED_TIME_DEFAULT_VALUE,
+          SNAPSHOT_VERSION_DEFAULT_VALUE);
 
   /**
    * A container defined specifically for the blobs put without specifying target container but isPrivate flag is
@@ -310,8 +312,9 @@ public class Container {
           DEFAULT_PUBLIC_CONTAINER_PREVIOUSLY_ENCRYPTED_SETTING, DEFAULT_PUBLIC_CONTAINER_CACHEABLE_SETTING,
           DEFAULT_PUBLIC_CONTAINER_MEDIA_SCAN_DISABLED_SETTING, null, DEFAULT_PUBLIC_CONTAINER_TTL_REQUIRED_SETTING,
           SECURE_PATH_REQUIRED_DEFAULT_VALUE, CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD_DEFAULT_VALUE,
-          BACKUP_ENABLED_DEFAULT_VALUE, DEFAULT_PUBLIC_CONTAINER_PARENT_ACCOUNT_ID,
-          DEFAULT_PRIVATE_CONTAINER_DELETE_TRIGGER_TIME);
+          BACKUP_ENABLED_DEFAULT_VALUE, OVERRIDE_ACCOUNT_ACL_DEFAULT_VALUE, NAMED_BLOB_MODE_DEFAULT_VALUE,
+          DEFAULT_PUBLIC_CONTAINER_PARENT_ACCOUNT_ID, DEFAULT_PRIVATE_CONTAINER_DELETE_TRIGGER_TIME,
+          LAST_MODIFIED_TIME_DEFAULT_VALUE, SNAPSHOT_VERSION_DEFAULT_VALUE);
 
   /**
    * A container defined specifically for the blobs put without specifying target container but isPrivate flag is
@@ -326,16 +329,20 @@ public class Container {
           DEFAULT_PRIVATE_CONTAINER_PREVIOUSLY_ENCRYPTED_SETTING, DEFAULT_PRIVATE_CONTAINER_CACHEABLE_SETTING,
           DEFAULT_PRIVATE_CONTAINER_MEDIA_SCAN_DISABLED_SETTING, null, DEFAULT_PRIVATE_CONTAINER_TTL_REQUIRED_SETTING,
           SECURE_PATH_REQUIRED_DEFAULT_VALUE, CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD_DEFAULT_VALUE,
-          BACKUP_ENABLED_DEFAULT_VALUE, DEFAULT_PRIVATE_CONTAINER_PARENT_ACCOUNT_ID,
-          DEFAULT_PUBLIC_CONTAINER_DELETE_TRIGGER_TIME);
+          BACKUP_ENABLED_DEFAULT_VALUE, OVERRIDE_ACCOUNT_ACL_DEFAULT_VALUE, NAMED_BLOB_MODE_DEFAULT_VALUE,
+          DEFAULT_PRIVATE_CONTAINER_PARENT_ACCOUNT_ID, DEFAULT_PUBLIC_CONTAINER_DELETE_TRIGGER_TIME,
+          LAST_MODIFIED_TIME_DEFAULT_VALUE, SNAPSHOT_VERSION_DEFAULT_VALUE);
 
   // container field variables
+  @JsonProperty(CONTAINER_ID_KEY)
   private final short id;
+  @JsonProperty(CONTAINER_NAME_KEY)
   private final String name;
   private final ContainerStatus status;
   private final long deleteTriggerTime;
   private final String description;
   private final boolean encrypted;
+  @JsonProperty(PREVIOUSLY_ENCRYPTED_KEY)
   private final boolean previouslyEncrypted;
   private final boolean cacheable;
   private final boolean backupEnabled;
@@ -343,73 +350,15 @@ public class Container {
   private final String replicationPolicy;
   private final boolean ttlRequired;
   private final boolean securePathRequired;
+  @JsonProperty(OVERRIDE_ACCOUNT_ACL_KEY)
+  private final boolean overrideAccountAcl;
+  private final NamedBlobMode namedBlobMode;
   private final Set<String> contentTypeWhitelistForFilenamesOnDownload;
   private final short parentAccountId;
   private final long lastModifiedTime;
   private final int snapshotVersion;
-
-  /**
-   * Constructing an {@link Container} object from container metadata.
-   * @param metadata The metadata of the container in JSON.
-   * @throws JSONException If fails to parse metadata.
-   */
-  private Container(JSONObject metadata, short parentAccountId) throws JSONException {
-    if (metadata == null) {
-      throw new IllegalArgumentException("metadata cannot be null.");
-    }
-    this.parentAccountId = parentAccountId;
-    short metadataVersion = (short) metadata.getInt(JSON_VERSION_KEY);
-    switch (metadataVersion) {
-      case JSON_VERSION_1:
-        id = (short) metadata.getInt(CONTAINER_ID_KEY);
-        name = metadata.getString(CONTAINER_NAME_KEY);
-        status = ContainerStatus.valueOf(metadata.getString(STATUS_KEY));
-        deleteTriggerTime = CONTAINER_DELETE_TRIGGER_TIME_DEFAULT_VALUE;
-        description = metadata.optString(DESCRIPTION_KEY);
-        encrypted = ENCRYPTED_DEFAULT_VALUE;
-        previouslyEncrypted = PREVIOUSLY_ENCRYPTED_DEFAULT_VALUE;
-        cacheable = !metadata.getBoolean(IS_PRIVATE_KEY);
-        backupEnabled = BACKUP_ENABLED_DEFAULT_VALUE;
-        mediaScanDisabled = MEDIA_SCAN_DISABLED_DEFAULT_VALUE;
-        replicationPolicy = null;
-        ttlRequired = TTL_REQUIRED_DEFAULT_VALUE;
-        securePathRequired = SECURE_PATH_REQUIRED_DEFAULT_VALUE;
-        contentTypeWhitelistForFilenamesOnDownload = CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD_DEFAULT_VALUE;
-        lastModifiedTime = metadata.optLong(LAST_MODIFIED_TIME_KEY, LAST_MODIFIED_TIME_DEFAULT_VALUE);
-        snapshotVersion = metadata.optInt(SNAPSHOT_VERSION_KEY, SNAPSHOT_VERSION_DEFAULT_VALUE);
-        break;
-      case JSON_VERSION_2:
-        id = (short) metadata.getInt(CONTAINER_ID_KEY);
-        name = metadata.getString(CONTAINER_NAME_KEY);
-        status = ContainerStatus.valueOf(metadata.getString(STATUS_KEY));
-        deleteTriggerTime =
-            metadata.optLong(CONTAINER_DELETE_TRIGGER_TIME_KEY, CONTAINER_DELETE_TRIGGER_TIME_DEFAULT_VALUE);
-        description = metadata.optString(DESCRIPTION_KEY);
-        encrypted = metadata.optBoolean(ENCRYPTED_KEY, ENCRYPTED_DEFAULT_VALUE);
-        previouslyEncrypted = metadata.optBoolean(PREVIOUSLY_ENCRYPTED_KEY, PREVIOUSLY_ENCRYPTED_DEFAULT_VALUE);
-        cacheable = metadata.optBoolean(CACHEABLE_KEY, CACHEABLE_DEFAULT_VALUE);
-        backupEnabled = metadata.optBoolean(BACKUP_ENABLED_KEY, BACKUP_ENABLED_DEFAULT_VALUE);
-        mediaScanDisabled = metadata.optBoolean(MEDIA_SCAN_DISABLED_KEY, MEDIA_SCAN_DISABLED_DEFAULT_VALUE);
-        replicationPolicy = metadata.optString(REPLICATION_POLICY_KEY, null);
-        ttlRequired = metadata.optBoolean(TTL_REQUIRED_KEY, TTL_REQUIRED_DEFAULT_VALUE);
-        securePathRequired = metadata.optBoolean(SECURE_PATH_REQUIRED_KEY, SECURE_PATH_REQUIRED_DEFAULT_VALUE);
-        JSONArray contentTypeWhitelistForFilenamesOnDownloadJson =
-            metadata.optJSONArray(CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD);
-        if (contentTypeWhitelistForFilenamesOnDownloadJson != null) {
-          contentTypeWhitelistForFilenamesOnDownload = new HashSet<>();
-          contentTypeWhitelistForFilenamesOnDownloadJson.forEach(
-              contentType -> contentTypeWhitelistForFilenamesOnDownload.add(contentType.toString()));
-        } else {
-          contentTypeWhitelistForFilenamesOnDownload = CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD_DEFAULT_VALUE;
-        }
-        lastModifiedTime = metadata.optLong(LAST_MODIFIED_TIME_KEY, LAST_MODIFIED_TIME_DEFAULT_VALUE);
-        snapshotVersion = metadata.optInt(SNAPSHOT_VERSION_KEY, SNAPSHOT_VERSION_DEFAULT_VALUE);
-        break;
-      default:
-        throw new IllegalStateException("Unsupported container json version=" + metadataVersion);
-    }
-    checkPreconditions(name, status, encrypted, previouslyEncrypted);
-  }
+  @JsonProperty(JSON_VERSION_KEY)
+  private final int version = JSON_VERSION_2; // the default version is 2
 
   /**
    * Constructor that takes individual arguments. Cannot be null.
@@ -427,45 +376,18 @@ public class Container {
    * @param ttlRequired {@code true} if ttl is required on content created in this container.
    * @param securePathRequired {@code true} if secure path validation is required in this container.
    * @param contentTypeWhitelistForFilenamesOnDownload the set of content types for which the filename can be sent on
-   *                                                   download
-   * @param backupEnabled Whether backup is enabled for this container or not
-   * @param parentAccountId The id of the parent {@link Account} of this container.
-   */
-  Container(short id, String name, ContainerStatus status, String description, boolean encrypted,
-      boolean previouslyEncrypted, boolean cacheable, boolean mediaScanDisabled, String replicationPolicy,
-      boolean ttlRequired, boolean securePathRequired, Set<String> contentTypeWhitelistForFilenamesOnDownload,
-      boolean backupEnabled, short parentAccountId, long deleteTriggerTime) {
-    this(id, name, status, description, encrypted, previouslyEncrypted, cacheable, mediaScanDisabled, replicationPolicy,
-        ttlRequired, securePathRequired, contentTypeWhitelistForFilenamesOnDownload, backupEnabled, parentAccountId,
-        deleteTriggerTime, LAST_MODIFIED_TIME_DEFAULT_VALUE, SNAPSHOT_VERSION_DEFAULT_VALUE);
-  }
-
-  /**
-   * Constructor that takes individual arguments. Cannot be null.
-   * @param id The id of the container.
-   * @param name The name of the container. Cannot be null.
-   * @param status The status of the container. Cannot be null.
-   * @param description The description of the container. Can be null.
-   * @param encrypted {@code true} if blobs in the {@link Container} should be encrypted, {@code false} otherwise.
-   * @param previouslyEncrypted {@code true} if this {@link Container} was encrypted in the past, or currently, and a
-   *                            subset of blobs in it could still be encrypted.
-   * @param cacheable {@code true} if cache control headers should be set to allow CDNs and browsers to cache blobs in
-   *                  this container.
-   * @param mediaScanDisabled {@code true} if media scanning for content in this container should be disabled.
-   * @param replicationPolicy the replication policy to use. If {@code null}, the cluster's default will be used.
-   * @param ttlRequired {@code true} if ttl is required on content created in this container.
-   * @param securePathRequired {@code true} if secure path validation is required in this container.
-   * @param contentTypeWhitelistForFilenamesOnDownload the set of content types for which the filename can be sent on
-   *                                                   download
-   * @param backupEnabled Whether backup is enabled for this container or not
+   *                                                   download.
+   * @param backupEnabled Whether backup is enabled for this container or not.
+   * @param overrideAccountAcl Whether to override account-level ACLs.
+   * @param namedBlobMode how named blob requests should be treated for this container.
    * @param parentAccountId The id of the parent {@link Account} of this container.
    * @param lastModifiedTime created/modified time of this container.
    */
   Container(short id, String name, ContainerStatus status, String description, boolean encrypted,
       boolean previouslyEncrypted, boolean cacheable, boolean mediaScanDisabled, String replicationPolicy,
       boolean ttlRequired, boolean securePathRequired, Set<String> contentTypeWhitelistForFilenamesOnDownload,
-      boolean backupEnabled, short parentAccountId, long deleteTriggerTime, long lastModifiedTime,
-      int snapshotVersion) {
+      boolean backupEnabled, boolean overrideAccountAcl, NamedBlobMode namedBlobMode, short parentAccountId,
+      long deleteTriggerTime, long lastModifiedTime, int snapshotVersion) {
     checkPreconditions(name, status, encrypted, previouslyEncrypted);
     this.id = id;
     this.name = name;
@@ -487,6 +409,8 @@ public class Container {
         this.securePathRequired = SECURE_PATH_REQUIRED_DEFAULT_VALUE;
         this.contentTypeWhitelistForFilenamesOnDownload =
             CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD_DEFAULT_VALUE;
+        this.overrideAccountAcl = OVERRIDE_ACCOUNT_ACL_DEFAULT_VALUE;
+        this.namedBlobMode = NAMED_BLOB_MODE_DEFAULT_VALUE;
         break;
       case JSON_VERSION_2:
         this.backupEnabled = backupEnabled;
@@ -500,6 +424,8 @@ public class Container {
         this.contentTypeWhitelistForFilenamesOnDownload =
             contentTypeWhitelistForFilenamesOnDownload == null ? Collections.emptySet()
                 : contentTypeWhitelistForFilenamesOnDownload;
+        this.overrideAccountAcl = overrideAccountAcl;
+        this.namedBlobMode = namedBlobMode;
         break;
       default:
         throw new IllegalStateException("Unsupported container json version=" + currentJsonVersion);
@@ -533,72 +459,14 @@ public class Container {
         && Objects.equals(this.isEncrypted(), containerToCompare.isEncrypted())
         && Objects.equals(this.isMediaScanDisabled(), containerToCompare.isMediaScanDisabled())
         && Objects.equals(this.isTtlRequired(), containerToCompare.isTtlRequired())
+        && Objects.equals(this.getStatus(), containerToCompare.getStatus())
         && Objects.equals(this.getReplicationPolicy(), containerToCompare.getReplicationPolicy())
         && Objects.equals(this.isSecurePathRequired(), containerToCompare.isSecurePathRequired())
-        && Objects.equals(this.isBackupEnabled(), containerToCompare.isBackupEnabled());
+        && Objects.equals(this.isBackupEnabled(), containerToCompare.isBackupEnabled())
+        && Objects.equals(this.getContentTypeWhitelistForFilenamesOnDownload(),
+                          containerToCompare.getContentTypeWhitelistForFilenamesOnDownload())
+        && Objects.equals(this.isAccountAclOverridden(), containerToCompare.isAccountAclOverridden());
     //@formatter:on
-  }
-
-  /**
-   * Deserializes a {@link JSONObject} to a container object.
-   * @param json The {@link JSONObject} to deserialize.
-   * @param parentAccountId The ID of the parent {@link Account} of this container. This is passed in because it is
-   *                        not always included in the JSON record.
-   * @return A container object deserialized from the {@link JSONObject}.
-   * @throws JSONException If parsing the {@link JSONObject} fails.
-   */
-  public static Container fromJson(JSONObject json, short parentAccountId) throws JSONException {
-    return new Container(json, parentAccountId);
-  }
-
-  /**
-   * Gets the metadata of the container.
-   * @return The metadata of the container.
-   * @throws JSONException If fails to compose metadata.
-   */
-  public JSONObject toJson() throws JSONException {
-    JSONObject metadata = new JSONObject();
-    switch (currentJsonVersion) {
-      case JSON_VERSION_1:
-        metadata.put(JSON_VERSION_KEY, JSON_VERSION_1);
-        metadata.put(CONTAINER_ID_KEY, id);
-        metadata.put(CONTAINER_NAME_KEY, name);
-        metadata.put(STATUS_KEY, status.name());
-        metadata.put(DESCRIPTION_KEY, description);
-        metadata.put(IS_PRIVATE_KEY, !cacheable);
-        metadata.put(PARENT_ACCOUNT_ID_KEY, parentAccountId);
-        metadata.put(LAST_MODIFIED_TIME_KEY, lastModifiedTime);
-        metadata.put(SNAPSHOT_VERSION_KEY, snapshotVersion);
-        break;
-      case JSON_VERSION_2:
-        metadata.put(Container.JSON_VERSION_KEY, JSON_VERSION_2);
-        metadata.put(CONTAINER_ID_KEY, id);
-        metadata.put(CONTAINER_NAME_KEY, name);
-        metadata.put(CONTAINER_DELETE_TRIGGER_TIME_KEY, deleteTriggerTime);
-        metadata.put(Container.STATUS_KEY, status.name());
-        metadata.put(DESCRIPTION_KEY, description);
-        metadata.put(ENCRYPTED_KEY, encrypted);
-        metadata.put(PREVIOUSLY_ENCRYPTED_KEY, previouslyEncrypted);
-        metadata.put(CACHEABLE_KEY, cacheable);
-        metadata.put(BACKUP_ENABLED_KEY, backupEnabled);
-        metadata.put(MEDIA_SCAN_DISABLED_KEY, mediaScanDisabled);
-        metadata.putOpt(REPLICATION_POLICY_KEY, replicationPolicy);
-        metadata.put(TTL_REQUIRED_KEY, ttlRequired);
-        metadata.put(SECURE_PATH_REQUIRED_KEY, securePathRequired);
-        if (contentTypeWhitelistForFilenamesOnDownload != null
-            && !contentTypeWhitelistForFilenamesOnDownload.isEmpty()) {
-          JSONArray contentTypeWhitelistForFilenamesOnDownloadJson = new JSONArray();
-          contentTypeWhitelistForFilenamesOnDownload.forEach(contentTypeWhitelistForFilenamesOnDownloadJson::put);
-          metadata.put(CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD,
-              contentTypeWhitelistForFilenamesOnDownloadJson);
-        }
-        metadata.put(LAST_MODIFIED_TIME_KEY, lastModifiedTime);
-        metadata.put(SNAPSHOT_VERSION_KEY, snapshotVersion);
-        break;
-      default:
-        throw new IllegalStateException("Unsupported container json version=" + currentJsonVersion);
-    }
-    return metadata;
   }
 
   /**
@@ -707,9 +575,24 @@ public class Container {
   }
 
   /**
+   * @return {@code true} if current container overrides parent account's ACL.
+   */
+  public boolean isAccountAclOverridden() {
+    return overrideAccountAcl;
+  }
+
+  /**
+   * @return how named blob requests should be treated for this container.
+   */
+  public NamedBlobMode getNamedBlobMode() {
+    return namedBlobMode;
+  }
+
+  /**
    * Gets the if of the {@link Account} that owns this container.
    * @return The id of the parent {@link Account} of this container.
    */
+  @JsonIgnore
   public short getParentAccountId() {
     return parentAccountId;
   }
@@ -751,14 +634,16 @@ public class Container {
       return false;
     }
     Container container = (Container) o;
+    // Note: do not under any circumstances compare snapshotVersion!
     return id == container.id && encrypted == container.encrypted
         && previouslyEncrypted == container.previouslyEncrypted && cacheable == container.cacheable
         && mediaScanDisabled == container.mediaScanDisabled && parentAccountId == container.parentAccountId
         && Objects.equals(name, container.name) && status == container.status
         && deleteTriggerTime == container.deleteTriggerTime && Objects.equals(description, container.description)
         && Objects.equals(replicationPolicy, container.replicationPolicy) && ttlRequired == container.ttlRequired
-        && securePathRequired == container.securePathRequired && Objects.equals(
-        contentTypeWhitelistForFilenamesOnDownload, container.contentTypeWhitelistForFilenamesOnDownload);
+        && securePathRequired == container.securePathRequired && overrideAccountAcl == container.overrideAccountAcl
+        && namedBlobMode == container.namedBlobMode && Objects.equals(contentTypeWhitelistForFilenamesOnDownload,
+        container.contentTypeWhitelistForFilenamesOnDownload);
   }
 
   @Override
@@ -790,5 +675,20 @@ public class Container {
    */
   public enum ContainerStatus {
     ACTIVE, INACTIVE, DELETE_IN_PROGRESS
+  }
+
+  /**
+   * How named blob requests should be treated for this container.
+   */
+  public enum NamedBlobMode {
+    /**
+     * Named blob APIs are completely disabled for this container.
+     */
+    DISABLED,
+
+    /**
+     * Both named blob APIs and blob ID APIs may be used for this container.
+     */
+    OPTIONAL
   }
 }

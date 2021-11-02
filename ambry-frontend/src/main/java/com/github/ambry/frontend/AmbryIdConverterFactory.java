@@ -14,19 +14,26 @@
 package com.github.ambry.frontend;
 
 import com.codahale.metrics.MetricRegistry;
-import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.commons.Callback;
+import com.github.ambry.commons.CallbackUtils;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.messageformat.BlobInfo;
+import com.github.ambry.messageformat.BlobProperties;
+import com.github.ambry.named.DeleteResult;
 import com.github.ambry.named.NamedBlobDb;
+import com.github.ambry.named.NamedBlobRecord;
+import com.github.ambry.rest.RequestPath;
 import com.github.ambry.rest.RestMethod;
 import com.github.ambry.rest.RestRequest;
 import com.github.ambry.rest.RestServiceErrorCode;
 import com.github.ambry.rest.RestServiceException;
 import com.github.ambry.rest.RestUtils;
-import com.github.ambry.commons.Callback;
 import com.github.ambry.utils.Pair;
+import com.github.ambry.utils.Utils;
+import java.util.Collections;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Future;
 
@@ -36,33 +43,41 @@ import java.util.concurrent.Future;
  */
 public class AmbryIdConverterFactory implements IdConverterFactory {
   private final IdSigningService idSigningService;
+  private final NamedBlobDb namedBlobDb;
   private final FrontendMetrics frontendMetrics;
 
   public AmbryIdConverterFactory(VerifiableProperties verifiableProperties, MetricRegistry metricRegistry,
       IdSigningService idSigningService, NamedBlobDb namedBlobDb) {
     this.idSigningService = idSigningService;
+    this.namedBlobDb = namedBlobDb;
     frontendMetrics = new FrontendMetrics(metricRegistry);
   }
 
   @Override
   public IdConverter getIdConverter() {
-    return new AmbryIdConverter(idSigningService, frontendMetrics);
+    return new AmbryIdConverter(idSigningService, namedBlobDb, frontendMetrics);
   }
 
   private static class AmbryIdConverter implements IdConverter {
     private boolean isOpen = true;
     private final IdSigningService idSigningService;
+    private final NamedBlobDb namedBlobDb;
     private final FrontendMetrics frontendMetrics;
-    private static final String NAMED_BLOB_PREFIX = "/named";
 
-    AmbryIdConverter(IdSigningService idSigningService, FrontendMetrics frontendMetrics) {
+    AmbryIdConverter(IdSigningService idSigningService, NamedBlobDb namedBlobDb, FrontendMetrics frontendMetrics) {
       this.idSigningService = idSigningService;
+      this.namedBlobDb = namedBlobDb;
       this.frontendMetrics = frontendMetrics;
     }
 
     @Override
     public void close() {
       isOpen = false;
+    }
+
+    @Override
+    public Future<String> convert(RestRequest restRequest, String input, Callback<String> callback) {
+      return convert(restRequest, input, null, callback);
     }
 
     /**
@@ -73,11 +88,12 @@ public class AmbryIdConverterFactory implements IdConverterFactory {
      * {@link com.github.ambry.router.Router} will understand.
      * @param restRequest {@link RestRequest} representing the request.
      * @param input the ID that needs to be converted.
+     * @param blobInfo the {@link BlobInfo} for an uploaded blob. This will be used for named blob PUT requests.
      * @param callback the {@link Callback} to invoke once the converted ID is available. Can be null.
      * @return a {@link Future} that will eventually contain the converted ID.
      */
     @Override
-    public Future<String> convert(RestRequest restRequest, String input, Callback<String> callback) {
+    public Future<String> convert(RestRequest restRequest, String input, BlobInfo blobInfo, Callback<String> callback) {
       final CompletableFuture<String> future = new CompletableFuture<>();
       String convertedId = null;
       Exception exception = null;
@@ -85,17 +101,15 @@ public class AmbryIdConverterFactory implements IdConverterFactory {
       long startTimeInMs = System.currentTimeMillis();
       try {
         if (!isOpen) {
-        frontendMetrics.idConverterProcessingTimeInMs.update(System.currentTimeMillis() - startTimeInMs);
-        exception = new RestServiceException("IdConverter is closed", RestServiceErrorCode.ServiceUnavailable);
+          exception = new RestServiceException("IdConverter is closed", RestServiceErrorCode.ServiceUnavailable);
         } else if (restRequest.getRestMethod().equals(RestMethod.POST)) {
-            convertedId = "/" + signIdIfRequired(restRequest, input);
+          convertedId = "/" + signIdIfRequired(restRequest, input);
         } else {
-            frontendMetrics.idConverterProcessingTimeInMs.update(System.currentTimeMillis() - startTimeInMs);
-            convertId(input, restRequest).whenComplete(
-                (id, throwable) -> completeConversion(id, extractCompletionExceptionCause(throwable), future, callback));
+          CallbackUtils.callCallbackAfter(convertId(input, restRequest, blobInfo),
+              (id, e) -> completeConversion(id, e, future, callback));
         }
       } catch (Exception e) {
-          exception = e;
+        exception = e;
       } finally {
         frontendMetrics.idConverterProcessingTimeInMs.update(System.currentTimeMillis() - startTimeInMs);
         if (convertedId != null || exception != null) {
@@ -103,21 +117,6 @@ public class AmbryIdConverterFactory implements IdConverterFactory {
         }
       }
       return future;
-    }
-
-    /**
-     * @param throwable a throwable to possibly wrap in an exception.
-     * @return if the {@link Throwable} is an instance of {@link Exception}, return the throwable, otherwise return the
-     *         throwable wrapped in an exception.
-     */
-    private static Exception extractCompletionExceptionCause(Throwable throwable) {
-      if (throwable == null) {
-        return null;
-      }
-      if (throwable instanceof CompletionException) {
-        throwable = throwable.getCause();
-      }
-      return throwable instanceof Exception ? (Exception) throwable : new Exception("Encountered throwable", throwable);
     }
 
     /**
@@ -146,47 +145,40 @@ public class AmbryIdConverterFactory implements IdConverterFactory {
      * otherwise return the input with leading slash and extension be stripped.
      * @param input the input blob ID.
      * @param restRequest the {@link RestRequest} to set arguments in.
+     * @param blobInfo the {@link BlobInfo} for an uploaded blob. This will be used for named blob PUT requests.
      * @return the {@link CompletionStage} that will be completed with the converted ID
      * @throws RestServiceException
      */
-    private CompletionStage<String> convertId(String input, RestRequest restRequest) throws RestServiceException {
+    private CompletionStage<String> convertId(String input, RestRequest restRequest, BlobInfo blobInfo)
+        throws RestServiceException {
       CompletionStage<String> conversionFuture;
-      if (input.startsWith(NAMED_BLOB_PREFIX)) {
-        NamedBlobPath namedBlobPath = RestUtils.parseInput(input);
-        //will update this hack version once NamedBlobDb is in.
-        conversionFuture =
-            get(namedBlobPath.getAccountName(), namedBlobPath.getContainerName(), namedBlobPath.getBlobName());
-      } else if (restRequest.getRestMethod().equals(RestMethod.PUT) && restRequest.getUri()
-          .startsWith(NAMED_BLOB_PREFIX)) {
-        NamedBlobPath namedBlobPath =
-            RestUtils.parseInput(RestUtils.getRequestPath(restRequest).getOperationOrBlobId(false));
+      if (RequestPath.matchesOperation(input, Operations.NAMED_BLOB)) {
+        NamedBlobPath namedBlobPath = NamedBlobPath.parse(input, Collections.emptyMap());
+        if (restRequest.getRestMethod() == RestMethod.DELETE) {
+          // on delete requests we can soft delete the record from NamedBlobDb and get the blob ID in one step.
+          conversionFuture = getNamedBlobDb().delete(namedBlobPath.getAccountName(), namedBlobPath.getContainerName(),
+              namedBlobPath.getBlobName()).thenApply(DeleteResult::getBlobId);
+        } else {
+          conversionFuture = getNamedBlobDb().get(namedBlobPath.getAccountName(), namedBlobPath.getContainerName(),
+              namedBlobPath.getBlobName()).thenApply(NamedBlobRecord::getBlobId);
+        }
+      } else if (restRequest.getRestMethod() == RestMethod.PUT && RestUtils.getRequestPath(restRequest)
+          .matchesOperation(Operations.NAMED_BLOB)) {
+        Objects.requireNonNull(blobInfo, "blobInfo cannot be null.");
+        NamedBlobPath namedBlobPath = NamedBlobPath.parse(RestUtils.getRequestPath(restRequest), restRequest.getArgs());
         String blobId = RestUtils.stripSlashAndExtensionFromId(input);
-        conversionFuture =
-            put(namedBlobPath.getAccountName(), namedBlobPath.getContainerName(), namedBlobPath.getBlobName(), blobId);
+        BlobProperties properties = blobInfo.getBlobProperties();
+        long expirationTimeMs =
+            Utils.addSecondsToEpochTime(properties.getCreationTimeInMs(), properties.getTimeToLiveInSeconds());
+        NamedBlobRecord record = new NamedBlobRecord(namedBlobPath.getAccountName(), namedBlobPath.getContainerName(),
+            namedBlobPath.getBlobName(), blobId, expirationTimeMs);
+        conversionFuture = getNamedBlobDb().put(record).thenApply(result -> result.getInsertedRecord().getBlobId());
       } else {
         String decryptedInput =
             parseSignedIdIfRequired(restRequest, input.startsWith("/") ? input.substring(1) : input);
         conversionFuture = CompletableFuture.completedFuture(RestUtils.stripSlashAndExtensionFromId(decryptedInput));
       }
       return conversionFuture;
-    }
-
-    /*
-     * will update this hack version once NamedBlobDb is in.
-     */
-    private CompletableFuture<String> get(String accountName, String containerName, String blobName) {
-      CompletableFuture<String> completableFuture = new CompletableFuture<>();
-      completableFuture.complete(accountName + containerName + blobName);
-      return completableFuture;
-    }
-
-    /*
-     * will update this hack version once NamedBlobDb is in.
-     */
-    private CompletableFuture<String> put(String accountName, String containerName, String blobName, String blobId) {
-      CompletableFuture<String> completableFuture = new CompletableFuture<>();
-      completableFuture.complete(blobId);
-      return completableFuture;
     }
 
     /**
@@ -223,6 +215,13 @@ public class AmbryIdConverterFactory implements IdConverterFactory {
       Map<String, String> metadata =
           (Map<String, String>) restRequest.getArgs().get(RestUtils.InternalKeys.SIGNED_ID_METADATA_KEY);
       return metadata != null ? idSigningService.getSignedId(blobId, metadata) : blobId;
+    }
+
+    private NamedBlobDb getNamedBlobDb() throws RestServiceException {
+      if (namedBlobDb == null) {
+        throw new RestServiceException("Named blob support not enabled", RestServiceErrorCode.BadRequest);
+      }
+      return namedBlobDb;
     }
   }
 }

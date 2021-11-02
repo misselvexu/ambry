@@ -58,10 +58,10 @@ public class RouterConfig {
   public static final String ROUTER_GET_REQUEST_PARALLELISM = "router.get.request.parallelism";
   public static final String ROUTER_GET_SUCCESS_TARGET = "router.get.success.target";
   public static final String ROUTER_GET_CROSS_DC_ENABLED = "router.get.cross.dc.enabled";
-  public static final String ROUTER_GET_INCLUDE_NON_ORIGINATING_DC_REPLICAS =
-      "router.get.include.non.originating.dc.replicas";
-  public static final String ROUTER_GET_REPLICAS_REQUIRED = "router.get.replicas.required";
+  public static final String ROUTER_OPERATION_TRACKER_INCLUDE_DOWN_REPLICAS =
+      "router.operation.tracker.include.down.replicas";
   public static final String ROUTER_GET_OPERATION_TRACKER_TYPE = "router.get.operation.tracker.type";
+  public static final String ROUTER_PUT_OPERATION_TRACKER_TYPE = "router.put.operation.tracker.type";
   public static final String ROUTER_LATENCY_TOLERANCE_QUANTILE = "router.latency.tolerance.quantile";
   public static final String ROUTER_BLOBID_CURRENT_VERSION = "router.blobid.current.version";
   public static final String ROUTER_METADATA_CONTENT_VERSION = "router.metadata.content.version";
@@ -85,6 +85,8 @@ public class RouterConfig {
       "router.operation.tracker.terminate.on.not.found.enabled";
   public static final String ROUTER_OPERATION_TRACKER_MAX_INFLIGHT_REQUESTS =
       "router.operation.tracker.max.inflight.requests";
+  public static final String ROUTER_ADAPTIVE_OPERATION_TRACKER_WAITING_FOR_RESPONSE =
+      "router.adaptive.operation.tracker.waiting.for.response";
   public static final String ROUTER_OPERATION_TRACKER_EXCLUDE_TIMEOUT_ENABLED =
       "router.operation.tracker.exclude.timeout.enabled";
   public static final String ROUTER_OPERATION_TRACKER_HISTOGRAM_DUMP_ENABLED =
@@ -105,6 +107,7 @@ public class RouterConfig {
       "router.cross.colo.request.to.dc.with.most.replicas";
   public static final String ROUTER_BACKGROUND_DELETER_MAX_CONCURRENT_OPERATIONS =
       "router.background.deleter.max.concurrent.operations";
+  public static final String ROUTER_PUT_REQUEST_USE_JAVA_NATIVE_CRC32 = "router.put.request.use.java.native.crc32";
 
   /**
    * Number of independent scaling units for the router.
@@ -251,26 +254,25 @@ public class RouterConfig {
   public final boolean routerGetCrossDcEnabled;
 
   /**
-   * Indicates whether get operations are allowed to make requests to nodes in non-originating remote data centers.
+   * Whether to include down(offline) replicas in replicas pool within operation tracker.
    */
-  @Config(ROUTER_GET_INCLUDE_NON_ORIGINATING_DC_REPLICAS)
+  @Config(ROUTER_OPERATION_TRACKER_INCLUDE_DOWN_REPLICAS)
   @Default("true")
-  public final boolean routerGetIncludeNonOriginatingDcReplicas;
+  public final boolean routerOperationTrackerIncludeDownReplicas;
 
-  /**
-   * Number of replicas required for GET OperationTracker when routerGetIncludeNonOriginatingDcReplicas is False.
-   * Please note routerGetReplicasRequired is 6 because total number of local and originating replicas is always <= 6.
-   * This may no longer be true with partition classes and flexible replication.
-   */
-  @Config(ROUTER_GET_REPLICAS_REQUIRED)
-  @Default("6")
-  public final int routerGetReplicasRequired;
   /**
    * The OperationTracker to use for GET operations.
    */
   @Config(ROUTER_GET_OPERATION_TRACKER_TYPE)
   @Default("SimpleOperationTracker")
   public final String routerGetOperationTrackerType;
+
+  /**
+   * The OperationTracker to use for PUT operations.
+   */
+  @Config(ROUTER_PUT_OPERATION_TRACKER_TYPE)
+  @Default("SimpleOperationTracker")
+  public final String routerPutOperationTrackerType;
 
   /**
    * If an adaptive operation tracker is being used, a request is discounted from the parallelism count if it has been
@@ -412,6 +414,14 @@ public class RouterConfig {
   public final int routerOperationTrackerMaxInflightRequests;
 
   /**
+   * True when the adaptive operation tracker would wait for all the responses coming back before sending out new requests
+   * when there is no request exceeding the given percentile.
+   */
+  @Config(ROUTER_ADAPTIVE_OPERATION_TRACKER_WAITING_FOR_RESPONSE)
+  @Default("false")
+  public final boolean routerAdaptiveOperationTrackerWaitingForResponse;
+
+  /**
    * Indicates whether to enable excluding timed out requests in Histogram reservoir.
    */
   @Config(ROUTER_OPERATION_TRACKER_EXCLUDE_TIMEOUT_ENABLED)
@@ -510,6 +520,13 @@ public class RouterConfig {
   public final int routerBackgroundDeleterMaxConcurrentOperations;
 
   /**
+   * True to use java native crc32 implementation
+   */
+  @Config(ROUTER_PUT_REQUEST_USE_JAVA_NATIVE_CRC32)
+  @Default("false")
+  public final boolean routerPutRequestUseJavaNativeCrc32;
+
+  /**
    * Create a RouterConfig instance.
    * @param verifiableProperties the properties map to refer to.
    */
@@ -546,12 +563,12 @@ public class RouterConfig {
         verifiableProperties.getIntInRange(ROUTER_GET_REQUEST_PARALLELISM, 2, 1, Integer.MAX_VALUE);
     routerGetSuccessTarget = verifiableProperties.getIntInRange(ROUTER_GET_SUCCESS_TARGET, 1, 1, Integer.MAX_VALUE);
     routerGetCrossDcEnabled = verifiableProperties.getBoolean(ROUTER_GET_CROSS_DC_ENABLED, true);
-    routerGetIncludeNonOriginatingDcReplicas =
-        verifiableProperties.getBoolean(ROUTER_GET_INCLUDE_NON_ORIGINATING_DC_REPLICAS, true);
-    routerGetReplicasRequired =
-        verifiableProperties.getIntInRange(ROUTER_GET_REPLICAS_REQUIRED, 6, 1, Integer.MAX_VALUE);
+    routerOperationTrackerIncludeDownReplicas =
+        verifiableProperties.getBoolean(ROUTER_OPERATION_TRACKER_INCLUDE_DOWN_REPLICAS, true);
     routerGetOperationTrackerType =
         verifiableProperties.getString(ROUTER_GET_OPERATION_TRACKER_TYPE, "SimpleOperationTracker");
+    routerPutOperationTrackerType =
+        verifiableProperties.getString(ROUTER_PUT_OPERATION_TRACKER_TYPE, "SimpleOperationTracker");
     routerLatencyToleranceQuantile =
         verifiableProperties.getDoubleInRange(ROUTER_LATENCY_TOLERANCE_QUANTILE, DEFAULT_LATENCY_TOLERANCE_QUANTILE,
             0.0, 1.0);
@@ -588,6 +605,8 @@ public class RouterConfig {
         verifiableProperties.getLong(ROUTER_OPERATION_TRACKER_MIN_DATA_POINTS_REQUIRED, 1000L);
     routerOperationTrackerMaxInflightRequests =
         verifiableProperties.getIntInRange(ROUTER_OPERATION_TRACKER_MAX_INFLIGHT_REQUESTS, 2, 1, Integer.MAX_VALUE);
+    routerAdaptiveOperationTrackerWaitingForResponse =
+        verifiableProperties.getBoolean(ROUTER_ADAPTIVE_OPERATION_TRACKER_WAITING_FOR_RESPONSE, false);
     routerOperationTrackerExcludeTimeoutEnabled =
         verifiableProperties.getBoolean(ROUTER_OPERATION_TRACKER_EXCLUDE_TIMEOUT_ENABLED, false);
     routerOperationTrackerHistogramDumpEnabled =
@@ -619,5 +638,7 @@ public class RouterConfig {
     routerBackgroundDeleterMaxConcurrentOperations =
         verifiableProperties.getIntInRange(ROUTER_BACKGROUND_DELETER_MAX_CONCURRENT_OPERATIONS, 0, 0,
             Integer.MAX_VALUE);
+    routerPutRequestUseJavaNativeCrc32 =
+        verifiableProperties.getBoolean(ROUTER_PUT_REQUEST_USE_JAVA_NATIVE_CRC32, false);
   }
 }

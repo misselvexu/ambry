@@ -23,7 +23,7 @@ import org.slf4j.LoggerFactory;
  * an appropriate amount of time when maybeThrottle() is called to attain the desired rate.
  */
 public class Throttler {
-  private double desiredRatePerSec;
+  private volatile double desiredRatePerSec;
   private long checkIntervalMs;
   private boolean throttleDown;
   private final Object lock = new Object();
@@ -79,9 +79,19 @@ public class Throttler {
             }
           }
         }
-        periodStartNs = now;
+        periodStartNs = time.nanoseconds();
         observedSoFar = 0;
       }
+    }
+  }
+
+  /**
+   * Update desiredRatePerSec for this throttler.
+   * @param desiredRatePerSec the new desiredRatePerSec
+   */
+  public void updateDesiredRatePerSecond(double desiredRatePerSec) {
+    synchronized (lock) {
+      this.desiredRatePerSec = desiredRatePerSec;
     }
   }
 

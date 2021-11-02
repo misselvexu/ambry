@@ -15,13 +15,23 @@ package com.github.ambry.frontend;
 
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.account.Account;
+import com.github.ambry.account.AccountService;
 import com.github.ambry.account.Container;
 import com.github.ambry.account.InMemAccountService;
 import com.github.ambry.account.InMemAccountServiceFactory;
+import com.github.ambry.commons.Callback;
+import com.github.ambry.commons.HostLevelThrottler;
 import com.github.ambry.config.FrontendConfig;
+import com.github.ambry.config.HostThrottleConfig;
+import com.github.ambry.config.QuotaConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobInfo;
 import com.github.ambry.messageformat.BlobProperties;
+import com.github.ambry.quota.AmbryQuotaManager;
+import com.github.ambry.quota.MaxThrottlePolicy;
+import com.github.ambry.quota.QuotaManager;
+import com.github.ambry.quota.QuotaMode;
+import com.github.ambry.quota.QuotaTestUtils;
 import com.github.ambry.rest.MockRestRequest;
 import com.github.ambry.rest.MockRestResponseChannel;
 import com.github.ambry.rest.RequestPath;
@@ -35,7 +45,6 @@ import com.github.ambry.rest.RestTestUtils;
 import com.github.ambry.rest.RestUtils;
 import com.github.ambry.router.ByteRange;
 import com.github.ambry.router.ByteRanges;
-import com.github.ambry.commons.Callback;
 import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.ThrowingConsumer;
@@ -71,12 +80,15 @@ import static org.mockito.Mockito.*;
 public class AmbrySecurityServiceTest {
 
   private static final FrontendConfig FRONTEND_CONFIG = new FrontendConfig(new VerifiableProperties(new Properties()));
+  private static final HostThrottleConfig HOST_THROTTLE_CONFIG =
+      new HostThrottleConfig(new VerifiableProperties(new Properties()));
   private static final String SERVICE_ID = "AmbrySecurityService";
   private static final String OWNER_ID = SERVICE_ID;
   private static final String CLUSTER_NAME = "ambry-test";
   private static final InMemAccountService ACCOUNT_SERVICE =
       new InMemAccountServiceFactory(false, true).getAccountService();
-  private static final QuotaManager quotaManager = new QuotaManager(FRONTEND_CONFIG);
+  private static final HostLevelThrottler hostLevelThrottler = new HostLevelThrottler(HOST_THROTTLE_CONFIG);
+  private static final QuotaManager QUOTA_MANAGER;
   private static final Account REF_ACCOUNT;
   private static final Container REF_CONTAINER;
   private static final Map<String, Object> USER_METADATA = new HashMap<>();
@@ -94,7 +106,7 @@ public class AmbrySecurityServiceTest {
 
   private final SecurityService securityService =
       new AmbrySecurityService(FRONTEND_CONFIG, new FrontendMetrics(new MetricRegistry()),
-          URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(), quotaManager);
+          URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(), hostLevelThrottler, QUOTA_MANAGER);
 
   static {
     try {
@@ -116,6 +128,10 @@ public class AmbrySecurityServiceTest {
               false, Utils.Infinite_Time, REF_ACCOUNT.getId(), REF_CONTAINER.getId(), false, null, null, null),
           RestUtils.buildUserMetadata(USER_METADATA), DEFAULT_LIFEVERSION);
       ACCOUNT_SERVICE.updateAccounts(Collections.singletonList(InMemAccountService.UNKNOWN_ACCOUNT));
+      QuotaConfig quotaConfig = QuotaTestUtils.createQuotaConfig(Collections.emptyMap(), false, QuotaMode.TRACKING);
+      QUOTA_MANAGER =
+          new AmbryQuotaManager(quotaConfig, new MaxThrottlePolicy(quotaConfig), mock(AccountService.class), null,
+              new MetricRegistry());
     } catch (Exception e) {
       throw new IllegalStateException(e);
     }
@@ -154,7 +170,7 @@ public class AmbrySecurityServiceTest {
     FrontendConfig frontendConfig = new FrontendConfig(new VerifiableProperties(properties));
     SecurityService securityServiceWithTrackingDisabled =
         new AmbrySecurityService(frontendConfig, new FrontendMetrics(new MetricRegistry()),
-            URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(), quotaManager);
+            URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(), hostLevelThrottler, QUOTA_MANAGER);
     restRequest = createRestRequest(RestMethod.GET, "/", null);
     securityServiceWithTrackingDisabled.preProcessRequest(restRequest);
     Assert.assertFalse("The arg with key: ambry-internal-keys-send-tracking-info should be set to false",
@@ -217,11 +233,11 @@ public class AmbrySecurityServiceTest {
    */
   @Test
   public void postProcessQuotaManagerTest() throws Exception {
-    QuotaManager quotaManager = Mockito.mock(QuotaManager.class);
+    HostLevelThrottler quotaManager = Mockito.mock(HostLevelThrottler.class);
     AmbrySecurityService ambrySecurityService =
         new AmbrySecurityService(new FrontendConfig(new VerifiableProperties(new Properties())),
-            new FrontendMetrics(new MetricRegistry()), URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(),
-            quotaManager);
+            new FrontendMetrics(new MetricRegistry()), URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(), quotaManager,
+            QUOTA_MANAGER);
     // Everything should be good.
     Mockito.when(quotaManager.shouldThrottle(any())).thenReturn(false);
     for (int i = 0; i < 100; i++) {
@@ -909,13 +925,13 @@ public class AmbrySecurityServiceTest {
     }
 
     @Override
-    public void setStatus(ResponseStatus status) throws RestServiceException {
-      throw new RestServiceException("Not Implemented", RestServiceErrorCode.InternalServerError);
+    public ResponseStatus getStatus() {
+      throw new IllegalStateException("Not implemented");
     }
 
     @Override
-    public ResponseStatus getStatus() {
-      throw new IllegalStateException("Not implemented");
+    public void setStatus(ResponseStatus status) throws RestServiceException {
+      throw new RestServiceException("Not Implemented", RestServiceErrorCode.InternalServerError);
     }
 
     @Override

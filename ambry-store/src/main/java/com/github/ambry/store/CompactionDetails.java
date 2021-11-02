@@ -32,17 +32,20 @@ class CompactionDetails {
   private static final int SEGMENT_NAME_LENGTH_SIZE = 4;
 
   private final long referenceTimeMs;
-  private final List<String> logSegmentsUnderCompaction;
+  private final List<LogSegmentName> logSegmentsUnderCompaction;
+  private final CostBenefitInfo costBenefitInfo;
 
   /**
    * Construct a representation of all the details required for a compaction cycle.
    * @param referenceTimeMs the epoch time to use to get the same results from the {@link BlobStore} as when these
    *                        details were created.
    * @param logSegmentsUnderCompaction the names of the {@link LogSegment} under compaction.
+   * @param costBenefitInfo the {@link CostBenefitInfo} based on current Compaction Details
    * @throws IllegalArgumentException if {@code referenceTimeMs} < 0 or if {@code logSegmentsUnderCompaction} has no
    * elements.
    */
-  CompactionDetails(long referenceTimeMs, List<String> logSegmentsUnderCompaction) {
+  CompactionDetails(long referenceTimeMs, List<LogSegmentName> logSegmentsUnderCompaction,
+      CostBenefitInfo costBenefitInfo) {
     if (referenceTimeMs < 0 || logSegmentsUnderCompaction.size() == 0) {
       throw new IllegalArgumentException(
           "Illegal arguments provided. Ref time: [" + referenceTimeMs + "]. " + "Segments under compaction size: ["
@@ -50,6 +53,7 @@ class CompactionDetails {
     }
     this.referenceTimeMs = referenceTimeMs;
     this.logSegmentsUnderCompaction = logSegmentsUnderCompaction;
+    this.costBenefitInfo = costBenefitInfo;
   }
 
   /**
@@ -65,11 +69,11 @@ class CompactionDetails {
       case VERSION_0:
         long referenceTime = stream.readLong();
         int segmentCount = stream.readInt();
-        List<String> logSegmentsUnderCompaction = new ArrayList<>();
+        List<LogSegmentName> logSegmentsUnderCompaction = new ArrayList<>();
         for (int i = 0; i < segmentCount; i++) {
-          logSegmentsUnderCompaction.add(Utils.readIntString(stream));
+          logSegmentsUnderCompaction.add(LogSegmentName.fromString(Utils.readIntString(stream)));
         }
-        details = new CompactionDetails(referenceTime, logSegmentsUnderCompaction);
+        details = new CompactionDetails(referenceTime, logSegmentsUnderCompaction, null);
         break;
       default:
         throw new IllegalArgumentException("Unrecognized version: " + version);
@@ -88,7 +92,7 @@ class CompactionDetails {
   /**
    * @return the names of the segments under compaction. Guaranteed to contain at least one element.
    */
-  List<String> getLogSegmentsUnderCompaction() {
+  List<LogSegmentName> getLogSegmentsUnderCompaction() {
     return logSegmentsUnderCompaction;
   }
 
@@ -109,8 +113,8 @@ class CompactionDetails {
 
     List<byte[]> segmentNameBytesList = new ArrayList<>();
     int size = VERSION_SIZE + REFERENCE_TIME_SIZE + SEGMENT_COUNT_SIZE;
-    for (String segmentName : logSegmentsUnderCompaction) {
-      byte[] segmentNameBytes = segmentName.getBytes();
+    for (LogSegmentName segmentName : logSegmentsUnderCompaction) {
+      byte[] segmentNameBytes = segmentName.toString().getBytes();
       segmentNameBytesList.add(segmentNameBytes);
       size += SEGMENT_NAME_LENGTH_SIZE + segmentNameBytes.length;
     }
@@ -129,6 +133,10 @@ class CompactionDetails {
       bufWrap.put(segmentNameBytes);
     }
     return buf;
+  }
+
+  CostBenefitInfo getCostBenefitInfo() {
+    return costBenefitInfo;
   }
 
   @Override

@@ -50,12 +50,11 @@ public class IndexValueTest {
   public static List<Object[]> data() {
     return Arrays.asList(
         new Object[][]{{PersistentIndex.VERSION_0}, {PersistentIndex.VERSION_1}, {PersistentIndex.VERSION_2},
-            {PersistentIndex.VERSION_3}});
+            {PersistentIndex.VERSION_3}, {PersistentIndex.VERSION_4}});
   }
 
   /**
    * Creates a temporary directory and sets up metrics.
-   * @throws IOException
    */
   public IndexValueTest(short version) {
     this.version = version;
@@ -66,9 +65,7 @@ public class IndexValueTest {
    */
   @Test
   public void putValueTest() {
-    long pos = Utils.getRandomLong(TestUtils.RANDOM, 1000);
-    long gen = Utils.getRandomLong(TestUtils.RANDOM, 1000);
-    String logSegmentName = LogSegmentNameHelper.getName(pos, gen);
+    LogSegmentName logSegmentName = StoreTestUtils.getRandomLogSegmentName(null);
     long size = Utils.getRandomLong(TestUtils.RANDOM, 1000);
     long offset = Utils.getRandomLong(TestUtils.RANDOM, 1000);
     long operationTimeAtMs = Utils.getRandomLong(TestUtils.RANDOM, 1000000) + SystemTime.getInstance().milliseconds();
@@ -114,9 +111,7 @@ public class IndexValueTest {
    */
   @Test
   public void updateRecordTest() {
-    long pos = Utils.getRandomLong(TestUtils.RANDOM, 1000);
-    long gen = Utils.getRandomLong(TestUtils.RANDOM, 1000);
-    String logSegmentName = LogSegmentNameHelper.getName(pos, gen);
+    LogSegmentName logSegmentName = StoreTestUtils.getRandomLogSegmentName(null);
     long size = Utils.getRandomLong(TestUtils.RANDOM, 1000);
     long offset = Utils.getRandomLong(TestUtils.RANDOM, 1000);
     long expiresAtMs = Utils.getRandomLong(TestUtils.RANDOM, 1000000);
@@ -163,8 +158,8 @@ public class IndexValueTest {
           IndexValue.UNKNOWN_ORIGINAL_MESSAGE_OFFSET, expectedOperationTimeMs, accountId, containerId, lifeVersion);
 
       newValue = new IndexValue(logSegmentName, value.getBytes(), version);
-      String newLogSegmentName = LogSegmentNameHelper.getNextPositionName(logSegmentName);
-      String expectedLogSegmentName;
+      LogSegmentName newLogSegmentName = logSegmentName.getNextPositionName();
+      LogSegmentName expectedLogSegmentName;
       // update not in the same log segment
       newValue.setFlag(flag);
       originalMsgOff = new Offset(newLogSegmentName, originalMsgOffset);
@@ -217,7 +212,7 @@ public class IndexValueTest {
    * @param containerId the containerId of the Index value
    * @param lifeVersion the update version of the Index value
    */
-  private void verifyIndexValue(IndexValue value, String logSegmentName, long size, long offset,
+  private void verifyIndexValue(IndexValue value, LogSegmentName logSegmentName, long size, long offset,
       EnumSet<IndexValue.Flags> flags, long expiresAtMs, long originalMessageOffset, long operationTimeInMs,
       short accountId, short containerId, short lifeVersion) {
     switch (version) {
@@ -229,6 +224,7 @@ public class IndexValueTest {
       case PersistentIndex.VERSION_1:
       case PersistentIndex.VERSION_2:
       case PersistentIndex.VERSION_3:
+      case PersistentIndex.VERSION_4:
         expiresAtMs = expiresAtMs >= 0 ? Utils.getTimeInMsToTheNearestSec(expiresAtMs) : Utils.Infinite_Time;
         expiresAtMs =
             TimeUnit.MILLISECONDS.toSeconds(expiresAtMs) > Integer.MAX_VALUE ? Utils.Infinite_Time : expiresAtMs;
@@ -257,7 +253,7 @@ public class IndexValueTest {
    * @param containerId the containerId of the Index value
    * @param lifeVersion the update version of the Index value
    */
-  private void verifyGetters(IndexValue value, String logSegmentName, long size, long offset,
+  private void verifyGetters(IndexValue value, LogSegmentName logSegmentName, long size, long offset,
       EnumSet<IndexValue.Flags> flags, long expiresAtMs, long originalMessageOffset, long operationTimeInMs,
       short accountId, short containerId, short lifeVersion) {
     assertEquals("Version is not as expected", version, value.getFormatVersion());
@@ -280,7 +276,7 @@ public class IndexValueTest {
    * @param value the source {@link IndexValue} to construct the bad one
    * @param logSegmentName the log segment name to be used to construct the {@link IndexValue}
    */
-  private void verifyInvalidValueSize(IndexValue value, String logSegmentName) {
+  private void verifyInvalidValueSize(IndexValue value, LogSegmentName logSegmentName) {
     int capacity = TestUtils.RANDOM.nextInt(value.getBytes().capacity());
     ByteBuffer invalidValue = ByteBuffer.allocate(capacity);
     invalidValue.put(value.getBytes().array(), 0, capacity);
@@ -366,7 +362,8 @@ public class IndexValueTest {
         indexValue = new IndexValue(offset.getName(), value, persistentIndexVersion);
         break;
       case PersistentIndex.VERSION_3:
-        value = ByteBuffer.allocate(IndexValue.INDEX_VALUE_SIZE_IN_BYTES_V3);
+      case PersistentIndex.VERSION_4:
+        value = ByteBuffer.allocate(IndexValue.INDEX_VALUE_SIZE_IN_BYTES_V3_V4);
         value.putLong(size);
         value.putLong(offset.getOffset());
         value.put(flags);
@@ -378,7 +375,7 @@ public class IndexValueTest {
         value.putShort(containerId);
         value.putShort(lifeVersion);
         value.position(0);
-        indexValue = new IndexValue(offset.getName(), value, PersistentIndex.VERSION_3);
+        indexValue = new IndexValue(offset.getName(), value, persistentIndexVersion);
         break;
       default:
         throw new IllegalArgumentException("Unrecognized version: " + persistentIndexVersion);

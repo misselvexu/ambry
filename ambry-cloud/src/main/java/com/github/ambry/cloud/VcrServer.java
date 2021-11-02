@@ -20,12 +20,15 @@ import com.github.ambry.account.AccountServiceFactory;
 import com.github.ambry.clustermap.ClusterAgentsFactory;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.DataNodeId;
-import com.github.ambry.clustermap.VirtualReplicatorCluster;
-import com.github.ambry.clustermap.VirtualReplicatorClusterFactory;
+import com.github.ambry.clustermap.VcrClusterParticipant;
+import com.github.ambry.clustermap.VcrClusterAgentsFactory;
+import com.github.ambry.commons.NettySslHttp2Factory;
+import com.github.ambry.commons.SSLFactory;
 import com.github.ambry.commons.ServerMetrics;
 import com.github.ambry.config.CloudConfig;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.ConnectionPoolConfig;
+import com.github.ambry.config.Http2ClientConfig;
 import com.github.ambry.config.NetworkConfig;
 import com.github.ambry.config.ReplicationConfig;
 import com.github.ambry.config.SSLConfig;
@@ -38,6 +41,8 @@ import com.github.ambry.network.NetworkServer;
 import com.github.ambry.network.Port;
 import com.github.ambry.network.PortType;
 import com.github.ambry.network.SocketServer;
+import com.github.ambry.network.http2.Http2BlockingChannelPool;
+import com.github.ambry.network.http2.Http2ClientMetrics;
 import com.github.ambry.notification.NotificationSystem;
 import com.github.ambry.protocol.RequestHandlerPool;
 import com.github.ambry.replication.FindTokenHelper;
@@ -70,7 +75,7 @@ public class VcrServer {
   private final VerifiableProperties properties;
   private final ClusterAgentsFactory clusterAgentsFactory;
   private ClusterMap clusterMap;
-  private VirtualReplicatorCluster virtualReplicatorCluster;
+  private VcrClusterParticipant vcrClusterParticipant;
   private MetricRegistry registry = null;
   private JmxReporter reporter = null;
   private ConnectionPool connectionPool = null;
@@ -106,7 +111,7 @@ public class VcrServer {
    * @param reporterFactory if non-null, use this function to set up a {@link JmxReporter} with custom settings. If this
    *                        option is null the default settings for the reporter will be used.
    */
-  VcrServer(VerifiableProperties properties, ClusterAgentsFactory clusterAgentsFactory,
+  public VcrServer(VerifiableProperties properties, ClusterAgentsFactory clusterAgentsFactory,
       NotificationSystem notificationSystem, CloudDestinationFactory cloudDestinationFactory,
       Function<MetricRegistry, JmxReporter> reporterFactory) {
     this(properties, clusterAgentsFactory, notificationSystem, reporterFactory);
@@ -153,15 +158,23 @@ public class VcrServer {
           Utils.getObj(serverConfig.serverAccountServiceFactory, properties, registry);
       AccountService accountService = accountServiceFactory.getAccountService();
 
-      virtualReplicatorCluster =
-          ((VirtualReplicatorClusterFactory) Utils.getObj(cloudConfig.virtualReplicatorClusterFactoryClass, cloudConfig,
+      vcrClusterParticipant =
+          ((VcrClusterAgentsFactory) Utils.getObj(cloudConfig.vcrClusterAgentsFactoryClass, cloudConfig,
               clusterMapConfig, clusterMap, accountService, storeConfig, cloudDestination,
-              registry)).getVirtualReplicatorCluster();
+              registry)).getVcrClusterParticipant();
 
       scheduler = Utils.newScheduler(serverConfig.serverSchedulerNumOfthreads, false);
       StoreKeyFactory storeKeyFactory = Utils.getObj(storeConfig.storeKeyFactory, clusterMap);
 
-      connectionPool = new BlockingChannelConnectionPool(connectionPoolConfig, sslConfig, clusterMapConfig, registry);
+      SSLFactory sslFactory = new NettySslHttp2Factory(sslConfig);
+      if (clusterMapConfig.clusterMapEnableHttp2Replication) {
+        connectionPool = new Http2BlockingChannelPool(sslFactory, new Http2ClientConfig(properties),
+            new Http2ClientMetrics(registry));
+        logger.info("Using http2 for VCR replication.");
+      } else {
+        connectionPool = new BlockingChannelConnectionPool(connectionPoolConfig, sslConfig, clusterMapConfig, registry);
+        logger.info("Using blocking channel for VCR replication.");
+      }
       connectionPool.start();
 
       StoreKeyConverterFactory storeKeyConverterFactory =
@@ -171,11 +184,11 @@ public class VcrServer {
           new CloudStorageManager(properties, vcrMetrics, cloudDestination, clusterMap);
       vcrReplicationManager =
           new VcrReplicationManager(cloudConfig, replicationConfig, clusterMapConfig, storeConfig, cloudStorageManager,
-              storeKeyFactory, clusterMap, virtualReplicatorCluster, cloudDestination, scheduler, connectionPool,
+              storeKeyFactory, clusterMap, vcrClusterParticipant, cloudDestination, scheduler, connectionPool,
               vcrMetrics, notificationSystem, storeKeyConverterFactory, serverConfig.serverMessageTransformer);
       vcrReplicationManager.start();
 
-      DataNodeId currentNode = virtualReplicatorCluster.getCurrentDataNodeId();
+      DataNodeId currentNode = vcrClusterParticipant.getCurrentDataNodeId();
       ArrayList<Port> ports = new ArrayList<Port>();
       ports.add(new Port(networkConfig.port, PortType.PLAINTEXT));
       if (currentNode.hasSSLPort()) {
@@ -239,8 +252,8 @@ public class VcrServer {
       if (clusterMap != null) {
         clusterMap.close();
       }
-      if (virtualReplicatorCluster != null) {
-        virtualReplicatorCluster.close();
+      if (vcrClusterParticipant != null) {
+        vcrClusterParticipant.close();
       }
       if (cloudDestination != null) {
         cloudDestination.close();
@@ -259,8 +272,8 @@ public class VcrServer {
     return shutdownLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
   }
 
-  public VirtualReplicatorCluster getVirtualReplicatorCluster() {
-    return virtualReplicatorCluster;
+  public VcrClusterParticipant getVcrClusterParticipant() {
+    return vcrClusterParticipant;
   }
 
   public VcrReplicationManager getVcrReplicationManager() {

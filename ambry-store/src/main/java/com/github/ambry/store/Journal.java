@@ -118,6 +118,30 @@ class Journal {
   }
 
   /**
+   * This method should only be called when replica gets sealed. Remove all entries belongs to the auto closed log segment.
+   * It will delay the addEntry method for sealed replica, so the replication performance will be hold while running this method.
+   */
+  void cleanUpJournal() {
+    if (!inBootstrapMode) {
+      journal.clear();
+      recentCrcs.clear();
+      currentNumberOfEntries.set(0);
+    }
+  }
+
+  /**
+   * This method should be called during recovery.It supports removing some specific offset from journal.
+   * @param offset the {@link Offset} which is targeted to be removed.
+   */
+  void removeSpecificValueInJournal(Offset offset) {
+    if (journal.containsKey(offset)) {
+      recentCrcs.remove(journal.get(offset));
+      journal.remove(offset);
+      currentNumberOfEntries.decrementAndGet();
+    }
+  }
+
+  /**
    * Adds an entry into the journal with the given {@link Offset}, {@link StoreKey}, and a null crc.
    * @param offset The {@link Offset} that the key pertains to.
    * @param key The key that the entry in the journal refers to.

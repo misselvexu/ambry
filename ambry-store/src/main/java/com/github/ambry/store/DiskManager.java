@@ -122,10 +122,12 @@ class DiskManager {
     expectedDirs.add(reserveFileDir.getAbsolutePath());
     for (ReplicaId replica : replicas) {
       if (disk.equals(replica.getDiskId())) {
+        DiskMetrics diskMetrics = new DiskMetrics(storeMainMetrics.getRegistry(), disk.getMountPath(),
+            storeConfig.storeDiskIoReservoirTimeWindowMs);
         BlobStore store =
             new BlobStore(replica, storeConfig, scheduler, longLivedTaskScheduler, diskIOScheduler, diskSpaceAllocator,
                 storeMainMetrics, storeUnderCompactionMetrics, keyFactory, recovery, hardDelete, replicaStatusDelegates,
-                time, accountService);
+                time, accountService, diskMetrics);
         stores.put(replica.getPartitionId(), store);
         partitionToReplicaMap.put(replica.getPartitionId(), replica);
         expectedDirs.add(replica.getReplicaPath());
@@ -336,7 +338,7 @@ class DiskManager {
         BlobStore store =
             new BlobStore(replica, storeConfig, scheduler, longLivedTaskScheduler, diskIOScheduler, diskSpaceAllocator,
                 storeMainMetrics, storeUnderCompactionMetrics, keyFactory, recovery, hardDelete, replicaStatusDelegates,
-                time, accountService);
+                time, accountService, null);
         store.start();
         // collect store segment requirements and add into DiskSpaceAllocator
         List<DiskSpaceRequirements> storeRequirements = Collections.singletonList(store.getDiskSpaceRequirements());
@@ -494,7 +496,9 @@ class DiskManager {
   private Map<String, Throttler> getThrottlers(StoreConfig config, Time time) {
     Map<String, Throttler> throttlers = new HashMap<>();
     // compaction ops
-    Throttler compactionOpsThrottler = new Throttler(config.storeCompactionOperationsBytesPerSec, -1, true, time);
+    Throttler compactionOpsThrottler =
+        new Throttler(config.storeCompactionOperationsBytesPerSec, config.storeCompactionThrottlerCheckIntervalMs, true,
+            time);
     throttlers.put(BlobStoreCompactor.COMPACTION_CLEANUP_JOB_NAME, compactionOpsThrottler);
     // hard delete ops
     Throttler hardDeleteOpsThrottler = new Throttler(config.storeHardDeleteOperationsBytesPerSec, -1, true, time);

@@ -52,7 +52,7 @@ class LogSegment implements Read, Write {
   private final FileChannel fileChannel;
   private final File file;
   private final long capacityInBytes;
-  private final String name;
+  private final LogSegmentName name;
   private final Pair<File, FileChannel> segmentView;
   private final StoreMetrics metrics;
   private final long startOffset;
@@ -76,7 +76,7 @@ class LogSegment implements Read, Write {
    * @param writeHeader if {@code true}, headers are written that provide metadata about the segment.
    * @throws StoreException if the file cannot be read or created
    */
-  LogSegment(String name, File file, long capacityInBytes, StoreConfig config, StoreMetrics metrics,
+  LogSegment(LogSegmentName name, File file, long capacityInBytes, StoreConfig config, StoreMetrics metrics,
       boolean writeHeader) throws StoreException {
     if (!file.exists() || !file.isFile()) {
       throw new StoreException(file.getAbsolutePath() + " does not exist or is not a file",
@@ -113,7 +113,7 @@ class LogSegment implements Read, Write {
    * @param metrics the {@link StoreMetrics} instance to use.
    * @throws StoreException
    */
-  LogSegment(String name, File file, StoreConfig config, StoreMetrics metrics) throws StoreException {
+  LogSegment(LogSegmentName name, File file, StoreConfig config, StoreMetrics metrics) throws StoreException {
     if (!file.exists() || !file.isFile()) {
       throw new StoreException(file.getAbsolutePath() + " does not exist or is not a file",
           StoreErrorCodes.File_Not_Found);
@@ -129,7 +129,7 @@ class LogSegment implements Read, Write {
             long computedCrc = crcStream.getValue();
             long crcFromFile = stream.readLong();
             if (crcFromFile != computedCrc) {
-              throw new IllegalStateException("CRC from the segment file does not match computed CRC of header");
+              throw new IllegalStateException("CRC from the segment file [" + file.getAbsolutePath() + "] does not match computed CRC of header");
             }
             startOffset = HEADER_SIZE;
             break;
@@ -148,10 +148,10 @@ class LogSegment implements Read, Write {
         Files.setPosixFilePermissions(this.file.toPath(), config.storeDataFilePermission);
       }
     } catch (FileNotFoundException e) {
-      throw new StoreException("File not found while creating log segment", e, StoreErrorCodes.File_Not_Found);
+      throw new StoreException("File not found while creating log segment [" + file.getAbsolutePath() + "]", e, StoreErrorCodes.File_Not_Found);
     } catch (IOException e) {
       StoreErrorCodes errorCode = StoreException.resolveErrorCode(e);
-      throw new StoreException(errorCode.toString() + " while creating log segment", e, errorCode);
+      throw new StoreException(errorCode.toString() + " while creating log segment [" + file.getAbsolutePath() + "]", e, errorCode);
     }
   }
 
@@ -167,7 +167,7 @@ class LogSegment implements Read, Write {
   LogSegment(File file, long capacityInBytes, StoreConfig config, StoreMetrics metrics, FileChannel fileChannel)
       throws StoreException {
     this.file = file;
-    this.name = file.getName();
+    this.name = LogSegmentName.fromFilename(file.getName());
     this.capacityInBytes = capacityInBytes;
     this.metrics = metrics;
     this.fileChannel = fileChannel;
@@ -290,6 +290,13 @@ class LogSegment implements Read, Write {
   }
 
   /**
+   * @return {@code true} if the startOffset and endOffset of this log segment is the same. Otherwise return {@code false}.
+   */
+  boolean isEmpty() {
+    return startOffset == endOffset.get();
+  }
+
+  /**
    * Make sure the size for append is legal.
    * @param size The amount of data in bytes to append.
    */
@@ -303,7 +310,7 @@ class LogSegment implements Read, Write {
   }
 
   /**
-   * Initialize a {@link java.nio.DirectByteBuffer} for {@link LogSegment#appendFrom(ReadableByteChannel, long)}.
+   * Initialize a direct {@link ByteBuffer} for {@link LogSegment#appendFrom(ReadableByteChannel, long)}.
    * The buffer is to optimize JDK 8KB small IO write.
    */
   void initBufferForAppend() throws StoreException {
@@ -443,7 +450,7 @@ class LogSegment implements Read, Write {
   /**
    * @return the name of this segment.
    */
-  String getName() {
+  LogSegmentName getName() {
     return name;
   }
 
@@ -550,5 +557,9 @@ class LogSegment implements Read, Write {
   public String toString() {
     return "(File: [" + file + " ], Capacity: [" + capacityInBytes + "], Start offset: [" + startOffset
         + "], End offset: [" + endOffset + "])";
+  }
+
+  public StoreMetrics getMetrics() {
+    return metrics;
   }
 }

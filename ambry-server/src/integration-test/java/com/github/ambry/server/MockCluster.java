@@ -17,11 +17,11 @@ import com.github.ambry.account.Account;
 import com.github.ambry.account.Container;
 import com.github.ambry.clustermap.ClusterAgentsFactory;
 import com.github.ambry.clustermap.ClusterMap;
-import com.github.ambry.clustermap.ClusterSpectatorFactory;
+import com.github.ambry.clustermap.VcrClusterAgentsFactory;
 import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.clustermap.MockClusterAgentsFactory;
 import com.github.ambry.clustermap.MockClusterMap;
-import com.github.ambry.clustermap.MockClusterSpectatorFactory;
+import com.github.ambry.clustermap.MockVcrClusterAgentsFactory;
 import com.github.ambry.clustermap.MockDataNodeId;
 import com.github.ambry.clustermap.MockReplicaId;
 import com.github.ambry.clustermap.PartitionId;
@@ -63,12 +63,13 @@ import static org.junit.Assert.*;
 public class MockCluster {
   private static final Logger logger = LoggerFactory.getLogger(MockCluster.class);
   private final MockClusterAgentsFactory mockClusterAgentsFactory;
-  private MockClusterSpectatorFactory mockClusterSpectatorFactory;
+  private MockVcrClusterAgentsFactory mockClusterSpectatorFactory;
   private final MockClusterMap clusterMap;
   private final List<AmbryServer> serverList;
   private boolean serverInitialized = false;
   private int generalDataNodeIndex;
   private final List<String> sslEnabledDataCenterList;
+  private final boolean enableHttp2Replication;
   private final Properties sslProps;
   private final boolean enableHardDeletes;
   private NotificationSystem notificationSystem;
@@ -87,6 +88,7 @@ public class MockCluster {
     String sslEnabledDataCentersStr = sslProps.getProperty("clustermap.ssl.enabled.datacenters");
     sslEnabledDataCenterList =
         sslEnabledDataCentersStr != null ? Utils.splitString(sslEnabledDataCentersStr, ",") : new ArrayList<>();
+    enableHttp2Replication = Boolean.parseBoolean(sslProps.getProperty("clustermap.enable.http2.replication"));
 
     mockClusterAgentsFactory =
         new MockClusterAgentsFactory(sslEnabledDataCentersStr != null, true, numNodes, numMountPointsPerNode,
@@ -103,12 +105,13 @@ public class MockCluster {
     this.time = SystemTime.getInstance();
 
     sslEnabledDataCenterList = new ArrayList<>();
+    enableHttp2Replication = Boolean.parseBoolean(sslProps.getProperty("clustermap.enable.http2.replication"));
     mockClusterAgentsFactory = new MockClusterAgentsFactory(mockClusterMap, null);
     clusterMap = mockClusterMap;
     serverList = new ArrayList<>();
     generalDataNodeIndex = 0;
 
-    mockClusterSpectatorFactory = new MockClusterSpectatorFactory(cloudDataNodes);
+    mockClusterSpectatorFactory = new MockVcrClusterAgentsFactory(cloudDataNodes);
   }
 
   /**
@@ -127,6 +130,7 @@ public class MockCluster {
     String sslEnabledDataCentersStr = sslProps.getProperty("clustermap.ssl.enabled.datacenters");
     sslEnabledDataCenterList =
         sslEnabledDataCentersStr != null ? Utils.splitString(sslEnabledDataCentersStr, ",") : new ArrayList<>();
+    enableHttp2Replication = Boolean.parseBoolean(sslProps.getProperty("clustermap.enable.http2.replication"));
 
     mockClusterAgentsFactory = new MockClusterAgentsFactory(mockClusterMap, null);
     clusterMap = mockClusterMap;
@@ -160,6 +164,7 @@ public class MockCluster {
       if (sslEnabledDataCenterList != null) {
         dataNodes.get(i).setSslEnabledDataCenters(sslEnabledDataCenterList);
       }
+      dataNodes.get(i).setEnableHttp2Replication(enableHttp2Replication);
       AmbryServer server =
           initializeServer(dataNodes.get(i), sslProps, enableHardDeletes, notificationSystem, time, null);
       serverList.add(server);
@@ -183,6 +188,7 @@ public class MockCluster {
       if (sslEnabledDataCenterList != null) {
         dataNodes.get(i).setSslEnabledDataCenters(sslEnabledDataCenterList);
       }
+      dataNodes.get(i).setEnableHttp2Replication(enableHttp2Replication);
       sslProps.putAll(props);
       AmbryServer server =
           initializeServer(dataNodes.get(i), sslProps, enableHardDeletes, notificationSystem, time, null);
@@ -223,7 +229,7 @@ public class MockCluster {
     return mockClusterAgentsFactory;
   }
 
-  public ClusterSpectatorFactory getClusterSpectatorFactory() {
+  public VcrClusterAgentsFactory getClusterSpectatorFactory() {
     return mockClusterSpectatorFactory;
   }
 
@@ -241,7 +247,7 @@ public class MockCluster {
     props.setProperty("port", Integer.toString(dataNodeId.getPort()));
     props.setProperty("store.data.flush.interval.seconds", "1");
     props.setProperty("store.enable.hard.delete", Boolean.toString(enableHardDeletes));
-    props.setProperty("store.deleted.message.retention.days", "1");
+    props.setProperty("store.deleted.message.retention.hours", "1");
     props.setProperty("store.validate.authorization", "true");
     props.setProperty("store.segment.size.in.bytes", Long.toString(MockReplicaId.MOCK_REPLICA_CAPACITY / 10));
     props.setProperty("replication.token.flush.interval.seconds", "5");

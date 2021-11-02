@@ -19,7 +19,6 @@ import com.github.ambry.config.HelixAccountServiceConfig;
 import com.github.ambry.router.Router;
 import java.io.IOException;
 import java.util.Collection;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Random;
 import java.util.concurrent.ScheduledExecutorService;
@@ -90,17 +89,13 @@ import static com.github.ambry.utils.Utils.*;
  *   back to zookeeper.
  * </p>
  */
-public class HelixAccountService extends AbstractAccountService implements AccountService {
-  static final String ACCOUNT_METADATA_CHANGE_TOPIC = "account_metadata_change_topic";
-  static final String FULL_ACCOUNT_METADATA_CHANGE_MESSAGE = "full_account_metadata_change";
+public class HelixAccountService extends AbstractAccountService {
 
   private final AtomicBoolean open = new AtomicBoolean(true);
   private final BackupFileManager backupFileManager;
   private final HelixPropertyStore<ZNRecord> helixStore;
-  private final Notifier<String> notifier;
   private final ScheduledExecutorService scheduler;
   private final HelixAccountServiceConfig config;
-  private final TopicListener<String> changeTopicListener = this::onAccountChangeMessage;
   private final AccountMetadataStore accountMetadataStore;
   private static final Logger logger = LoggerFactory.getLogger(HelixAccountService.class);
   private final AtomicReference<Router> router = new AtomicReference<>();
@@ -127,9 +122,8 @@ public class HelixAccountService extends AbstractAccountService implements Accou
   HelixAccountService(HelixPropertyStore<ZNRecord> helixStore, AccountServiceMetrics accountServiceMetrics,
       Notifier<String> notifier, ScheduledExecutorService scheduler, HelixAccountServiceConfig config)
       throws IOException {
-    super(config, Objects.requireNonNull(accountServiceMetrics, "accountServiceMetrics cannot be null"));
+    super(config, Objects.requireNonNull(accountServiceMetrics, "accountServiceMetrics cannot be null"), notifier);
     this.helixStore = Objects.requireNonNull(helixStore, "helixStore cannot be null");
-    this.notifier = notifier;
     this.scheduler = scheduler;
     this.config = config;
     this.backupFileManager =
@@ -159,24 +153,16 @@ public class HelixAccountService extends AbstractAccountService implements Accou
   }
 
   /**
-   * Return the {@link Notifier}.
-   * @return The {@link Notifier}
-   */
-  Notifier<String> getNotifier() {
-    return notifier;
-  }
-
-  /**
    * A synchronized function to fetch account metadata from {@link AccountMetadataStore} and update the in memory cache.
    * @param isCalledFromListener True is this function is invoked in the {@link TopicListener}.
    */
   private synchronized void fetchAndUpdateCache(boolean isCalledFromListener) {
-    Map<String, String> accountMap = accountMetadataStore.fetchAccountMetadata();
-    if (accountMap == null) {
-      logger.debug("No account map returned");
+    Collection<Account> accounts = accountMetadataStore.fetchAccountMetadata();
+    if (accounts == null) {
+      logger.debug("No account collection returned");
     } else {
       logger.trace("Start parsing remote account data");
-      AccountInfoMap newAccountInfoMap = new AccountInfoMap(accountServiceMetrics, accountMap);
+      AccountInfoMap newAccountInfoMap = new AccountInfoMap(accounts);
       AccountInfoMap oldAccountInfoMap = accountInfoMapRef.getAndSet(newAccountInfoMap);
 
       //Notify modified accounts to consumers
@@ -214,13 +200,13 @@ public class HelixAccountService extends AbstractAccountService implements Accou
 
     // accountInfoMapRef's reference is empty doesn't mean that fetchAndUpdateCache failed, it would just be that there
     // is no account metadata for the time being. Theoretically local storage shouldn't have any backup files. So
-    // backup.getLatestAccountMap should return null. And in case we have a very old backup file just mentioned above, a threshold
+    // backup.getLatestAccounts should return null. And in case we have a very old backup file just mentioned above, a threshold
     // would solve the problem.
     if (accountInfoMapRef.get().isEmpty() && config.enableServeFromBackup && !backupFileManager.isEmpty()) {
       long aMonthAgo = System.currentTimeMillis() / 1000 - TimeUnit.DAYS.toSeconds(30);
-      Map<String, String> accountMap = backupFileManager.getLatestAccountMap(aMonthAgo);
-      if (accountMap != null) {
-        AccountInfoMap newAccountInfoMap = new AccountInfoMap(accountServiceMetrics, accountMap);
+      Collection<Account> accounts = backupFileManager.getLatestAccounts(aMonthAgo);
+      if (accounts != null) {
+        AccountInfoMap newAccountInfoMap = new AccountInfoMap(accounts);
         accountInfoMapRef.set(newAccountInfoMap);
 
         // Notify accounts to consumers
@@ -236,13 +222,7 @@ public class HelixAccountService extends AbstractAccountService implements Accou
           initialDelay, config.updaterPollingIntervalMs);
     }
 
-    if (notifier != null) {
-      notifier.subscribe(ACCOUNT_METADATA_CHANGE_TOPIC, changeTopicListener);
-    } else {
-      logger.warn("Notifier is null. Account updates cannot be notified to other entities. Local account cache may not "
-          + "be in sync with remote account data.");
-      accountServiceMetrics.nullNotifierCount.inc();
-    }
+    maybeSubscribeChangeTopic(true);
   }
 
   /**
@@ -321,9 +301,7 @@ public class HelixAccountService extends AbstractAccountService implements Accou
   @Override
   public void close() {
     if (open.compareAndSet(true, false)) {
-      if (notifier != null) {
-        notifier.unsubscribe(ACCOUNT_METADATA_CHANGE_TOPIC, changeTopicListener);
-      }
+      maybeUnsubscribeChangeTopic();
       if (scheduler != null) {
         shutDownExecutorService(scheduler, config.updaterShutDownTimeoutMs, TimeUnit.MILLISECONDS);
       }
@@ -337,7 +315,8 @@ public class HelixAccountService extends AbstractAccountService implements Accou
    * @param topic The topic.
    * @param message The message for the topic.
    */
-  private void onAccountChangeMessage(String topic, String message) {
+  @Override
+  protected void onAccountChangeMessage(String topic, String message) {
     if (!open.get()) {
       // take no action instead of throwing an exception to silence noisy log messages when a message is received while
       // closing the AccountService.

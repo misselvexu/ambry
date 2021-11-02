@@ -14,6 +14,7 @@
 package com.github.ambry.account;
 
 import com.codahale.metrics.MetricRegistry;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.ambry.clustermap.HelixStoreOperator;
 import com.github.ambry.clustermap.MockHelixPropertyStore;
 import com.github.ambry.config.HelixAccountServiceConfig;
@@ -45,6 +46,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Matcher;
@@ -52,10 +54,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.helix.store.HelixPropertyStore;
 import org.apache.helix.zookeeper.datamodel.ZNRecord;
-import org.json.JSONArray;
 import org.json.JSONException;
-import org.json.JSONObject;
-import org.json.JSONTokener;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -76,6 +75,7 @@ import static org.junit.Assume.*;
  */
 @RunWith(Parameterized.class)
 public class HelixAccountServiceTest {
+  private static final ObjectMapper objectMapper = new ObjectMapper();
   private static final int ZK_CLIENT_CONNECTION_TIMEOUT_MS = 20000;
   private static final int ZK_CLIENT_SESSION_TIMEOUT_MS = 20000;
   private static final String ZK_CONNECT_STRING = "dummyHost:dummyPort";
@@ -373,10 +373,27 @@ public class HelixAccountServiceTest {
     accountService = mockHelixAccountServiceFactory.getAccountService();
     assertEquals("The number of account in HelixAccountService is incorrect", 0,
         accountService.getAllAccounts().size());
+    // create three containers for testing
+    Container activeContainer =
+        new ContainerBuilder((short) (refContainer.getId() + 1), "active", Container.ContainerStatus.ACTIVE, "",
+            refAccount.getId()).build();
+    Container inactiveContainer =
+        new ContainerBuilder((short) (refContainer.getId() + 2), "inactive", Container.ContainerStatus.INACTIVE, "",
+            refAccount.getId()).build();
+    Container deleteInProgressContainer1 =
+        new ContainerBuilder((short) (refContainer.getId() + 3), "within-retention-period",
+            ContainerStatus.DELETE_IN_PROGRESS, "", refAccount.getId()).setDeleteTriggerTime(System.currentTimeMillis())
+            .build();
+    Container deleteInProgressContainer2 =
+        new ContainerBuilder((short) (refContainer.getId() + 4), "past-retention-period",
+            ContainerStatus.DELETE_IN_PROGRESS, "", refAccount.getId()).setDeleteTriggerTime(
+            System.currentTimeMillis() - TimeUnit.DAYS.toMillis(15)).build();
+    refAccount.updateContainerMap(
+        Arrays.asList(activeContainer, inactiveContainer, deleteInProgressContainer1, deleteInProgressContainer2));
     // add an account with single container
     accountService.updateAccounts(Collections.singletonList(refAccount));
 
-    Container brandNewContainer = new ContainerBuilder(refContainer).setId(UNKNOWN_CONTAINER_ID).build();
+    Container brandNewContainer = new ContainerBuilder(activeContainer).setId(UNKNOWN_CONTAINER_ID).build();
 
     // 1. test invalid input
     try {
@@ -398,7 +415,31 @@ public class HelixAccountServiceTest {
       assertEquals("Mismatch in error code", AccountServiceErrorCode.NotFound, e.getErrorCode());
     }
 
-    // 3. test conflict container (new container with existing name but different attributes)
+    // 3. test containers already exist with INACTIVE and DELETE_IN_PROGRESS state
+    Container duplicateInactiveContainer = new ContainerBuilder(inactiveContainer).setId(UNKNOWN_CONTAINER_ID).build();
+    Container duplicateDeleteInProgressContainer1 =
+        new ContainerBuilder(deleteInProgressContainer1).setId(UNKNOWN_CONTAINER_ID).build();
+    Container duplicateDeleteInProgressContainer2 =
+        new ContainerBuilder(deleteInProgressContainer2).setId(UNKNOWN_CONTAINER_ID).build();
+    try {
+      accountService.updateContainers(refAccountName, Collections.singleton(duplicateInactiveContainer));
+      fail("Should fail because the existing container has been marked INACTIVE.");
+    } catch (AccountServiceException ase) {
+      assertEquals("Mismatch in error code", AccountServiceErrorCode.ResourceHasGone, ase.getErrorCode());
+    }
+    try {
+      accountService.updateContainers(refAccountName, Collections.singleton(duplicateDeleteInProgressContainer1));
+      fail("Should fail because the existing container has been marked DELETE_IN_PROGRESS.");
+    } catch (AccountServiceException ase) {
+      assertEquals("Mismatch in error code", AccountServiceErrorCode.MethodNotAllowed, ase.getErrorCode());
+    }
+    try {
+      accountService.updateContainers(refAccountName, Collections.singleton(duplicateDeleteInProgressContainer2));
+      fail("Should fail because the existing container has been marked DELETE_IN_PROGRESS and past retention time");
+    } catch (AccountServiceException ase) {
+      assertEquals("Mismatch in error code", AccountServiceErrorCode.ResourceHasGone, ase.getErrorCode());
+    }
+    // 4. test conflict container (new container with existing name but different attributes)
     Container conflictContainer = new ContainerBuilder(brandNewContainer).setBackupEnabled(true).build();
     try {
       accountService.updateContainers(refAccountName, Collections.singleton(conflictContainer));
@@ -407,17 +448,17 @@ public class HelixAccountServiceTest {
       assertEquals("Mismatch in error code", AccountServiceErrorCode.ResourceConflict, e.getErrorCode());
     }
 
-    // 4. test adding same container twice, should be no-op and return result should include container with id
+    // 5. test adding same container twice, should be no-op and return result should include container with id
     Collection<Container> addedContainers =
         accountService.updateContainers(refAccountName, Collections.singleton(brandNewContainer));
     assertEquals("Mismatch in return count", 1, addedContainers.size());
     for (Container container : addedContainers) {
       assertEquals("Mismatch in account id", refAccountId, container.getParentAccountId());
-      assertEquals("Mismatch in container id", refContainerId, container.getId());
-      assertEquals("Mismatch in container name", refContainerName, container.getName());
+      assertEquals("Mismatch in container id", activeContainer.getId(), container.getId());
+      assertEquals("Mismatch in container name", activeContainer.getName(), container.getName());
     }
 
-    // 5. test adding a different container (failure case due to ZK update failure)
+    // 6. test adding a different container (failure case due to ZK update failure)
     MockHelixPropertyStore<ZNRecord> mockHelixStore =
         mockHelixAccountServiceFactory.getHelixStore(ZK_CONNECT_STRING, storeConfig);
     mockHelixStore.setExceptionDuringUpdater(true);
@@ -429,7 +470,7 @@ public class HelixAccountServiceTest {
     }
     mockHelixStore.setExceptionDuringUpdater(false);
 
-    // 6. test adding 2 different containers (success case)
+    // 7. test adding 2 different containers (success case)
     Container containerToAdd2 =
         new ContainerBuilder(UNKNOWN_CONTAINER_ID, "newContainer2", ContainerStatus.ACTIVE, "description",
             refParentAccountId).build();
@@ -544,7 +585,8 @@ public class HelixAccountServiceTest {
   @Test
   public void testReadBadZNRecordCase3() throws Exception {
     Map<String, String> mapValue = new HashMap<>();
-    mapValue.put(String.valueOf(refAccount.getId()), refAccount.toJson(true).toString());
+    mapValue.put(String.valueOf(refAccount.getId()), objectMapper.writeValueAsString(
+        new AccountBuilder(refAccount).snapshotVersion(refAccount.getSnapshotVersion() + 1).build()));
     ZNRecord zNRecord = makeZNRecordWithMapField(null, "key", mapValue);
     updateAndWriteZNRecord(zNRecord, true);
   }
@@ -559,7 +601,8 @@ public class HelixAccountServiceTest {
   @Test
   public void testReadBadZNRecordCase4() throws Exception {
     Map<String, String> mapValue = new HashMap<>();
-    mapValue.put("-1", refAccount.toJson(true).toString());
+    mapValue.put("-1", objectMapper.writeValueAsString(
+        new AccountBuilder(refAccount).snapshotVersion(refAccount.getSnapshotVersion() + 1).build()));
     ZNRecord zNRecord = null;
     if (useNewZNodePath) {
       String blobID = RouterStore.writeAccountMapToRouter(mapValue, mockRouter);
@@ -602,7 +645,8 @@ public class HelixAccountServiceTest {
   public void testReadBadZNRecordCase6() throws Exception {
     ZNRecord zNRecord = new ZNRecord(String.valueOf(System.currentTimeMillis()));
     Map<String, String> accountMap = new HashMap<>();
-    accountMap.put(String.valueOf(refAccount.getId()), refAccount.toJson(true).toString());
+    accountMap.put(String.valueOf(refAccount.getId()), objectMapper.writeValueAsString(
+        new AccountBuilder(refAccount).snapshotVersion(refAccount.getSnapshotVersion() + 1).build()));
     accountMap.put(String.valueOf(refAccount.getId() + 1), BAD_ACCOUNT_METADATA_STRING);
     if (useNewZNodePath) {
       String blobID = RouterStore.writeAccountMapToRouter(accountMap, mockRouter);
@@ -627,7 +671,8 @@ public class HelixAccountServiceTest {
     }
     ZNRecord zNRecord = new ZNRecord(String.valueOf(System.currentTimeMillis()));
     Map<String, String> accountMap = new HashMap<>();
-    accountMap.put(String.valueOf(refAccount.getId()), refAccount.toJson(true).toString());
+    accountMap.put(String.valueOf(refAccount.getId()), objectMapper.writeValueAsString(
+        new AccountBuilder(refAccount).snapshotVersion(refAccount.getSnapshotVersion() + 1).build()));
     RouterStore.writeAccountMapToRouter(accountMap, mockRouter);
     List<String> list = Collections.singletonList("bad_list_string");
     zNRecord.setListField(RouterStore.ACCOUNT_METADATA_BLOB_IDS_LIST_KEY, list);
@@ -647,7 +692,8 @@ public class HelixAccountServiceTest {
     }
     ZNRecord zNRecord = new ZNRecord(String.valueOf(System.currentTimeMillis()));
     Map<String, String> accountMap = new HashMap<>();
-    accountMap.put(String.valueOf(refAccount.getId()), refAccount.toJson(true).toString());
+    accountMap.put(String.valueOf(refAccount.getId()), objectMapper.writeValueAsString(
+        new AccountBuilder(refAccount).snapshotVersion(refAccount.getSnapshotVersion() + 1).build()));
     String blobID = RouterStore.writeAccountMapToRouter(accountMap, mockRouter);
     List<String> list = new ArrayList<>();
     list.add("badliststring");
@@ -1225,32 +1271,13 @@ public class HelixAccountServiceTest {
   private void checkBackupFileWithVersion(Collection<Account> expectedAccounts, Path backupPath)
       throws JSONException, IOException {
     try (BufferedReader reader = Files.newBufferedReader(backupPath)) {
-      JSONArray accountArray = new JSONArray(new JSONTokener(reader));
-      int arrayLength = accountArray.length();
-      assertEquals("unexpected array size", expectedAccounts.size(), arrayLength);
+      Account[] accounts = objectMapper.readValue(reader, Account[].class);
+      assertEquals("unexpected array size", expectedAccounts.size(), accounts.length);
       Set<Account> expectedAccountSet = new HashSet<>(expectedAccounts);
-      for (int i = 0; i < arrayLength; i++) {
-        JSONObject accountJson = accountArray.getJSONObject(i);
-        Account account = Account.fromJson(accountJson);
-        assertTrue("unexpected account in array: " + accountJson.toString(), expectedAccountSet.contains(account));
+      for (int i = 0; i < accounts.length; i++) {
+        Account account = accounts[i];
+        assertTrue("unexpected account in array: " + account.toString(), expectedAccountSet.contains(account));
       }
-    }
-  }
-
-  /**
-   * Assert that the account map has the same accounts with the expected account set.
-   * @param expectedAccounts the expected {@link Account}s.
-   * @param accountMap the account map.
-   * @throws Exception
-   */
-  private void assertAccountMapEquals(Collection<Account> expectedAccounts, Map<String, String> accountMap)
-      throws Exception {
-    Set<Account> expectedAccountSet = new HashSet<>(expectedAccounts);
-    assertEquals("Number of accounts mismatch", expectedAccountSet.size(), accountMap.size());
-    for (String accountJsonString : accountMap.values()) {
-      JSONObject accountJson = new JSONObject(accountJsonString);
-      Account account = Account.fromJson(accountJson);
-      assertTrue("unexpected account in map: " + accountJson.toString(), expectedAccountSet.contains(account));
     }
   }
 
@@ -1266,7 +1293,8 @@ public class HelixAccountServiceTest {
     ZNRecord zNRecord = new ZNRecord(String.valueOf(System.currentTimeMillis()));
     Map<String, String> accountMap = new HashMap<>();
     for (Account account : accounts) {
-      accountMap.put(String.valueOf(account.getId()), account.toJson(true).toString());
+      accountMap.put(String.valueOf(account.getId()), objectMapper.writeValueAsString(
+          new AccountBuilder(account).snapshotVersion(refAccount.getSnapshotVersion() + 1).build()));
     }
     if (useNewZNodePath) {
       String blobID = RouterStore.writeAccountMapToRouter(accountMap, mockRouter);

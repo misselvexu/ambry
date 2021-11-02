@@ -34,6 +34,7 @@ import java.util.UUID;
 import org.junit.After;
 import org.junit.Test;
 
+import static com.github.ambry.store.StoreFindToken.*;
 import static org.junit.Assert.*;
 
 
@@ -57,7 +58,7 @@ public class CompactionLogTest {
   private final StoreConfig config;
   // the time instance that will be used in the index
   private final Time time = new MockTime();
-  private final Set<String> generatedSegmentNames = new HashSet<>();
+  private final Set<LogSegmentName> generatedSegmentNames = new HashSet<>();
 
   /**
    * Creates a temporary directory for the compaction log file.
@@ -100,14 +101,14 @@ public class CompactionLogTest {
       assertEquals("Should be in the PREPARE phase", CompactionLog.Phase.PREPARE, cLog.getCompactionPhase());
       cLog.markCopyStart();
       assertEquals("Should be in the COPY phase", CompactionLog.Phase.COPY, cLog.getCompactionPhase());
-      Offset offset = new Offset(LogSegmentNameHelper.generateFirstSegmentName(true),
+      Offset offset = new Offset(LogSegmentName.generateFirstSegmentName(true),
           Utils.getRandomLong(TestUtils.RANDOM, Long.MAX_VALUE));
       cLog.setStartOffsetOfLastIndexSegmentForDeleteCheck(offset);
       assertEquals("Offset that was set was not the one returned", offset,
           cLog.getStartOffsetOfLastIndexSegmentForDeleteCheck());
       StoreFindToken safeToken =
-          new StoreFindToken(new MockId("dummy"), new Offset(LogSegmentNameHelper.generateFirstSegmentName(true), 0),
-              new UUID(1, 1), new UUID(1, 1));
+          new StoreFindToken(new MockId("dummy"), new Offset(LogSegmentName.generateFirstSegmentName(true), 0),
+              new UUID(1, 1), new UUID(1, 1), null, null, UNINITIALIZED_RESET_KEY_VERSION);
       cLog.setSafeToken(safeToken);
       assertEquals("Returned token not the same as the one that was set", safeToken, cLog.getSafeToken());
       CompactionDetails nextDetails = detailsIterator.hasNext() ? detailsIterator.next() : null;
@@ -160,7 +161,7 @@ public class CompactionLogTest {
       cLog.close();
       cLog = new CompactionLog(tempDirStr, storeName, STORE_KEY_FACTORY, time, config);
       assertEquals("Should be in the COPY phase", CompactionLog.Phase.COPY, cLog.getCompactionPhase());
-      Offset offset = new Offset(LogSegmentNameHelper.generateFirstSegmentName(true),
+      Offset offset = new Offset(LogSegmentName.generateFirstSegmentName(true),
           Utils.getRandomLong(TestUtils.RANDOM, Long.MAX_VALUE));
       cLog.setStartOffsetOfLastIndexSegmentForDeleteCheck(offset);
 
@@ -169,8 +170,8 @@ public class CompactionLogTest {
       assertEquals("Offset that was set was not the one returned", offset,
           cLog.getStartOffsetOfLastIndexSegmentForDeleteCheck());
       StoreFindToken safeToken =
-          new StoreFindToken(new MockId("dummy"), new Offset(LogSegmentNameHelper.generateFirstSegmentName(true), 0),
-              new UUID(1, 1), new UUID(1, 1));
+          new StoreFindToken(new MockId("dummy"), new Offset(LogSegmentName.generateFirstSegmentName(true), 0),
+              new UUID(1, 1), new UUID(1, 1), null, null, UNINITIALIZED_RESET_KEY_VERSION);
       cLog.setSafeToken(safeToken);
 
       cLog.close();
@@ -326,16 +327,13 @@ public class CompactionLogTest {
    */
   private CompactionDetails getCompactionDetails(long referenceTime) {
     int segmentCount = TestUtils.RANDOM.nextInt(10) + 1;
-    List<String> segmentsUnderCompaction = new ArrayList<>();
+    List<LogSegmentName> segmentsUnderCompaction = new ArrayList<>();
     for (int j = 0; j < segmentCount; j++) {
-      String segmentName;
-      do {
-        segmentName = TestUtils.getRandomString(10);
-      } while (generatedSegmentNames.contains(segmentName));
+      LogSegmentName segmentName = StoreTestUtils.getRandomLogSegmentName(generatedSegmentNames);
       generatedSegmentNames.add(segmentName);
       segmentsUnderCompaction.add(segmentName);
     }
-    return new CompactionDetails(referenceTime, segmentsUnderCompaction);
+    return new CompactionDetails(referenceTime, segmentsUnderCompaction, null);
   }
 
   /**
@@ -373,11 +371,11 @@ public class CompactionLogTest {
    * @return combines {@code detailsList} into a single {@link CompactionDetails}.
    */
   private CompactionDetails combineListOfDetails(List<CompactionDetails> detailsList) {
-    List<String> allSegmentNames = new ArrayList<>();
+    List<LogSegmentName> allSegmentNames = new ArrayList<>();
     for (CompactionDetails details : detailsList) {
       allSegmentNames.addAll(details.getLogSegmentsUnderCompaction());
     }
-    return new CompactionDetails(detailsList.get(0).getReferenceTimeMs(), allSegmentNames);
+    return new CompactionDetails(detailsList.get(0).getReferenceTimeMs(), allSegmentNames, null);
   }
 
   // phaseTransitionEnforcementTest() helpers
@@ -414,8 +412,8 @@ public class CompactionLogTest {
 
     if (!cLog.getCompactionPhase().equals(CompactionLog.Phase.COPY)) {
       StoreFindToken safeToken =
-          new StoreFindToken(new MockId("dummy"), new Offset(LogSegmentNameHelper.generateFirstSegmentName(true), 0),
-              new UUID(1, 1), new UUID(1, 1));
+          new StoreFindToken(new MockId("dummy"), new Offset(LogSegmentName.generateFirstSegmentName(true), 0),
+              new UUID(1, 1), new UUID(1, 1), null, null, UNINITIALIZED_RESET_KEY_VERSION);
       try {
         cLog.setSafeToken(safeToken);
         fail("Setting safe token should have failed");

@@ -15,8 +15,8 @@ package com.github.ambry.clustermap;
 
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.commons.Callback;
-import com.github.ambry.server.AccountStatsStore;
-import com.github.ambry.server.AmbryHealthReport;
+import com.github.ambry.accountstats.AccountStatsStore;
+import com.github.ambry.server.AmbryStatsReport;
 import com.github.ambry.server.StatsSnapshot;
 import java.io.IOException;
 import java.util.Collections;
@@ -51,6 +51,7 @@ public class RecoveryTestClusterAgentsFactory implements ClusterAgentsFactory {
     PartitionLayout partitionLayout =
         new PartitionLayout(new HardwareLayout(clusterMapConfig.clustermapRecoveryTestHardwareLayout, clusterMapConfig),
             clusterMapConfig.clustermapRecoveryTestPartitionLayout, clusterMapConfig);
+    logger.info("Initialized partition layout in RecoveryTestClusterAgentsFactory: " + partitionLayout.toString());
     staticClusterAgentsFactory = new StaticClusterAgentsFactory(clusterMapConfig, partitionLayout);
     helixClusterAgentsFactory =
         new HelixClusterAgentsFactory(clusterMapConfig, staticClusterAgentsFactory.getMetricRegistry());
@@ -86,7 +87,7 @@ public class RecoveryTestClusterAgentsFactory implements ClusterAgentsFactory {
       // create a no op cluster participant that does nothing. Just sits idly by!!! ¯\_(ツ)_/¯
       ClusterParticipant clusterParticipant = new ClusterParticipant() {
         @Override
-        public void participate(List<AmbryHealthReport> ambryHealthReports, AccountStatsStore accountStatsStore,
+        public void participate(List<AmbryStatsReport> ambryHealthReports, AccountStatsStore accountStatsStore,
             Callback<StatsSnapshot> callback) {
         }
 

@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright 2016 LinkedIn Corp. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -357,9 +357,10 @@ public class AmbryRequests implements RequestAPI {
       long processingTime = SystemTime.getInstance().milliseconds() - startTime;
       totalTimeSpent += processingTime;
       publicAccessLogger.info("{} {} processingTime {}", getRequest, response, processingTime);
+      long responseSize = response != null ? response.sizeInBytes() : 0;
       if (getRequest.getMessageFormatFlag() == MessageFormatFlags.Blob) {
         metrics.getBlobProcessingTimeInMs.update(processingTime);
-        metrics.updateGetBlobProcessingTimeBySize(response.sizeInBytes(), processingTime);
+        metrics.updateGetBlobProcessingTimeBySize(responseSize, processingTime);
       } else if (getRequest.getMessageFormatFlag() == MessageFormatFlags.BlobProperties) {
         metrics.getBlobPropertiesProcessingTimeInMs.update(processingTime);
       } else if (getRequest.getMessageFormatFlag() == MessageFormatFlags.BlobUserMetadata) {
@@ -374,12 +375,12 @@ public class AmbryRequests implements RequestAPI {
           if (clientStrs.length > 1) {
             String clientDc = clientStrs[1].substring(0, clientStrs[1].length() - 1);
             if (!currentNode.getDatacenterName().equals(clientDc)) {
-              metrics.updateCrossColoFetchBytesRate(clientDc, response.sizeInBytes());
+              metrics.updateCrossColoFetchBytesRate(clientDc, responseSize);
             }
           }
         } else {
           metrics.getBlobAllProcessingTimeInMs.update(processingTime);
-          metrics.updateGetBlobProcessingTimeBySize(response.sizeInBytes(), processingTime);
+          metrics.updateGetBlobProcessingTimeBySize(responseSize, processingTime);
         }
       }
     }
@@ -575,7 +576,8 @@ public class AmbryRequests implements RequestAPI {
 
             partitionStartTimeInMs = SystemTime.getInstance().milliseconds();
             FindInfo findInfo =
-                store.findEntriesSince(findToken, replicaMetadataRequest.getMaxTotalSizeOfEntriesInBytes());
+                store.findEntriesSince(findToken, replicaMetadataRequest.getMaxTotalSizeOfEntriesInBytes(), hostName,
+                    replicaPath);
             logger.trace("{} Time used to find entry since: {}", partitionId,
                 (SystemTime.getInstance().milliseconds() - partitionStartTimeInMs));
 
@@ -639,7 +641,7 @@ public class AmbryRequests implements RequestAPI {
       if (clientStrs.length > 1) {
         String clientDc = clientStrs[1].substring(0, clientStrs[1].length() - 1);
         if (!currentNode.getDatacenterName().equals(clientDc)) {
-          metrics.updateCrossColoMetadataExchangeBytesRate(clientDc, response.sizeInBytes());
+          metrics.updateCrossColoMetadataExchangeBytesRate(clientDc, response != null ? response.sizeInBytes() : 0L);
         }
       }
     }
@@ -659,8 +661,8 @@ public class AmbryRequests implements RequestAPI {
     metrics.undeleteBlobRequestRate.mark();
     long startTime = SystemTime.getInstance().milliseconds();
     UndeleteResponse response = null;
-    Store storeToUndelete = null;
-    StoreKey convertedStoreKey = null;
+    Store storeToUndelete;
+    StoreKey convertedStoreKey;
     try {
       convertedStoreKey = getConvertedStoreKeys(Collections.singletonList(undeleteRequest.getBlobId())).get(0);
       ServerErrorCode error =

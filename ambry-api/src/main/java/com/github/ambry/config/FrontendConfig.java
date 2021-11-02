@@ -13,8 +13,8 @@
  */
 package com.github.ambry.config;
 
+import com.github.ambry.accountstats.AccountStatsStoreFactory;
 import com.github.ambry.protocol.GetOption;
-import com.github.ambry.quota.StorageQuotaServiceFactory;
 import com.github.ambry.router.GetBlobOptions;
 import com.github.ambry.utils.Utils;
 import java.util.Collections;
@@ -38,22 +38,17 @@ public class FrontendConfig {
       PREFIX + "max.acceptable.ttl.secs.if.ttl.required";
   public static final String MAX_JSON_REQUEST_SIZE_BYTES_KEY = PREFIX + "max.json.request.size.bytes";
   public static final String ENABLE_UNDELETE = PREFIX + "enable.undelete";
-  public static final String ENABLE_STORAGE_QUOTA_SERVICE = PREFIX + "enable.storage.quota.service";
-  public static final String STORAGE_QUOTA_SERVICE_FACTORY = PREFIX + "storage.quota.service.factory";
   public static final String NAMED_BLOB_DB_FACTORY = PREFIX + "named.blob.db.factory";
+  public static final String CONTAINER_METRICS_EXCLUDED_ACCOUNTS = PREFIX + "container.metrics.excluded.accounts";
+  public static final String ACCOUNT_STATS_STORE_FACTORY = PREFIX + "account.stats.store.factory";
 
   // Default values
   private static final String DEFAULT_ENDPOINT = "http://localhost:1174";
   private static final String DEFAULT_ENDPOINTS_STRING =
       "{\"POST\": \"" + DEFAULT_ENDPOINT + "\", \"GET\": \"" + DEFAULT_ENDPOINT + "\"}";
 
-  public static final String REST_REQUEST_QUOTA_STRING = PREFIX + "rest.request.quota";
-
-  private static final String DEFAULT_REST_REQUEST_QUOTA_STRING =
-      "{\"PUT\": \"-1\",\"GET\": \"-1\",\"POST\": \"-1\",\"HEAD\": \"-1\",\"OPTIONS\": \"-1\",\"UNKNOWN\": \"-1\",\"DELETE\": \"-1\"}";
-
-  private static final String DEFAULT_STORAGE_QUOTA_SERVICE_FACTORY =
-      "com.github.ambry.quota.AmbryStorageQuotaServiceFactory";
+  private static final String DEFAULT_ACCOUNT_STATS_STORE_FACTORY =
+      "com.github.ambry.accountstats.InmemoryAccountStatsStoreFactory";
 
   /**
    * Cache validity in seconds for non-private blobs for GET.
@@ -68,6 +63,14 @@ public class FrontendConfig {
   @Config("frontend.options.validity.seconds")
   @Default("24 * 60 * 60")
   public final long optionsValiditySeconds;
+
+  /**
+   * For permanent named blob, the put procedure is put, database insert and then ttlUpdate. This config is the ttl used
+   * in the initial put. This value should be greater than {@link StoreConfig#storeTtlUpdateBufferTimeSeconds}
+   */
+  @Config("permanent.named.blob.initial.put.ttl")
+  @Default("25 * 60 * 60")
+  public final long permanentNamedBlobInitialPutTtl;
 
   /**
    * Value of "Access-Control-Allow-Methods" in response headers for OPTIONS requests.
@@ -124,7 +127,7 @@ public class FrontendConfig {
    */
   @Config("frontend.chunked.get.response.threshold.in.bytes")
   @Default("8192")
-  public final Integer chunkedGetResponseThresholdInBytes;
+  public final long chunkedGetResponseThresholdInBytes;
 
   /**
    * Boolean indicator to specify if frontend should allow the post requests that carry serviceId used as target
@@ -147,13 +150,6 @@ public class FrontendConfig {
   @Config(URL_SIGNER_ENDPOINTS)
   @Default(DEFAULT_ENDPOINTS_STRING)
   public final String urlSignerEndpoints;
-
-  /**
-   * Quotas for rest requests, in JSON string.
-   */
-  @Config(REST_REQUEST_QUOTA_STRING)
-  @Default(DEFAULT_REST_REQUEST_QUOTA_STRING)
-  public final String restRequestQuota;
 
   /**
    * The default maximum size (in bytes) that can be uploaded using a signed POST URL unless otherwise specified at
@@ -217,18 +213,11 @@ public class FrontendConfig {
   public final boolean enableUndelete;
 
   /**
-   * Set to true to enable storage quota in frontend.
+   * The {@link AccountStatsStoreFactory}.
    */
-  @Config(ENABLE_STORAGE_QUOTA_SERVICE)
-  @Default("false")
-  public final boolean enableStorageQuotaService;
-
-  /**
-   * The {@link StorageQuotaServiceFactory}.
-   */
-  @Config(STORAGE_QUOTA_SERVICE_FACTORY)
-  @Default(DEFAULT_STORAGE_QUOTA_SERVICE_FACTORY)
-  public final String storageQuotaServiceFactory;
+  @Config(ACCOUNT_STATS_STORE_FACTORY)
+  @Default(DEFAULT_ACCOUNT_STATS_STORE_FACTORY)
+  public final String accountStatsStoreFactory;
 
   /**
    * Can be set to a classname that implements {@link com.github.ambry.named.NamedBlobDbFactory} to enable named blob
@@ -238,9 +227,18 @@ public class FrontendConfig {
   @Default("null")
   public final String namedBlobDbFactory;
 
+  /**
+   * The comma separated list of account names for which container metrics should not be generated.
+   */
+  @Config(CONTAINER_METRICS_EXCLUDED_ACCOUNTS)
+  @Default("")
+  public final List<String> containerMetricsExcludedAccounts;
+
   public FrontendConfig(VerifiableProperties verifiableProperties) {
     cacheValiditySeconds = verifiableProperties.getLong("frontend.cache.validity.seconds", 365 * 24 * 60 * 60);
     optionsValiditySeconds = verifiableProperties.getLong("frontend.options.validity.seconds", 24 * 60 * 60);
+    permanentNamedBlobInitialPutTtl =
+        verifiableProperties.getLong("permanent.named.blob.initial.put.ttl", 25 * 60 * 60);
     optionsAllowMethods =
         verifiableProperties.getString("frontend.options.allow.methods", "POST, GET, OPTIONS, HEAD, DELETE");
     idConverterFactory = verifiableProperties.getString("frontend.id.converter.factory",
@@ -260,11 +258,11 @@ public class FrontendConfig {
     pathPrefixesToRemove = Collections.unmodifiableList(
         pathPrefixesFromConfig.stream().map(this::stripLeadingAndTrailingSlash).collect(Collectors.toList()));
     chunkedGetResponseThresholdInBytes =
-        verifiableProperties.getInt("frontend.chunked.get.response.threshold.in.bytes", 8192);
+        verifiableProperties.getLong("frontend.chunked.get.response.threshold.in.bytes", 8192);
     allowServiceIdBasedPostRequest =
         verifiableProperties.getBoolean("frontend.allow.service.id.based.post.request", true);
     attachTrackingInfo = verifiableProperties.getBoolean("frontend.attach.tracking.info", true);
-    restRequestQuota = verifiableProperties.getString(REST_REQUEST_QUOTA_STRING, DEFAULT_REST_REQUEST_QUOTA_STRING);
+
     urlSignerEndpoints = verifiableProperties.getString(URL_SIGNER_ENDPOINTS, DEFAULT_ENDPOINTS_STRING);
     urlSignerDefaultMaxUploadSizeBytes =
         verifiableProperties.getLongInRange("frontend.url.signer.default.max.upload.size.bytes", 100 * 1024 * 1024, 0,
@@ -284,11 +282,11 @@ public class FrontendConfig {
     maxJsonRequestSizeBytes =
         verifiableProperties.getIntInRange(MAX_JSON_REQUEST_SIZE_BYTES_KEY, 20 * 1024 * 1024, 0, Integer.MAX_VALUE);
     enableUndelete = verifiableProperties.getBoolean(ENABLE_UNDELETE, false);
-    enableStorageQuotaService = verifiableProperties.getBoolean(ENABLE_STORAGE_QUOTA_SERVICE, false);
-    storageQuotaServiceFactory =
-        verifiableProperties.getString(STORAGE_QUOTA_SERVICE_FACTORY, DEFAULT_STORAGE_QUOTA_SERVICE_FACTORY);
-    namedBlobDbFactory =
-        verifiableProperties.getString(NAMED_BLOB_DB_FACTORY, null);
+    accountStatsStoreFactory =
+        verifiableProperties.getString(ACCOUNT_STATS_STORE_FACTORY, DEFAULT_ACCOUNT_STATS_STORE_FACTORY);
+    namedBlobDbFactory = verifiableProperties.getString(NAMED_BLOB_DB_FACTORY, null);
+    containerMetricsExcludedAccounts =
+        Utils.splitString(verifiableProperties.getString(CONTAINER_METRICS_EXCLUDED_ACCOUNTS, ""), ",");
   }
 
   /**

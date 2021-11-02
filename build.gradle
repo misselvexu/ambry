@@ -158,8 +158,9 @@ project(':ambry-utils') {
         compile "commons-codec:commons-codec:$commonsVersion"
         compile "org.json:json:$jsonVersion"
         compile "net.sf.jopt-simple:jopt-simple:$joptSimpleVersion"
-        compile "io.netty:netty-buffer:$nettyVersion"
+        compile "io.netty:netty-all:$nettyVersion"
         testCompile project(":ambry-test-utils")
+        testCompile "io.netty:netty-transport-native-epoll:$nettyVersion"
     }
 }
 
@@ -168,7 +169,6 @@ project(':ambry-test-utils') {
         compile "junit:junit:$junitVersion"
         compile "org.mockito:mockito-core:2.+"
         compile project(":ambry-utils")
-        compile project(":ambry-api")
         compile project(":ambry-commons")
         compile project(":ambry-clustermap")
         compile "org.bouncycastle:bcpkix-jdk15on:$bouncycastleVersion"
@@ -179,9 +179,9 @@ project(':ambry-api') {
     dependencies {
         compile project(':ambry-utils')
         compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
-        compile "org.codehaus.jackson:jackson-core-asl:$jacksonVersion"
-        compile "org.codehaus.jackson:jackson-mapper-asl:$jacksonVersion"
-        compile "io.netty:netty-buffer:$nettyVersion"
+        compile "com.fasterxml.jackson.core:jackson-core:$jacksonVersion"
+        compile "com.fasterxml.jackson.core:jackson-annotations:$jacksonVersion"
+        compile "com.fasterxml.jackson.core:jackson-databind:$jacksonVersion"
         testCompile project(':ambry-clustermap')
         testCompile project(':ambry-test-utils')
     }
@@ -191,7 +191,8 @@ project(':ambry-account') {
     dependencies {
         compile project(':ambry-api'),
                 project(':ambry-utils'),
-                project(':ambry-commons')
+                project(':ambry-commons'),
+                project(':ambry-mysql')
         compile ("org.apache.helix:helix-core:$helixVersion") {
             exclude group: "log4j", module: "log4j"
         }
@@ -215,6 +216,7 @@ project(':ambry-clustermap') {
         compile "org.json:json:$jsonVersion"
         testCompile project(':ambry-commons')
         testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
     }
 }
 
@@ -229,7 +231,6 @@ project(':ambry-commons') {
         compile ("org.apache.helix:helix-core:$helixVersion") {
             exclude group: "log4j", module: "log4j"
         }
-        compile "mysql:mysql-connector-java:$mysqlConnectorVersion"
         testCompile project(':ambry-test-utils')
         testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
     }
@@ -261,7 +262,8 @@ project(':ambry-server') {
                 project(':ambry-utils'),
                 project(':ambry-rest'),
                 project(':ambry-account'),
-                project(':ambry-replication')
+                project(':ambry-replication'),
+                project(':ambry-mysql')
         compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         compile "io.dropwizard.metrics:metrics-jmx:$metricsVersion"
         runtimeOnly "log4j:log4j:$log4jVersion"
@@ -315,9 +317,12 @@ project(':ambry-replication') {
                 project(':ambry-utils'),
                 project(':ambry-commons'),
                 project(':ambry-protocol'),
-                project(':ambry-network')
+                project(':ambry-store'),
+                project(':ambry-network'),
+                project(':ambry-clustermap')
         compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         testCompile project(':ambry-store')
+        testCompile project(':ambry-clustermap')
         testCompile project(':ambry-test-utils')
         testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
         testCompile project(path: ':ambry-api', configuration: 'testArchives')
@@ -361,7 +366,8 @@ project(':ambry-rest') {
         compile project(':ambry-api'),
                 project(':ambry-account'),
                 project(':ambry-utils'),
-                project(':ambry-commons')
+                project(':ambry-commons'),
+                project(':ambry-quota')
         compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         compile "io.dropwizard.metrics:metrics-jmx:$metricsVersion"
         compile "net.sf.jopt-simple:jopt-simple:$joptSimpleVersion"
@@ -391,7 +397,6 @@ project(':ambry-router') {
                 project(':ambry-rest')
         compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         compile "org.bouncycastle:bcpkix-jdk15on:$bouncycastleVersion"
-        compile "io.netty:netty-buffer:$nettyVersion"
         testCompile project(':ambry-test-utils')
         testCompile project(path: ':ambry-network', configuration: 'testArchives')
         testCompile project(path: ':ambry-cloud', configuration: 'testArchives')
@@ -405,9 +410,11 @@ project(':ambry-frontend') {
                 project(':ambry-utils'),
                 project(':ambry-commons'),
                 project(':ambry-rest'),
-                project(':ambry-router')
+                project(':ambry-router'),
+                project(':ambry-quota')
         compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         testCompile project(':ambry-test-utils')
+        testCompile project(':ambry-quota')
         testCompile project(path: ':ambry-api', configuration: 'testArchives')
         testCompile project(path: ':ambry-rest', configuration: 'testArchives')
     }
@@ -420,12 +427,15 @@ project(':ambry-cloud') {
             project(':ambry-commons'),
             project(':ambry-account'),
             project(':ambry-replication')
-        compile "com.azure:azure-storage-blob:$azureStorageVersion"
-        compile "com.azure:azure-storage-blob-batch:$azureStorageVersion"
+        compile "com.azure:azure-storage-blob:$azureStorageBlobVersion"
+        compile "com.azure:azure-storage-blob-batch:$azureStorageBlobBatchVersion"
         compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         compile "io.dropwizard.metrics:metrics-jmx:$metricsVersion"
         compile "com.microsoft.azure:azure-cosmosdb:$azureCosmosDbVersion"
         compile "com.microsoft.azure:msal4j:$azureMsal4jVersion"
+        compile ("org.apache.helix:helix-lock:$helixVersion") {
+            exclude group: "log4j", module: "log4j"
+        }
         testCompile project(':ambry-router')
         testCompile project(':ambry-store')
         testCompile project(':ambry-test-utils')
@@ -438,6 +448,7 @@ project(':ambry-cloud') {
 project(':ambry-named-mysql') {
     dependencies {
         compile project(':ambry-api')
+        compile project(':ambry-mysql')
         compile project(':ambry-commons')
         compile "mysql:mysql-connector-java:$mysqlConnectorVersion"
         compile "com.zaxxer:HikariCP:$hikariVersion"
@@ -448,12 +459,31 @@ project(':ambry-named-mysql') {
 project(':ambry-quota') {
     dependencies {
         compile project(':ambry-api'),
-            project(':ambry-commons')
+            project(':ambry-commons'),
+            project(':ambry-mysql'),
+            project(':ambry-clustermap')
         compile ("org.apache.helix:helix-core:$helixVersion") {
             exclude group: "log4j", module: "log4j"
         }
         testCompile project(':ambry-test-utils')
+        testCompile project(':ambry-account')
         testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
+    }
+}
+
+project(':ambry-mysql') {
+    dependencies {
+        compile project(':ambry-api')
+        compile project(':ambry-utils')
+        compile project(':ambry-commons')
+        compile "mysql:mysql-connector-java:$mysqlConnectorVersion"
+        compile ("org.apache.helix:helix-core:$helixVersion") {
+            exclude group: "log4j", module: "log4j"
+        }
+        compile "com.zaxxer:HikariCP:$hikariVersion"
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
     }
 }
 
@@ -467,6 +497,7 @@ project(':ambry-all') {
         compile project(':ambry-cloud')
         compile project(':ambry-named-mysql')
         compile project(':ambry-test-utils')
+        compile project(':ambry-quota')
     }
 }
 
@@ -516,6 +547,9 @@ task codeCoverageReport(type: JacocoReport) {
     subprojects.each {
         sourceSets it.sourceSets.main
     }
+
+    // always rerun task when requested to get new execution data
+    outputs.upToDateWhen { false }
 
     reports {
         xml.enabled true

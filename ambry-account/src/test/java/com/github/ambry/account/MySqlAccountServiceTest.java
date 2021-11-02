@@ -16,6 +16,7 @@ package com.github.ambry.account;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.account.mysql.MySqlAccountStore;
 import com.github.ambry.account.mysql.MySqlAccountStoreFactory;
+import com.github.ambry.commons.Notifier;
 import com.github.ambry.config.MySqlAccountServiceConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.utils.SystemTime;
@@ -27,12 +28,11 @@ import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import org.junit.Test;
 
@@ -51,14 +51,13 @@ public class MySqlAccountServiceTest {
   MySqlAccountService mySqlAccountService;
   MySqlAccountStoreFactory mockMySqlAccountStoreFactory;
   MySqlAccountStore mockMySqlAccountStore;
-  AccountServiceMetrics accountServiceMetrics;
+  Notifier<String> mockNotifier = new MockNotifier<>();
   Properties mySqlConfigProps = new Properties();
 
   public MySqlAccountServiceTest() throws Exception {
     mySqlConfigProps.setProperty(DB_INFO, "");
     mySqlConfigProps.setProperty(UPDATER_POLLING_INTERVAL_SECONDS, "0");
     mySqlConfigProps.setProperty(UPDATE_DISABLED, "false");
-    accountServiceMetrics = new AccountServiceMetrics(new MetricRegistry());
     mockMySqlAccountStoreFactory = mock(MySqlAccountStoreFactory.class);
     mockMySqlAccountStore = mock(MySqlAccountStore.class);
     when(mockMySqlAccountStoreFactory.getMySqlAccountStore()).thenReturn(mockMySqlAccountStore);
@@ -67,8 +66,10 @@ public class MySqlAccountServiceTest {
 
   // TODO: parametrize to use mock or real store (maybe blank url = test)
   private MySqlAccountService getAccountService() throws IOException, SQLException {
+    AccountServiceMetrics accountServiceMetrics = new AccountServiceMetrics(new MetricRegistry());
     return new MySqlAccountService(accountServiceMetrics,
-        new MySqlAccountServiceConfig(new VerifiableProperties(mySqlConfigProps)), mockMySqlAccountStoreFactory);
+        new MySqlAccountServiceConfig(new VerifiableProperties(mySqlConfigProps)), mockMySqlAccountStoreFactory,
+        mockNotifier);
   }
 
   /**
@@ -85,11 +86,11 @@ public class MySqlAccountServiceTest {
     Account testAccount =
         new AccountBuilder((short) 1, "testAccount", Account.AccountStatus.ACTIVE).lastModifiedTime(lastModifiedTime)
             .build();
-    Map<String, String> accountMap = new HashMap<>();
-    accountMap.put(Short.toString(testAccount.getId()), testAccount.toJson(false).toString());
+    Collection<Account> accounts = new ArrayList<>();
+    accounts.add(testAccount);
     String filename = BackupFileManager.getBackupFilename(1, SystemTime.getInstance().seconds());
     Path filePath = accountBackupDir.resolve(filename);
-    BackupFileManager.writeAccountMapToFile(filePath, accountMap);
+    BackupFileManager.writeAccountsToFile(filePath, accounts);
 
     mySqlAccountService = getAccountService();
 
@@ -120,6 +121,10 @@ public class MySqlAccountServiceTest {
     List<Account> accounts = new ArrayList<>(mySqlAccountService.getAllAccounts());
     assertEquals("Mismatch in number of accounts", 1, accounts.size());
     assertEquals("Mismatch in account information", testAccount, accounts.get(0));
+    assertTrue("Sync time not updated",
+        mySqlAccountService.accountServiceMetrics.timeInSecondsSinceLastSyncGauge.getValue() < 10);
+    assertEquals("Unexpected container count", 1,
+        mySqlAccountService.accountServiceMetrics.containerCountGauge.getValue().intValue());
   }
 
   /**
@@ -131,6 +136,7 @@ public class MySqlAccountServiceTest {
   public void testUpdateAccounts() throws Exception {
 
     when(mockMySqlAccountStore.getNewAccounts(0)).thenReturn(new ArrayList<>());
+    mySqlAccountService = getAccountService();
     Container testContainer =
         new ContainerBuilder((short) 1, "testContainer", Container.ContainerStatus.ACTIVE, "testContainer",
             (short) 1).build();
@@ -139,7 +145,11 @@ public class MySqlAccountServiceTest {
 
     // 1. Addition of new account. Verify account is added to cache and written to mysql store.
     mySqlAccountService.updateAccounts(Collections.singletonList(testAccount));
-    verify(mockMySqlAccountStore, atLeastOnce()).addAccount(testAccount);
+    Account finalTestAccount = testAccount;
+    verify(mockMySqlAccountStore, atLeastOnce()).updateAccounts(argThat(accountsInfo -> {
+      Account account = accountsInfo.get(0).getAccount();
+      return account.equals(finalTestAccount);
+    }));
     List<Account> accounts = new ArrayList<>(mySqlAccountService.getAllAccounts());
     assertEquals("Mismatch in number of accounts", 1, accounts.size());
     assertEquals("Mismatch in account retrieved by ID", testAccount,
@@ -147,29 +157,54 @@ public class MySqlAccountServiceTest {
     assertEquals("Mismatch in account retrieved by name", testAccount,
         mySqlAccountService.getAccountByName(testAccount.getName()));
 
-    // 2. Update existing account by adding new container. Verify account is updated in cache and written to mysql store.
+    // 2. Update existing account by changing aclInheritedByContainer to true. Verify account is updated in cache and written to mysql store.
+    testAccount = new AccountBuilder(testAccount).aclInheritedByContainer(true).build();
+    mySqlAccountService.updateAccounts(Collections.singletonList(testAccount));
+    Account finalTestAccount0 = testAccount;
+    verify(mockMySqlAccountStore, atLeastOnce()).updateAccounts(argThat(accountsInfo -> {
+      AccountUtils.AccountUpdateInfo accountUpdateInfo = accountsInfo.get(0);
+      return accountUpdateInfo.getAccount().equals(finalTestAccount0) && !accountUpdateInfo.isAdded()
+          && accountUpdateInfo.isUpdated() && accountUpdateInfo.getAddedContainers().isEmpty()
+          && accountUpdateInfo.getUpdatedContainers().isEmpty();
+    }));
+    assertEquals("Mismatch in account retrieved by ID", testAccount,
+        mySqlAccountService.getAccountById(testAccount.getId()));
+
+    // 3. Update existing account by adding new container. Verify account is updated in cache and written to mysql store.
     Container testContainer2 =
         new ContainerBuilder((short) 2, "testContainer2", Container.ContainerStatus.ACTIVE, "testContainer2", (short) 1)
             .build();
     testAccount = new AccountBuilder(testAccount).addOrUpdateContainer(testContainer2).build();
     mySqlAccountService.updateAccounts(Collections.singletonList(testAccount));
-    verify(mockMySqlAccountStore, never()).updateAccount(testAccount);
-    verify(mockMySqlAccountStore, atLeastOnce()).addContainers(anyInt(),
-        argThat(containers -> containers.size() == 1 && containers.iterator().next().equals(testContainer2)));
+    Account finalTestAccount1 = testAccount;
+    verify(mockMySqlAccountStore, atLeastOnce()).updateAccounts(argThat(accountsInfo -> {
+      AccountUtils.AccountUpdateInfo accountUpdateInfo = accountsInfo.get(0);
+      return accountUpdateInfo.getAccount().equals(finalTestAccount1) && !accountUpdateInfo.isAdded()
+          && !accountUpdateInfo.isUpdated() && accountUpdateInfo.getAddedContainers()
+          .equals(Collections.singletonList(testContainer2)) && accountUpdateInfo.getUpdatedContainers().isEmpty();
+    }));
     assertEquals("Mismatch in account retrieved by ID", testAccount,
         mySqlAccountService.getAccountById(testAccount.getId()));
 
-    // 3. Update existing container. Verify container is updated in cache and written to mysql store.
+    // 4. Update existing container. Verify container is updated in cache and written to mysql store.
     testContainer = new ContainerBuilder(testContainer).setMediaScanDisabled(true).setCacheable(true).build();
     testAccount = new AccountBuilder(testAccount).addOrUpdateContainer(testContainer).build();
     mySqlAccountService.updateAccounts(Collections.singletonList(testAccount));
-    verify(mockMySqlAccountStore, never()).updateAccount(testAccount);
     Container finalTestContainer =
         new ContainerBuilder(testContainer).setSnapshotVersion(testContainer.getSnapshotVersion() + 1).build();
-    verify(mockMySqlAccountStore, atLeastOnce()).updateContainers(anyInt(),
-        argThat(containers -> containers.size() == 1));
+    Account finalTestAccount2 = testAccount;
+    verify(mockMySqlAccountStore, atLeastOnce()).updateAccounts(argThat(accountsInfo -> {
+      AccountUtils.AccountUpdateInfo accountUpdateInfo = accountsInfo.get(0);
+      return accountUpdateInfo.getAccount().equals(finalTestAccount2) && !accountUpdateInfo.isAdded()
+          && !accountUpdateInfo.isUpdated() && accountUpdateInfo.getAddedContainers().isEmpty()
+          && accountUpdateInfo.getUpdatedContainers().equals(Collections.singletonList(finalTestContainer));
+    }));
     assertEquals("Mismatch in account retrieved by ID", testAccount,
         mySqlAccountService.getAccountById(testAccount.getId()));
+    assertTrue("Sync time not updated",
+        mySqlAccountService.accountServiceMetrics.timeInSecondsSinceLastSyncGauge.getValue() < 10);
+    assertEquals("Unexpected container count", 2,
+        mySqlAccountService.accountServiceMetrics.containerCountGauge.getValue().intValue());
   }
 
   /**
@@ -248,7 +283,7 @@ public class MySqlAccountServiceTest {
     conflictAccounts.add(new AccountBuilder((short) 2, "a", Account.AccountStatus.INACTIVE).build());
     assertUpdateAccountsFails(conflictAccounts, AccountServiceErrorCode.ResourceConflict, mySqlAccountService);
     assertEquals("UpdateAccountErrorCount in metrics should be 1", 1,
-        accountServiceMetrics.updateAccountErrorCount.getCount());
+        mySqlAccountService.accountServiceMetrics.updateAccountErrorCount.getCount());
   }
 
   /**
@@ -262,7 +297,7 @@ public class MySqlAccountServiceTest {
     conflictAccounts.add(new AccountBuilder((short) 1, "b", Account.AccountStatus.INACTIVE).build());
     assertUpdateAccountsFails(conflictAccounts, AccountServiceErrorCode.ResourceConflict, mySqlAccountService);
     assertEquals("UpdateAccountErrorCount in metrics should be 1", 1,
-        accountServiceMetrics.updateAccountErrorCount.getCount());
+        mySqlAccountService.accountServiceMetrics.updateAccountErrorCount.getCount());
   }
 
   /**
@@ -275,7 +310,7 @@ public class MySqlAccountServiceTest {
     conflictAccounts.add(new AccountBuilder((short) 1, "a", Account.AccountStatus.INACTIVE).build());
     assertUpdateAccountsFails(conflictAccounts, AccountServiceErrorCode.ResourceConflict, mySqlAccountService);
     assertEquals("UpdateAccountErrorCount in metrics should be 1", 1,
-        accountServiceMetrics.updateAccountErrorCount.getCount());
+        mySqlAccountService.accountServiceMetrics.updateAccountErrorCount.getCount());
   }
 
   /**
@@ -283,7 +318,7 @@ public class MySqlAccountServiceTest {
    */
   @Test
   public void testConflictingUpdatesWithAccounts() throws Exception {
-
+    AccountServiceMetrics accountServiceMetrics = mySqlAccountService.accountServiceMetrics;
     // write two accounts (1, "a") and (2, "b")
     List<Account> existingAccounts = new ArrayList<>();
     existingAccounts.add(new AccountBuilder((short) 1, "a", Account.AccountStatus.ACTIVE).build());
@@ -343,6 +378,7 @@ public class MySqlAccountServiceTest {
    */
   @Test
   public void testConflictingUpdatesWithContainers() throws Exception {
+    AccountServiceMetrics accountServiceMetrics = mySqlAccountService.accountServiceMetrics;
     List<Container> containersList = new ArrayList<>();
     containersList.add(
         new ContainerBuilder((short) 1, "c1", Container.ContainerStatus.ACTIVE, "c1", (short) 1).build());
@@ -486,6 +522,75 @@ public class MySqlAccountServiceTest {
         .build();
     mySqlAccountService.updateContainers(accountToUpdate.getName(), Collections.singletonList(containerToUpdate));
     assertEquals("Mismatch in container information", containerToUpdate,
-        mySqlAccountService.getContainer(accountToUpdate.getName(), containerToUpdate.getName()));
+        mySqlAccountService.getContainerByName(accountToUpdate.getName(), containerToUpdate.getName()));
+  }
+
+  /**
+   * Tests creating existing containers with different states. This is to mock edge case where user attempts to create
+   * same container which has been deprecated already.
+   * @throws Exception
+   */
+  @Test
+  public void testCreateExistingContainerInDifferentStates() throws Exception {
+    AccountService mySqlAccountService = getAccountService();
+    String accountName = "test-account";
+    String inactiveContainer = "inactive-container";
+    String deleteInProgressContainer1 = "delete-in-progress-container1";
+    String deleteInProgressContainer2 = "delete-in-progress-container2";
+    // create a testing account with inactive and delete-in-progress container.
+    Account accountToUpdate =
+        new AccountBuilder((short) 1, accountName, Account.AccountStatus.ACTIVE).addOrUpdateContainer(
+            new ContainerBuilder((short) 1, inactiveContainer, Container.ContainerStatus.INACTIVE, "",
+                (short) 1).build())
+            .addOrUpdateContainer(new ContainerBuilder((short) 2, deleteInProgressContainer1,
+                Container.ContainerStatus.DELETE_IN_PROGRESS, "", (short) 1).setDeleteTriggerTime(
+                System.currentTimeMillis()).build())
+            .addOrUpdateContainer(new ContainerBuilder((short) 3, deleteInProgressContainer2,
+                Container.ContainerStatus.DELETE_IN_PROGRESS, "", (short) 1).setDeleteTriggerTime(
+                System.currentTimeMillis() - TimeUnit.DAYS.toMillis(15)).build())
+            .build();
+    mySqlAccountService.updateAccounts(Collections.singletonList(accountToUpdate));
+
+    // Attempting to create an existing container with INACTIVE state should fail
+    Container containerToCreate =
+        new ContainerBuilder(Container.UNKNOWN_CONTAINER_ID, inactiveContainer, Container.ContainerStatus.ACTIVE, "",
+            (short) 1).build();
+    try {
+      mySqlAccountService.updateContainers(accountName, Collections.singletonList(containerToCreate));
+      fail("should fail because container to create is already marked as inactive");
+    } catch (AccountServiceException ase) {
+      assertEquals("Mismatch in error code", AccountServiceErrorCode.ResourceHasGone, ase.getErrorCode());
+    }
+
+    // Attempting to create an existing container with DELETE_IN_PROGRESS state (within retention time) should fail
+    containerToCreate = new ContainerBuilder(Container.UNKNOWN_CONTAINER_ID, deleteInProgressContainer1,
+        Container.ContainerStatus.ACTIVE, "", (short) 1).build();
+    try {
+      mySqlAccountService.updateContainers(accountName, Collections.singletonList(containerToCreate));
+      fail("should fail because container to create is in DELETE_IN_PROGRESS state");
+    } catch (AccountServiceException ase) {
+      assertEquals("Mismatch in error code", AccountServiceErrorCode.MethodNotAllowed, ase.getErrorCode());
+    }
+
+    // Attempting to create an existing container with DELETE_IN_PROGRESS state (past retention time) should fail
+    containerToCreate = new ContainerBuilder(Container.UNKNOWN_CONTAINER_ID, deleteInProgressContainer2,
+        Container.ContainerStatus.ACTIVE, "", (short) 1).build();
+    try {
+      mySqlAccountService.updateContainers(accountName, Collections.singletonList(containerToCreate));
+      fail("should fail because container to create is in DELETE_IN_PROGRESS state and past retention time");
+    } catch (AccountServiceException ase) {
+      assertEquals("Mismatch in error code", AccountServiceErrorCode.ResourceHasGone, ase.getErrorCode());
+    }
+  }
+
+  /**
+   * Asserts that sync time was updated and container count is expected.
+   * @param accountServiceMetrics the metrics to check
+   * @param expectedContainerCount expected value of containerCountGauge
+   */
+  private static void checkGauges(AccountServiceMetrics accountServiceMetrics, int expectedContainerCount) {
+    assertTrue("Sync time not updated", accountServiceMetrics.timeInSecondsSinceLastSyncGauge.getValue() < 10);
+    assertEquals("Unexpected container count", expectedContainerCount,
+        accountServiceMetrics.containerCountGauge.getValue().intValue());
   }
 }

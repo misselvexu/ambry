@@ -1,8 +1,7 @@
 # Ambry
 
-[![Build Status](https://travis-ci.com/linkedin/ambry.svg?branch=master)](https://travis-ci.com/linkedin/ambry)
+[![Github Actions CI](https://github.com/linkedin/ambry/actions/workflows/github-actions.yml/badge.svg)](https://github.com/linkedin/ambry/actions/workflows/github-actions.yml)
 [![codecov.io](https://codecov.io/github/linkedin/ambry/branch/master/graph/badge.svg)](https://codecov.io/github/linkedin/ambry)
-[ ![Download](https://api.bintray.com/packages/linkedin/maven/ambry/images/download.svg) ](https://bintray.com/linkedin/maven/ambry/_latestVersion)
 [![license](https://img.shields.io/github/license/linkedin/ambry.svg)](LICENSE)
 
 Ambry is a distributed object store that supports storage of trillion of small immutable objects (50K -100K) as well as billions of large objects. It was specifically designed to store and serve media objects in web companies. However, it can be used as a general purpose storage system to store DB backups, search indexes or business reports. The system has the following characterisitics: 
@@ -14,11 +13,12 @@ Ambry is a distributed object store that supports storage of trillion of small i
 5. Easy to use
 
 Requires at least JDK 1.8.
+
 ## Documentation
 Detailed documentation is available at https://github.com/linkedin/ambry/wiki
 
 ## Research
-Paper introducing Ambry at [SIGMOD 2016](http://sigmod2016.org/) -> http://dprg.cs.uiuc.edu/docs/SIGMOD2016-a/ambry.pdf
+Paper introducing Ambry at [SIGMOD 2016](http://sigmod2016.org/) -> http://dprg.cs.uiuc.edu/data/files/2016/ambry.pdf
 
 Reach out to us at ambrydev@googlegroups.com if you would like us to list a paper that is based off of research on Ambry.
 
@@ -99,4 +99,3 @@ In addition to the simple APIs demonstrated above, Ambry provides support for `G
 Other features of interest include:
 * **Time To Live (TTL)**: During `POST`, a TTL in seconds can be provided through the addition of a header named `x-ambry-ttl`. This means that Ambry will stop serving the blob after the TTL has expired. On `GET`, expired blobs behave the same way as deleted blobs.
 * **Private**: During `POST`, providing a header named `x-ambry-private` with the value `true` will mark the blob as private. API behavior can be configured based on whether a blob is public or private.
-

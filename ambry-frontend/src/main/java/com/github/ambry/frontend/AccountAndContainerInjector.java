@@ -15,6 +15,7 @@ package com.github.ambry.frontend;
 
 import com.github.ambry.account.Account;
 import com.github.ambry.account.AccountService;
+import com.github.ambry.account.AccountServiceException;
 import com.github.ambry.account.Container;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.config.FrontendConfig;
@@ -42,7 +43,6 @@ public class AccountAndContainerInjector {
   private static final Set<String> requiredAmbryHeadersForPutWithAccountAndContainerName = Collections.unmodifiableSet(
       new HashSet<>(Arrays.asList(Headers.TARGET_ACCOUNT_NAME, Headers.TARGET_CONTAINER_NAME)));
   private static final Logger logger = LoggerFactory.getLogger(AccountAndContainerInjector.class);
-  private static final String NAMED_BLOB_PREFIX = "/named";
 
   private final AccountService accountService;
   private final FrontendMetrics frontendMetrics;
@@ -86,24 +86,47 @@ public class AccountAndContainerInjector {
   }
 
   /**
-   * Injects target {@link Account} and {@link Container} for PUT requests. This method also ensures required uri
-   * is present for the PUT requests that account name/container name can be parsed from.
+   * Injects target {@link Account} and {@link Container} for named blob requests. This will treat the request path as
+   * a named blob path that includes the account and container names.
    * @param restRequest The Put {@link RestRequest}.
    * @param metricsGroup The {@link RestRequestMetricsGroup} to use to set up {@link ContainerMetrics}, or {@code null}
    *                     if {@link ContainerMetrics} instantiation is not needed.
    * @throws RestServiceException
    */
-  public void injectAccountAndContainerForPutRequest(RestRequest restRequest, RestRequestMetricsGroup metricsGroup)
+  public void injectAccountAndContainerForNamedBlob(RestRequest restRequest, RestRequestMetricsGroup metricsGroup)
       throws RestServiceException {
     accountAndContainerSanityCheck(restRequest);
-    if (restRequest.getUri() != null) {
-      frontendMetrics.putWithAccountAndContainerHeaderRate.mark();
-      injectAccountAndContainerUsingAccountAndContainerUri(restRequest, metricsGroup);
-    } else {
+
+    NamedBlobPath namedBlobPath = NamedBlobPath.parse(getRequestPath(restRequest), restRequest.getArgs());
+    String accountName = namedBlobPath.getAccountName();
+    Account targetAccount = accountService.getAccountByName(accountName);
+    if (targetAccount == null) {
+      frontendMetrics.unrecognizedAccountNameCount.inc();
+      throw new RestServiceException("Account cannot be found for accountName=" + accountName
+          + " in put request with account and container headers.", RestServiceErrorCode.InvalidAccount);
+    }
+    ensureAccountNameMatch(targetAccount, restRequest);
+    String containerName = namedBlobPath.getContainerName();
+    Container targetContainer;
+    try {
+      targetContainer = accountService.getContainerByName(accountName, containerName);
+    } catch (AccountServiceException e) {
+      throw new RestServiceException("Failed to get container " + containerName + " from account " + accountName
+          + " in put request with account and container headers.",
+          RestServiceErrorCode.getRestServiceErrorCode(e.getErrorCode()));
+    }
+    if (targetContainer == null) {
+      frontendMetrics.unrecognizedContainerNameCount.inc();
       throw new RestServiceException(
-          "Missing either " + Headers.TARGET_ACCOUNT_NAME + " or " + Headers.TARGET_CONTAINER_NAME + " header",
+          "Container cannot be found for accountName=" + accountName + " and containerName=" + containerName
+              + " in put request with account and container headers.", RestServiceErrorCode.InvalidContainer);
+    }
+    if (targetContainer.getNamedBlobMode() == Container.NamedBlobMode.DISABLED) {
+      throw new RestServiceException(
+          "Named blob APIs disabled for this container. account=" + accountName + ", container=" + containerName,
           RestServiceErrorCode.BadRequest);
     }
+    setTargetAccountAndContainerInRestRequest(restRequest, targetAccount, targetContainer, metricsGroup);
   }
 
   /**
@@ -135,7 +158,14 @@ public class AccountAndContainerInjector {
         targetAccount = accountService.getAccountById(Account.UNKNOWN_ACCOUNT_ID);
       }
     }
-    Container targetContainer = targetAccount.getContainerById(blobId.getContainerId());
+    Container targetContainer;
+    try {
+      targetContainer = accountService.getContainerById(blobId.getAccountId(), blobId.getContainerId());
+    } catch (AccountServiceException e) {
+      throw new RestServiceException(
+          "Failed to get container with Id= " + blobId.getContainerId() + " from account " + targetAccount.getName()
+              + "for blobId=" + blobId.getID(), RestServiceErrorCode.getRestServiceErrorCode(e.getErrorCode()));
+    }
     if (targetContainer == null) {
       frontendMetrics.getHeadDeleteUnrecognizedContainerCount.inc();
       throw new RestServiceException(
@@ -193,8 +223,16 @@ public class AccountAndContainerInjector {
       targetAccount = accountService.getAccountById(Account.UNKNOWN_ACCOUNT_ID);
     }
     // Either the UNKNOWN_ACCOUNT, or the migrated account should contain default public/private containers
-    Container targetContainer = targetAccount.getContainerById(
-        isPrivate ? Container.DEFAULT_PRIVATE_CONTAINER_ID : Container.DEFAULT_PUBLIC_CONTAINER_ID);
+    Container targetContainer;
+    short containerId = isPrivate ? Container.DEFAULT_PRIVATE_CONTAINER_ID : Container.DEFAULT_PUBLIC_CONTAINER_ID;
+    try {
+      targetContainer = accountService.getContainerById(targetAccount.getId(), containerId);
+    } catch (AccountServiceException e) {
+      throw new RestServiceException(
+          "Failed to get container with Id= " + containerId + " from account " + targetAccount.getName()
+              + "for put request; ServiceId=" + serviceId + ", isPrivate=" + isPrivate,
+          RestServiceErrorCode.getRestServiceErrorCode(e.getErrorCode()));
+    }
     if (targetContainer == null) {
       throw new RestServiceException(
           "Invalid account or container to inject; serviceId=" + serviceId + ", isPrivate=" + isPrivate,
@@ -221,36 +259,14 @@ public class AccountAndContainerInjector {
     }
     ensureAccountNameMatch(targetAccount, restRequest);
     String containerName = getHeader(restRequest.getArgs(), Headers.TARGET_CONTAINER_NAME, false);
-    Container targetContainer = targetAccount.getContainerByName(containerName);
-    if (targetContainer == null) {
-      frontendMetrics.unrecognizedContainerNameCount.inc();
-      throw new RestServiceException(
-          "Container cannot be found for accountName=" + accountName + " and containerName=" + containerName
-              + " in put request with account and container headers.", RestServiceErrorCode.InvalidContainer);
+    Container targetContainer;
+    try {
+      targetContainer = accountService.getContainerByName(accountName, containerName);
+    } catch (AccountServiceException e) {
+      throw new RestServiceException("Failed to get container " + containerName + " from account " + accountName
+          + " for put request with account and container headers.",
+          RestServiceErrorCode.getRestServiceErrorCode(e.getErrorCode()));
     }
-    setTargetAccountAndContainerInRestRequest(restRequest, targetAccount, targetContainer, metricsGroup);
-  }
-
-  /**
-   * Injects {@link Account} and {@link Container} for the PUT requests that carry the target account and container headers.
-   * @param restRequest The {@link RestRequest} to inject {@link Account} and {@link Container} object.
-   * @param metricsGroup The {@link RestRequestMetricsGroup} to use to set up {@link ContainerMetrics}, or {@code null}
-   *                     if {@link ContainerMetrics} instantiation is not needed.
-   * @throws RestServiceException if either of {@link Account} or {@link Container} object could not be found.
-   */
-  private void injectAccountAndContainerUsingAccountAndContainerUri(RestRequest restRequest,
-      RestRequestMetricsGroup metricsGroup) throws RestServiceException {
-    NamedBlobPath namedBlobPath = RestUtils.parseInput(RestUtils.getRequestPath(restRequest).getOperationOrBlobId(false));
-    String accountName = namedBlobPath.getAccountName();
-    Account targetAccount = accountService.getAccountByName(accountName);
-    if (targetAccount == null) {
-      frontendMetrics.unrecognizedAccountNameCount.inc();
-      throw new RestServiceException("Account cannot be found for accountName=" + accountName
-          + " in put request with account and container headers.", RestServiceErrorCode.InvalidAccount);
-    }
-    ensureAccountNameMatch(targetAccount, restRequest);
-    String containerName = namedBlobPath.getContainerName();
-    Container targetContainer = targetAccount.getContainerByName(containerName);
     if (targetContainer == null) {
       frontendMetrics.unrecognizedContainerNameCount.inc();
       throw new RestServiceException(
@@ -268,8 +284,8 @@ public class AccountAndContainerInjector {
    */
   private void accountAndContainerSanityCheck(RestRequest restRequest) throws RestServiceException {
     NamedBlobPath namedBlobPath = null;
-    if (restRequest.getUri().startsWith(NAMED_BLOB_PREFIX)) {
-      namedBlobPath = RestUtils.parseInput(RestUtils.getRequestPath(restRequest).getOperationOrBlobId(false));
+    if (getRequestPath(restRequest).matchesOperation(Operations.NAMED_BLOB)) {
+      namedBlobPath = NamedBlobPath.parse(getRequestPath(restRequest), restRequest.getArgs());
     }
     if (Account.UNKNOWN_ACCOUNT_NAME.equals(getHeader(restRequest.getArgs(), Headers.TARGET_ACCOUNT_NAME, false))
         || Account.UNKNOWN_ACCOUNT_NAME.equals(getHeader(restRequest.getArgs(), Headers.SERVICE_ID, false)) || (
@@ -306,8 +322,11 @@ public class AccountAndContainerInjector {
     logger.trace("Setting targetAccount={} and targetContainer={} for restRequest={} ", targetAccount, targetContainer,
         restRequest);
     if (metricsGroup != null) {
-      restRequest.getMetricsTracker()
-          .injectContainerMetrics(metricsGroup.getContainerMetrics(targetAccount.getName(), targetContainer.getName()));
+      if (!frontendConfig.containerMetricsExcludedAccounts.contains(targetAccount.getName())) {
+        restRequest.getMetricsTracker()
+            .injectContainerMetrics(
+                metricsGroup.getContainerMetrics(targetAccount.getName(), targetContainer.getName()));
+      }
     }
   }
 

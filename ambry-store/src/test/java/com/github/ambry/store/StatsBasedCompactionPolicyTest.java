@@ -49,7 +49,7 @@ public class StatsBasedCompactionPolicyTest {
     config = initState.getSecond();
     blobStore = initState.getFirst();
     mockBlobStoreStats = blobStore.getBlobStoreStats();
-    messageRetentionTimeInMs = TimeUnit.DAYS.toMillis(config.storeDeletedMessageRetentionDays);
+    messageRetentionTimeInMs = TimeUnit.HOURS.toMillis(config.storeDeletedMessageRetentionHours);
     compactionPolicy = new StatsBasedCompactionPolicy(config, time);
   }
 
@@ -71,16 +71,16 @@ public class StatsBasedCompactionPolicyTest {
     for (int k = 0; k < 5; k++) {
       for (int i = 0; i < logSegmentCount; i++) {
         for (int j = i; j < logSegmentCount; j++) {
-          List<String> bestCandidates = blobStore.logSegmentsNotInJournal.subList(i, j + 1);
+          List<LogSegmentName> bestCandidates = blobStore.logSegmentsNotInJournal.subList(i, j + 1);
           long bestCost = maxLogSegmentCapacity / bestCandidates.size();
           // this best cost is to ensure that no of segments reclaimed will be "bestCandidates" count - 1
-          NavigableMap<String, Long> validDataSize =
+          NavigableMap<LogSegmentName, Long> validDataSize =
               CompactionPolicyTest.generateValidDataSize(blobStore.logSegmentsNotInJournal, bestCandidates, bestCost,
                   maxLogSegmentCapacity);
           mockBlobStoreStats.validDataSizeByLogSegments = validDataSize;
           if ((j - i) >= config.storeMinLogSegmentCountToReclaimToTriggerCompaction) {
             CompactionPolicyTest.verifyCompactionDetails(
-                new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates), blobStore,
+                new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates, null), blobStore,
                 compactionPolicy);
             Pair<Integer, Integer> bestCandidateIndexes = new Pair<>(i, j);
             Pair<Integer, Integer> secondBestCandidateIndexes =
@@ -90,13 +90,13 @@ public class StatsBasedCompactionPolicyTest {
               CompactionPolicyTest.updateValidDataSize(validDataSize,
                   blobStore.logSegmentsNotInJournal.subList(secondBestCandidateIndexes.getFirst(),
                       secondBestCandidateIndexes.getSecond() + 1), bestCost + 1);
-              List<String> secondBestCandidate =
+              List<LogSegmentName> secondBestCandidate =
                   blobStore.logSegmentsNotInJournal.subList(secondBestCandidateIndexes.getFirst(),
                       secondBestCandidateIndexes.getSecond() + 1);
               mockBlobStoreStats.validDataSizeByLogSegments = validDataSize;
               // ensure that the best remains the best as it has the lowest cost benefit ratio
               CompactionPolicyTest.verifyCompactionDetails(
-                  new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates), blobStore,
+                  new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates, null), blobStore,
                   compactionPolicy);
               // set cost benefit of 2nd best to 1 less than the best candidate's cost benefit ratio
               CompactionPolicyTest.updateValidDataSize(validDataSize,
@@ -105,7 +105,7 @@ public class StatsBasedCompactionPolicyTest {
               mockBlobStoreStats.validDataSizeByLogSegments = validDataSize;
               // ensure that the 2nd best is now the best candidate to compact
               CompactionPolicyTest.verifyCompactionDetails(
-                  new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, secondBestCandidate), blobStore,
+                  new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, secondBestCandidate, null), blobStore,
                   compactionPolicy);
             }
           } else {
@@ -128,13 +128,13 @@ public class StatsBasedCompactionPolicyTest {
     blobStore.logSegmentsNotInJournal = CompactionPolicyTest.generateRandomLogSegmentName((int) logSegmentCount);
     for (int i = 0; i < logSegmentCount; i++) {
       for (int j = i; j < logSegmentCount; j++) {
-        List<String> bestCandidates = blobStore.logSegmentsNotInJournal.subList(i, j + 1);
-        NavigableMap<String, Long> validDataSize =
+        List<LogSegmentName> bestCandidates = blobStore.logSegmentsNotInJournal.subList(i, j + 1);
+        NavigableMap<LogSegmentName, Long> validDataSize =
             CompactionPolicyTest.generateValidDataSize(blobStore.logSegmentsNotInJournal, bestCandidates, 0,
                 maxLogSegmentCapacity);
         mockBlobStoreStats.validDataSizeByLogSegments = validDataSize;
         CompactionPolicyTest.verifyCompactionDetails(
-            new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates), blobStore,
+            new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates, null), blobStore,
             compactionPolicy);
       }
     }
@@ -151,15 +151,15 @@ public class StatsBasedCompactionPolicyTest {
     blobStore.logSegmentsNotInJournal = CompactionPolicyTest.generateRandomLogSegmentName((int) logSegmentCount);
 
     // case 1: 1st best(index_0 to index_3) is in journal, 2nd not in journal
-    List<String> bestCandidates = blobStore.logSegmentsNotInJournal.subList(0, 4);
+    List<LogSegmentName> bestCandidates = blobStore.logSegmentsNotInJournal.subList(0, 4);
     long bestCost = maxLogSegmentCapacity / bestCandidates.size();
     // this best cost is to ensure that no of segments reclaimed will be "bestCandidates" count - 1
-    NavigableMap<String, Long> validDataSize =
+    NavigableMap<LogSegmentName, Long> validDataSize =
         CompactionPolicyTest.generateValidDataSize(blobStore.logSegmentsNotInJournal, bestCandidates, bestCost,
             maxLogSegmentCapacity);
     mockBlobStoreStats.validDataSizeByLogSegments = validDataSize;
     CompactionPolicyTest.verifyCompactionDetails(
-        new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates), blobStore,
+        new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates, null), blobStore,
         compactionPolicy);
     Pair<Integer, Integer> bestCandidateIndexes = new Pair<>(0, 3);
     Pair<Integer, Integer> secondBestCandidateIndexes =
@@ -174,7 +174,7 @@ public class StatsBasedCompactionPolicyTest {
     // ensure that the 1st best is now the best candidate to compact even though 2nd best's cost benefit ratio
     // is the lowest
     CompactionPolicyTest.verifyCompactionDetails(
-        new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates), blobStore,
+        new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates, null), blobStore,
         compactionPolicy);
 
     // case 2: only one potential candidate(index_5 to index_7) to compact which is overlaps with the journal
@@ -201,7 +201,7 @@ public class StatsBasedCompactionPolicyTest {
     blobStore.logSegmentsNotInJournal = blobStore.logSegmentsNotInJournal.subList(0, 5);
     // expected best candidate = index2 to index_4 which is first 3 entries in the actual best candidate
     CompactionPolicyTest.verifyCompactionDetails(
-        new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates.subList(0, 3)), blobStore,
+        new CompactionDetails(time.milliseconds() - messageRetentionTimeInMs, bestCandidates.subList(0, 3), null), blobStore,
         compactionPolicy);
   }
 

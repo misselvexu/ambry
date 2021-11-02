@@ -16,6 +16,7 @@ package com.github.ambry.rest;
 import com.github.ambry.account.AccountService;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.quota.QuotaManager;
 import com.github.ambry.router.Router;
 
 

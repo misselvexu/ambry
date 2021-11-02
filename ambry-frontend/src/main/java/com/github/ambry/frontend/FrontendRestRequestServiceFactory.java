@@ -14,15 +14,18 @@
 package com.github.ambry.frontend;
 
 import com.github.ambry.account.AccountService;
+import com.github.ambry.accountstats.AccountStatsStore;
+import com.github.ambry.accountstats.AccountStatsStoreFactory;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.FrontendConfig;
-import com.github.ambry.config.StorageQuotaConfig;
+import com.github.ambry.config.QuotaConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.named.NamedBlobDb;
 import com.github.ambry.named.NamedBlobDbFactory;
-import com.github.ambry.quota.StorageQuotaService;
-import com.github.ambry.quota.StorageQuotaServiceFactory;
+import com.github.ambry.quota.MaxThrottlePolicy;
+import com.github.ambry.quota.QuotaManager;
+import com.github.ambry.quota.QuotaManagerFactory;
 import com.github.ambry.rest.RestRequestService;
 import com.github.ambry.rest.RestRequestServiceFactory;
 import com.github.ambry.router.Router;
@@ -39,6 +42,7 @@ import org.slf4j.LoggerFactory;
  * instance on {@link #getRestRequestService()}.
  */
 public class FrontendRestRequestServiceFactory implements RestRequestServiceFactory {
+  private static final Logger logger = LoggerFactory.getLogger(FrontendRestRequestServiceFactory.class);
   private final FrontendConfig frontendConfig;
   private final FrontendMetrics frontendMetrics;
   private final VerifiableProperties verifiableProperties;
@@ -46,7 +50,6 @@ public class FrontendRestRequestServiceFactory implements RestRequestServiceFact
   private final ClusterMapConfig clusterMapConfig;
   private final Router router;
   private final AccountService accountService;
-  private static final Logger logger = LoggerFactory.getLogger(FrontendRestRequestServiceFactory.class);
 
   /**
    * Creates a new instance of FrontendRestRequestServiceFactory.
@@ -78,8 +81,8 @@ public class FrontendRestRequestServiceFactory implements RestRequestServiceFact
       IdSigningService idSigningService =
           Utils.<IdSigningServiceFactory>getObj(frontendConfig.idSigningServiceFactory, verifiableProperties,
               clusterMap.getMetricRegistry()).getIdSigningService();
-      NamedBlobDb namedBlobDb = Utils.isNullOrEmpty(frontendConfig.namedBlobDbFactory) ? null :
-          Utils.<NamedBlobDbFactory>getObj(frontendConfig.namedBlobDbFactory, verifiableProperties,
+      NamedBlobDb namedBlobDb = Utils.isNullOrEmpty(frontendConfig.namedBlobDbFactory) ? null
+          : Utils.<NamedBlobDbFactory>getObj(frontendConfig.namedBlobDbFactory, verifiableProperties,
               clusterMap.getMetricRegistry(), accountService).getNamedBlobDb();
       IdConverterFactory idConverterFactory =
           Utils.getObj(frontendConfig.idConverterFactory, verifiableProperties, clusterMap.getMetricRegistry(),
@@ -89,20 +92,20 @@ public class FrontendRestRequestServiceFactory implements RestRequestServiceFact
               clusterMap.getMetricRegistry()).getUrlSigningService();
       AccountAndContainerInjector accountAndContainerInjector =
           new AccountAndContainerInjector(accountService, frontendMetrics, frontendConfig);
+      AccountStatsStore accountStatsStore =
+          Utils.<AccountStatsStoreFactory>getObj(frontendConfig.accountStatsStoreFactory, verifiableProperties,
+              clusterMapConfig, clusterMap.getMetricRegistry()).getAccountStatsStore();
+      QuotaConfig quotaConfig = new QuotaConfig(verifiableProperties);
+      QuotaManager quotaManager = ((QuotaManagerFactory) Utils.getObj(quotaConfig.quotaManagerFactory, quotaConfig,
+          new MaxThrottlePolicy(quotaConfig), accountService, accountStatsStore,
+          clusterMap.getMetricRegistry())).getQuotaManager();
       SecurityServiceFactory securityServiceFactory =
           Utils.getObj(frontendConfig.securityServiceFactory, verifiableProperties, clusterMap, accountService,
-              urlSigningService, idSigningService, accountAndContainerInjector);
-      StorageQuotaService storageQuotaService = null;
-      if (frontendConfig.enableStorageQuotaService) {
-        StorageQuotaConfig storageQuotaConfig = new StorageQuotaConfig(verifiableProperties);
-        storageQuotaService =
-            Utils.<StorageQuotaServiceFactory>getObj(frontendConfig.storageQuotaServiceFactory, storageQuotaConfig,
-                clusterMap.getMetricRegistry()).getStorageQuotaService();
-      }
+              urlSigningService, idSigningService, accountAndContainerInjector, quotaManager);
       return new FrontendRestRequestService(frontendConfig, frontendMetrics, router, clusterMap, idConverterFactory,
-          securityServiceFactory, urlSigningService, idSigningService, accountService, accountAndContainerInjector,
-          clusterMapConfig.clusterMapDatacenterName, clusterMapConfig.clusterMapHostName,
-          clusterMapConfig.clusterMapClusterName, storageQuotaService);
+          securityServiceFactory, urlSigningService, idSigningService, namedBlobDb, accountService,
+          accountAndContainerInjector, clusterMapConfig.clusterMapDatacenterName, clusterMapConfig.clusterMapHostName,
+          clusterMapConfig.clusterMapClusterName, accountStatsStore, quotaManager);
     } catch (Exception e) {
       throw new IllegalStateException("Could not instantiate FrontendRestRequestService", e);
     }

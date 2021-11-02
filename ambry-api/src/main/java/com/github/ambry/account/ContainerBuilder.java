@@ -13,6 +13,9 @@
  */
 package com.github.ambry.account;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.annotation.JsonPOJOBuilder;
 import java.util.Set;
 
 import static com.github.ambry.account.Container.*;
@@ -24,13 +27,15 @@ import static com.github.ambry.account.Container.*;
  * in two ways: 1) from an existing {@link Container} object; and 2) by supplying required fields of a {@link Container}.
  * This class is not thread safe.
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonPOJOBuilder(withPrefix = "set")
 public class ContainerBuilder {
   // necessary
-  private short id;
-  private String name;
-  private ContainerStatus status;
-  private String description;
-  private short parentAccountId;
+  private Short id = null;
+  private String name = null;
+  private ContainerStatus status = null;
+  private Short parentAccountId = null;
+  private String description = "";
 
   // optional
   private long deleteTriggerTime = CONTAINER_DELETE_TRIGGER_TIME_DEFAULT_VALUE;
@@ -41,6 +46,8 @@ public class ContainerBuilder {
   private String replicationPolicy = null;
   private boolean ttlRequired = TTL_REQUIRED_DEFAULT_VALUE;
   private boolean securePathRequired = SECURE_PATH_REQUIRED_DEFAULT_VALUE;
+  private boolean overrideAccountAcl = OVERRIDE_ACCOUNT_ACL_DEFAULT_VALUE;
+  private NamedBlobMode namedBlobMode = NAMED_BLOB_MODE_DEFAULT_VALUE;
   private Set<String> contentTypeWhitelistForFilenamesOnDownload =
       CONTENT_TYPE_WHITELIST_FOR_FILENAMES_ON_DOWNLOAD_DEFAULT_VALUE;
   private boolean backupEnabled = BACKUP_ENABLED_DEFAULT_VALUE;
@@ -70,10 +77,18 @@ public class ContainerBuilder {
     ttlRequired = origin.isTtlRequired();
     parentAccountId = origin.getParentAccountId();
     securePathRequired = origin.isSecurePathRequired();
+    overrideAccountAcl = origin.isAccountAclOverridden();
+    namedBlobMode = origin.getNamedBlobMode();
     contentTypeWhitelistForFilenamesOnDownload = origin.getContentTypeWhitelistForFilenamesOnDownload();
     backupEnabled = origin.isBackupEnabled();
     lastModifiedTime = origin.getLastModifiedTime();
     snapshotVersion = origin.getSnapshotVersion();
+  }
+
+  /**
+   * Constructor for jackson to deserialize {@link Container}.
+   */
+  public ContainerBuilder() {
   }
 
   /**
@@ -97,6 +112,7 @@ public class ContainerBuilder {
    * @param id The ID to set.
    * @return This builder.
    */
+  @JsonProperty(CONTAINER_ID_KEY)
   public ContainerBuilder setId(short id) {
     this.id = id;
     return this;
@@ -107,6 +123,7 @@ public class ContainerBuilder {
    * @param name The name to set.
    * @return This builder.
    */
+  @JsonProperty(CONTAINER_NAME_KEY)
   public ContainerBuilder setName(String name) {
     this.name = name;
     return this;
@@ -243,6 +260,26 @@ public class ContainerBuilder {
   }
 
   /**
+   * Sets whether to override account-level ACL in this container.
+   * @param overrideAccountAcl the boolean value indicating whether this container overrides account's ACL.
+   * @return This builder.
+   */
+  public ContainerBuilder setOverrideAccountAcl(boolean overrideAccountAcl) {
+    this.overrideAccountAcl = overrideAccountAcl;
+    return this;
+  }
+
+  /**
+   * Sets the named blob API mode for the container.
+   * @param namedBlobMode the {@link NamedBlobMode} to set.
+   * @return This builder.
+   */
+  public ContainerBuilder setNamedBlobMode(NamedBlobMode namedBlobMode) {
+    this.namedBlobMode = namedBlobMode;
+    return this;
+  }
+
+  /**
    * Sets the created/modified time of the {@link Container}
    * @param lastModifiedTime epoch time in milliseconds.
    * @return This builder.
@@ -269,9 +306,13 @@ public class ContainerBuilder {
    * @throws IllegalStateException If any required fields is not set.
    */
   public Container build() {
+    if (id == null) {
+      throw new IllegalStateException("Container id or container name is not present");
+    }
     return new Container(id, name, status, description, encrypted, previouslyEncrypted || encrypted, cacheable,
         mediaScanDisabled, replicationPolicy, ttlRequired, securePathRequired,
-        contentTypeWhitelistForFilenamesOnDownload, backupEnabled, parentAccountId, deleteTriggerTime, lastModifiedTime,
+        contentTypeWhitelistForFilenamesOnDownload, backupEnabled, overrideAccountAcl, namedBlobMode,
+        parentAccountId == null ? UNKNOWN_CONTAINER_PARENT_ACCOUNT_ID : parentAccountId.shortValue(), deleteTriggerTime, lastModifiedTime,
         snapshotVersion);
   }
 }

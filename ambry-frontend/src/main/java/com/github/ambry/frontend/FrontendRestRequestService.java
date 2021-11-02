@@ -18,21 +18,24 @@ import com.github.ambry.account.AccountService;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
+import com.github.ambry.commons.Callback;
 import com.github.ambry.config.FrontendConfig;
 import com.github.ambry.messageformat.BlobInfo;
+import com.github.ambry.named.NamedBlobDb;
 import com.github.ambry.protocol.GetOption;
-import com.github.ambry.quota.StorageQuotaService;
-import com.github.ambry.rest.RestRequestService;
+import com.github.ambry.quota.QuotaChargeCallback;
+import com.github.ambry.quota.QuotaManager;
 import com.github.ambry.rest.RequestPath;
 import com.github.ambry.rest.ResponseStatus;
 import com.github.ambry.rest.RestMethod;
 import com.github.ambry.rest.RestRequest;
 import com.github.ambry.rest.RestRequestMetrics;
+import com.github.ambry.rest.RestRequestService;
 import com.github.ambry.rest.RestResponseChannel;
 import com.github.ambry.rest.RestResponseHandler;
 import com.github.ambry.rest.RestServiceErrorCode;
 import com.github.ambry.rest.RestServiceException;
-import com.github.ambry.commons.Callback;
+import com.github.ambry.rest.RestUtils;
 import com.github.ambry.router.GetBlobOptions;
 import com.github.ambry.router.GetBlobOptionsBuilder;
 import com.github.ambry.router.GetBlobResult;
@@ -40,6 +43,7 @@ import com.github.ambry.router.ReadableStreamChannel;
 import com.github.ambry.router.Router;
 import com.github.ambry.router.RouterErrorCode;
 import com.github.ambry.router.RouterException;
+import com.github.ambry.accountstats.AccountStatsStore;
 import com.github.ambry.utils.AsyncOperationTracker;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.ThrowingConsumer;
@@ -62,7 +66,6 @@ class FrontendRestRequestService implements RestRequestService {
   static final String TTL_UPDATE_REJECTED_ALLOW_HEADER_VALUE = "GET,HEAD,DELETE";
 
   private static final ByteBuffer EMPTY_BUFFER = ByteBuffer.allocate(0);
-  private static final String NAMED_BLOB_PREFIX = "/named";
 
   private static final String OPERATION_TYPE_INBOUND_ID_CONVERSION = "Inbound Id Conversion";
   private static final String OPERATION_TYPE_GET_RESPONSE_SECURITY = "GET Response Security";
@@ -79,8 +82,10 @@ class FrontendRestRequestService implements RestRequestService {
   private final GetReplicasHandler getReplicasHandler;
   private final UrlSigningService urlSigningService;
   private final IdSigningService idSigningService;
+  private final NamedBlobDb namedBlobDb;
   private final AccountService accountService;
   private final AccountAndContainerInjector accountAndContainerInjector;
+  private final AccountStatsStore accountStatsStore;
   private static final Logger logger = LoggerFactory.getLogger(FrontendRestRequestService.class);
   private final String datacenterName;
   private final String hostname;
@@ -90,6 +95,7 @@ class FrontendRestRequestService implements RestRequestService {
   private SecurityService securityService = null;
   private GetPeersHandler getPeersHandler;
   private GetSignedUrlHandler getSignedUrlHandler;
+  private NamedBlobListHandler listNamedBlobsHandler;
   private PostBlobHandler postBlobHandler;
   private NamedBlobPutHandler namedBlobPutHandler;
   private TtlUpdateHandler ttlUpdateHandler;
@@ -97,6 +103,8 @@ class FrontendRestRequestService implements RestRequestService {
   private GetClusterMapSnapshotHandler getClusterMapSnapshotHandler;
   private GetAccountsHandler getAccountsHandler;
   private PostAccountsHandler postAccountsHandler;
+  private GetStatsReportHandler getStatsReportHandler;
+  private QuotaManager quotaManager;
   private boolean isUp = false;
 
   /**
@@ -110,18 +118,19 @@ class FrontendRestRequestService implements RestRequestService {
    * @param securityServiceFactory the {@link SecurityServiceFactory} to use to get an {@link SecurityService} instance.
    * @param urlSigningService the {@link UrlSigningService} used to sign URLs.
    * @param idSigningService the {@link IdSigningService} used to sign and verify IDs.
+   * @param namedBlobDb the {@link NamedBlobDb} for named blob metadata operations.
    * @param accountService the {@link AccountService} to use.
    * @param accountAndContainerInjector the {@link AccountAndContainerInjector} to use.
    * @param datacenterName the local datacenter name for this frontend.
    * @param hostname the hostname for this frontend.
    * @param clusterName the name of the storage cluster that the router communicates with.
-   * @param storageQuotaService the {@link StorageQuotaService} used to throttle traffics.
+   * @param accountStatsStore the {@link AccountStatsStore} used to fetch aggregated stats reports.
    */
   FrontendRestRequestService(FrontendConfig frontendConfig, FrontendMetrics frontendMetrics, Router router,
       ClusterMap clusterMap, IdConverterFactory idConverterFactory, SecurityServiceFactory securityServiceFactory,
-      UrlSigningService urlSigningService, IdSigningService idSigningService, AccountService accountService,
-      AccountAndContainerInjector accountAndContainerInjector, String datacenterName, String hostname,
-      String clusterName, StorageQuotaService storageQuotaService) {
+      UrlSigningService urlSigningService, IdSigningService idSigningService, NamedBlobDb namedBlobDb,
+      AccountService accountService, AccountAndContainerInjector accountAndContainerInjector, String datacenterName,
+      String hostname, String clusterName, AccountStatsStore accountStatsStore, QuotaManager quotaManager) {
     this.frontendConfig = frontendConfig;
     this.frontendMetrics = frontendMetrics;
     this.router = router;
@@ -130,10 +139,13 @@ class FrontendRestRequestService implements RestRequestService {
     this.securityServiceFactory = securityServiceFactory;
     this.urlSigningService = urlSigningService;
     this.idSigningService = idSigningService;
+    this.namedBlobDb = namedBlobDb;
     this.accountService = accountService;
     this.accountAndContainerInjector = accountAndContainerInjector;
+    this.accountStatsStore = accountStatsStore;
     this.datacenterName = datacenterName;
     this.hostname = hostname;
+    this.quotaManager = quotaManager;
     this.clusterName = clusterName.toLowerCase();
     getReplicasHandler = new GetReplicasHandler(frontendMetrics, clusterMap);
     logger.trace("Instantiated FrontendRestRequestService");
@@ -153,26 +165,30 @@ class FrontendRestRequestService implements RestRequestService {
       throw new InstantiationException("ResponseHandler is not set.");
     }
     long startupBeginTime = System.currentTimeMillis();
+    quotaManager.init();
     idConverter = idConverterFactory.getIdConverter();
     securityService = securityServiceFactory.getSecurityService();
     getPeersHandler = new GetPeersHandler(clusterMap, securityService, frontendMetrics);
     getSignedUrlHandler =
         new GetSignedUrlHandler(urlSigningService, securityService, idConverter, accountAndContainerInjector,
             frontendMetrics, clusterMap);
+    listNamedBlobsHandler =
+        new NamedBlobListHandler(securityService, namedBlobDb, accountAndContainerInjector, frontendMetrics);
     postBlobHandler =
         new PostBlobHandler(securityService, idConverter, idSigningService, router, accountAndContainerInjector,
-            SystemTime.getInstance(), frontendConfig, frontendMetrics, clusterName);
+            SystemTime.getInstance(), frontendConfig, frontendMetrics, clusterName, quotaManager);
     namedBlobPutHandler =
         new NamedBlobPutHandler(securityService, idConverter, idSigningService, router, accountAndContainerInjector,
-            frontendConfig, frontendMetrics, clusterName);
+            frontendConfig, frontendMetrics, clusterName, quotaManager);
     ttlUpdateHandler =
         new TtlUpdateHandler(router, securityService, idConverter, accountAndContainerInjector, frontendMetrics,
-            clusterMap);
+            clusterMap, quotaManager);
     undeleteHandler =
         new UndeleteHandler(router, securityService, idConverter, accountAndContainerInjector, frontendMetrics,
-            clusterMap);
+            clusterMap, quotaManager);
     getClusterMapSnapshotHandler = new GetClusterMapSnapshotHandler(securityService, frontendMetrics, clusterMap);
     getAccountsHandler = new GetAccountsHandler(securityService, accountService, frontendMetrics);
+    getStatsReportHandler = new GetStatsReportHandler(securityService, frontendMetrics, accountStatsStore);
     postAccountsHandler = new PostAccountsHandler(securityService, accountService, frontendConfig, frontendMetrics);
     isUp = true;
     logger.info("FrontendRestRequestService has started");
@@ -184,6 +200,10 @@ class FrontendRestRequestService implements RestRequestService {
     long shutdownBeginTime = System.currentTimeMillis();
     isUp = false;
     try {
+      if (quotaManager != null) {
+        quotaManager.shutdown();
+        quotaManager = null;
+      }
       if (securityService != null) {
         securityService.close();
         securityService = null;
@@ -191,6 +211,9 @@ class FrontendRestRequestService implements RestRequestService {
       if (idConverter != null) {
         idConverter.close();
         idConverter = null;
+      }
+      if (accountStatsStore != null) {
+        accountStatsStore.shutdown();
       }
       logger.info("FrontendRestRequestService shutdown complete");
     } catch (IOException e) {
@@ -215,6 +238,13 @@ class FrontendRestRequestService implements RestRequestService {
       } else if (requestPath.matchesOperation(Operations.ACCOUNTS)) {
         getAccountsHandler.handle(restRequest, restResponseChannel,
             (result, exception) -> submitResponse(restRequest, restResponseChannel, result, exception));
+      } else if (requestPath.matchesOperation(Operations.STATS_REPORT)) {
+        getStatsReportHandler.handle(restRequest, restResponseChannel,
+            (result, exception) -> submitResponse(restRequest, restResponseChannel, result, exception));
+      } else if (requestPath.matchesOperation(Operations.NAMED_BLOB)
+          && NamedBlobPath.parse(requestPath, restRequest.getArgs()).getBlobName() == null) {
+        listNamedBlobsHandler.handle(restRequest, restResponseChannel,
+            ((result, exception) -> submitResponse(restRequest, restResponseChannel, result, exception)));
       } else {
         SubResource subResource = requestPath.getSubResource();
         GetBlobOptions options = buildGetBlobOptions(restRequest.getArgs(), subResource,
@@ -225,9 +255,13 @@ class FrontendRestRequestService implements RestRequestService {
         if (subResource == SubResource.Replicas) {
           securityCallback = new SecurityProcessRequestCallback(restRequest, restResponseChannel);
         }
-        RestRequestMetrics restRequestMetrics =
-            getMetricsGroupForGet(frontendMetrics, subResource).getRestRequestMetrics(restRequest.isSslUsed(), false);
+        RestRequestMetricsGroup metricsGroup = getMetricsGroupForGet(frontendMetrics, subResource);
+        RestRequestMetrics restRequestMetrics = metricsGroup.getRestRequestMetrics(restRequest.isSslUsed(), false);
         restRequest.getMetricsTracker().injectMetrics(restRequestMetrics);
+        // named blob requests have their account/container in the URI, so checks can be done prior to ID conversion.
+        if (requestPath.matchesOperation(Operations.NAMED_BLOB)) {
+          accountAndContainerInjector.injectAccountAndContainerForNamedBlob(restRequest, metricsGroup);
+        }
         securityService.processRequest(restRequest, securityCallback);
       }
     };
@@ -268,7 +302,7 @@ class FrontendRestRequestService implements RestRequestService {
         undeleteHandler.handle(restRequest, restResponseChannel, (r, e) -> {
           submitResponse(restRequest, restResponseChannel, null, e);
         });
-      } else if (requestPath.getOperationOrBlobId(false).startsWith(NAMED_BLOB_PREFIX)) {
+      } else if (requestPath.matchesOperation(Operations.NAMED_BLOB)) {
         restRequest.setArg(SEND_FAILURE_REASON, Boolean.TRUE);
         namedBlobPutHandler.handle(restRequest, restResponseChannel,
             (r, e) -> submitResponse(restRequest, restResponseChannel, null, e));
@@ -286,6 +320,11 @@ class FrontendRestRequestService implements RestRequestService {
       RestRequestMetrics requestMetrics =
           frontendMetrics.deleteBlobMetricsGroup.getRestRequestMetrics(restRequest.isSslUsed(), false);
       restRequest.getMetricsTracker().injectMetrics(requestMetrics);
+      // named blob requests have their account/container in the URI, so checks can be done prior to ID conversion.
+      if (requestPath.matchesOperation(Operations.NAMED_BLOB)) {
+        accountAndContainerInjector.injectAccountAndContainerForNamedBlob(restRequest,
+            frontendMetrics.deleteBlobMetricsGroup);
+      }
       DeleteCallback routerCallback = new DeleteCallback(restRequest, restResponseChannel);
       SecurityProcessRequestCallback securityCallback =
           new SecurityProcessRequestCallback(restRequest, restResponseChannel, routerCallback);
@@ -301,6 +340,11 @@ class FrontendRestRequestService implements RestRequestService {
       RestRequestMetrics requestMetrics =
           frontendMetrics.headBlobMetricsGroup.getRestRequestMetrics(restRequest.isSslUsed(), false);
       restRequest.getMetricsTracker().injectMetrics(requestMetrics);
+      // named blob requests have their account/container in the URI, so checks can be done prior to ID conversion.
+      if (requestPath.matchesOperation(Operations.NAMED_BLOB)) {
+        accountAndContainerInjector.injectAccountAndContainerForNamedBlob(restRequest,
+            frontendMetrics.headBlobMetricsGroup);
+      }
       HeadCallback routerCallback = new HeadCallback(restRequest, restResponseChannel);
       SecurityProcessRequestCallback securityCallback =
           new SecurityProcessRequestCallback(restRequest, restResponseChannel, routerCallback);
@@ -343,7 +387,7 @@ class FrontendRestRequestService implements RestRequestService {
       frontendMetrics.optionsSecurityResponseTimeInMs.update(
           securityResponseProcessingEndTime - securityRequestProcessingEndTime);
     } catch (Exception e) {
-      exception = Utils.extractExecutionExceptionCause(e);
+      exception = Utils.extractFutureExceptionCause(e);
     }
     submitResponse(restRequest, restResponseChannel, null, exception);
   }
@@ -533,7 +577,10 @@ class FrontendRestRequestService implements RestRequestService {
           } else if (deleteCallback != null) {
             metricsGroup = frontendMetrics.deleteBlobMetricsGroup;
           }
-          accountAndContainerInjector.injectTargetAccountAndContainerFromBlobId(blobId, restRequest, metricsGroup);
+          // named blobs already have their account/container arguments set by handleGet/handleHead/handleDelete
+          if (!RestUtils.getRequestPath(restRequest).matchesOperation(Operations.NAMED_BLOB)) {
+            accountAndContainerInjector.injectTargetAccountAndContainerFromBlobId(blobId, restRequest, metricsGroup);
+          }
           securityService.postProcessRequest(restRequest,
               securityPostProcessRequestCallback(result, restRequest, restResponseChannel, getCallback, headCallback,
                   deleteCallback));
@@ -645,7 +692,7 @@ class FrontendRestRequestService implements RestRequestService {
               exception = new IllegalStateException("Unrecognized RestMethod: " + restMethod);
           }
         } catch (Exception e) {
-          exception = Utils.extractExecutionExceptionCause(e);
+          exception = Utils.extractFutureExceptionCause(e);
         }
       }
 
@@ -705,14 +752,16 @@ class FrontendRestRequestService implements RestRequestService {
           }
           if (subResource == null) {
             getCallback.markStartTime();
-            router.getBlob(convertedId, getCallback.options, getCallback);
+            router.getBlob(convertedId, getCallback.options, getCallback,
+                QuotaChargeCallback.buildQuotaChargeCallback(restRequest, quotaManager, true));
           } else {
             switch (subResource) {
               case BlobInfo:
               case UserMetadata:
               case Segment:
                 getCallback.markStartTime();
-                router.getBlob(convertedId, getCallback.options, getCallback);
+                router.getBlob(convertedId, getCallback.options, getCallback,
+                    QuotaChargeCallback.buildQuotaChargeCallback(restRequest, quotaManager, true));
                 break;
               case Replicas:
                 response = getReplicasHandler.getReplicas(convertedId, restResponseChannel);
@@ -731,11 +780,13 @@ class FrontendRestRequestService implements RestRequestService {
           headCallback.markStartTime();
           router.getBlob(convertedId, new GetBlobOptionsBuilder().operationType(GetBlobOptions.OperationType.BlobInfo)
               .getOption(getOption)
-              .build(), headCallback);
+              .build(), headCallback,
+              QuotaChargeCallback.buildQuotaChargeCallback(restRequest, quotaManager, false));
           break;
         case DELETE:
           deleteCallback.markStartTime();
-          router.deleteBlob(convertedId, getHeader(restRequest.getArgs(), Headers.SERVICE_ID, false), deleteCallback);
+          router.deleteBlob(convertedId, getHeader(restRequest.getArgs(), Headers.SERVICE_ID, false), deleteCallback,
+              QuotaChargeCallback.buildQuotaChargeCallback(restRequest, quotaManager, false));
           break;
         default:
           throw new IllegalStateException("Unrecognized RestMethod: " + restMethod);
@@ -816,8 +867,7 @@ class FrontendRestRequestService implements RestRequestService {
      * @param restRequest the {@link RestRequest} for whose response this is a callback.
      * @param restResponseChannel the {@link RestResponseChannel} to set headers on.
      * @param subResource the sub-resource requested.
-     * @param options the {@link GetBlobOptions} associated with the
-     *                {@link Router#getBlob(String, GetBlobOptions, Callback)} call.
+     * @param options the {@link GetBlobOptions} associated with the {@link Router#getBlob(String, GetBlobOptions, Callback)} call.
      */
     GetCallback(RestRequest restRequest, RestResponseChannel restResponseChannel, SubResource subResource,
         GetBlobOptions options) {
@@ -891,6 +941,7 @@ class FrontendRestRequestService implements RestRequestService {
         routerException = e;
       } finally {
         if (routerException != null) {
+          securityService.processRequestCharges(restRequest, restResponseChannel, null);
           submitResponse(restRequest, restResponseChannel,
               routerResult != null ? routerResult.getBlobDataChannel() : null, routerException);
         }
@@ -947,6 +998,7 @@ class FrontendRestRequestService implements RestRequestService {
         frontendMetrics.deleteCallbackProcessingError.inc();
         routerException = e;
       } finally {
+        securityService.processRequestCharges(restRequest, restResponseChannel, null);
         submitResponse(restRequest, restResponseChannel, null, routerException);
         callbackTracker.markCallbackProcessingEnd();
       }

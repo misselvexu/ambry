@@ -36,6 +36,7 @@ public class Http2ClientConfig {
   public static final String HTTP2_BLOCKING_CHANNEL_RECEIVE_TIMEOUT_MS = "http2.blocking.channel.receive.timeout.ms";
   public static final String HTTP2_BLOCKING_CHANNEL_POOL_SHUTDOWN_TIMEOUT_MS =
       "http2.blocking.channel.pool.shutdown.timeout.ms";
+  public static final String HTTP2_PEER_CERTIFICATE_SAN_REGEX = "http2.peer.certificate.san.regex";
 
   /**
    * HTTP/2 connection idle time before we close it. -1 means no idle close.
@@ -133,14 +134,14 @@ public class Http2ClientConfig {
    * Maximum time allowed for netty write and flush a request.
    */
   @Config(HTTP2_BLOCKING_CHANNEL_SEND_TIMEOUT_MS)
-  @Default("2000")
+  @Default("5000")
   public final int http2BlockingChannelSendTimeoutMs;
 
   /**
    * Maximum waiting time for receiving a response.
    */
   @Config(HTTP2_BLOCKING_CHANNEL_RECEIVE_TIMEOUT_MS)
-  @Default("5000")
+  @Default("10000")
   public final int http2BlockingChannelReceiveTimeoutMs;
 
   /**
@@ -149,6 +150,13 @@ public class Http2ClientConfig {
   @Config(HTTP2_BLOCKING_CHANNEL_POOL_SHUTDOWN_TIMEOUT_MS)
   @Default("3000")
   public final int http2BlockingChannelPoolShutdownTimeoutMs;
+
+  /**
+   * The expected subject alternative name within the server SSL certificate
+   */
+  @Config(HTTP2_PEER_CERTIFICATE_SAN_REGEX)
+  @Default("")
+  public final String http2PeerCertificateSanRegex;
 
   public Http2ClientConfig(VerifiableProperties verifiableProperties) {
     idleConnectionTimeoutMs = verifiableProperties.getLong(HTTP2_IDLE_CONNECTION_TIMEOUT_MS, -1);
@@ -172,5 +180,7 @@ public class Http2ClientConfig {
     http2BlockingChannelReceiveTimeoutMs = verifiableProperties.getInt(HTTP2_BLOCKING_CHANNEL_RECEIVE_TIMEOUT_MS, 5000);
     http2BlockingChannelPoolShutdownTimeoutMs =
         verifiableProperties.getInt(HTTP2_BLOCKING_CHANNEL_POOL_SHUTDOWN_TIMEOUT_MS, 3000);
+    http2PeerCertificateSanRegex =
+        verifiableProperties.getString(HTTP2_PEER_CERTIFICATE_SAN_REGEX, "");
   }
 }

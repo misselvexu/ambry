@@ -39,13 +39,13 @@ public class CompactionDetailsTest {
   @Test
   public void serDeTest() throws IOException {
     int segmentCount = TestUtils.RANDOM.nextInt(10) + 1;
-    List<String> segmentsUnderCompaction = new ArrayList<>();
+    List<LogSegmentName> segmentsUnderCompaction = new ArrayList<>();
     for (int i = 0; i < segmentCount; i++) {
-      int stringSize = TestUtils.RANDOM.nextInt(10) + 1;
-      segmentsUnderCompaction.add(TestUtils.getRandomString(stringSize));
+      LogSegmentName segmentName = StoreTestUtils.getRandomLogSegmentName(segmentsUnderCompaction);
+      segmentsUnderCompaction.add(segmentName);
     }
     long referenceTime = SystemTime.getInstance().milliseconds();
-    CompactionDetails details = new CompactionDetails(referenceTime, segmentsUnderCompaction);
+    CompactionDetails details = new CompactionDetails(referenceTime, segmentsUnderCompaction, null);
     DataInputStream stream = new DataInputStream(new ByteArrayInputStream(details.toBytes()));
     verifyEquality(details, CompactionDetails.fromBytes(stream));
   }
@@ -56,11 +56,12 @@ public class CompactionDetailsTest {
    */
   @Test
   public void badInputTest() throws Exception {
-    List<String> segmentsUnderCompaction = Collections.singletonList(TestUtils.getRandomString(10));
+    List<LogSegmentName> segmentsUnderCompaction =
+        Collections.singletonList(LogSegmentName.generateFirstSegmentName(true));
 
     // details contains no segments
     try {
-      new CompactionDetails(1, Collections.EMPTY_LIST);
+      new CompactionDetails(1, Collections.emptyList(), null);
       fail("Should have failed because there were no log segments to compact");
     } catch (IllegalArgumentException e) {
       // expected. Nothing to do.
@@ -68,14 +69,14 @@ public class CompactionDetailsTest {
 
     // details has a negative ref time.
     try {
-      new CompactionDetails(-1, segmentsUnderCompaction);
+      new CompactionDetails(-1, segmentsUnderCompaction, null);
       fail("Should have failed because reference time is < 0");
     } catch (IllegalArgumentException e) {
       // expected. Nothing to do.
     }
 
     // 0 ref time is ok.
-    new CompactionDetails(0, segmentsUnderCompaction);
+    new CompactionDetails(0, segmentsUnderCompaction, null);
   }
 
   /**

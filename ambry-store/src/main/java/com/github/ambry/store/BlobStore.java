@@ -26,6 +26,7 @@ import com.github.ambry.messageformat.TtlUpdateMessageFormatInputStream;
 import com.github.ambry.messageformat.UndeleteMessageFormatInputStream;
 import com.github.ambry.replication.FindToken;
 import com.github.ambry.utils.FileLock;
+import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
 import java.io.File;
@@ -42,13 +43,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static com.github.ambry.clustermap.VcrClusterParticipant.*;
 
 
 /**
@@ -62,6 +64,7 @@ public class BlobStore implements Store {
 
   private final String storeId;
   private final String dataDir;
+  private final DiskMetrics diskMetrics;
   private final ScheduledExecutorService taskScheduler;
   private final ScheduledExecutorService longLivedTaskScheduler;
   private final DiskIOScheduler diskIOScheduler;
@@ -82,9 +85,9 @@ public class BlobStore implements Store {
   private final long thresholdBytesHigh;
   private final long thresholdBytesLow;
   private final long ttlUpdateBufferTimeMs;
+  private final RemoteTokenTracker remoteTokenTracker;
   private final AtomicInteger errorCount;
   private final AccountService accountService;
-
   private Log log;
   private BlobStoreCompactor compactor;
   private BlobStoreStats blobStoreStats;
@@ -96,10 +99,6 @@ public class BlobStore implements Store {
   private AtomicBoolean isSealed = new AtomicBoolean(false);
   private AtomicBoolean isDisabled = new AtomicBoolean(false);
   protected PersistentIndex index;
-
-  // THIS IS ONLY FOR TEST.
-  volatile protected Callable<Void> operationBeforeSynchronization = null;
-  volatile protected Callable<Void> inDeleteBetweenGetEndOffsetAndFindKey = null;
 
   /**
    * States representing the different scenarios that can occur when a set of messages are to be written to the store.
@@ -131,16 +130,18 @@ public class BlobStore implements Store {
    * @param replicaStatusDelegates delegates used to communicate BlobStore write status(sealed/unsealed, stopped/started)
    * @param time the {@link Time} instance to use.
    * @param accountService  the {@link AccountService} instance to use.
+   * @param diskMetrics the {@link DiskMetrics} for the disk of this {@link BlobStore}
    */
   public BlobStore(ReplicaId replicaId, StoreConfig config, ScheduledExecutorService taskScheduler,
       ScheduledExecutorService longLivedTaskScheduler, DiskIOScheduler diskIOScheduler,
       DiskSpaceAllocator diskSpaceAllocator, StoreMetrics metrics, StoreMetrics storeUnderCompactionMetrics,
       StoreKeyFactory factory, MessageStoreRecovery recovery, MessageStoreHardDelete hardDelete,
-      List<ReplicaStatusDelegate> replicaStatusDelegates, Time time, AccountService accountService) {
+      List<ReplicaStatusDelegate> replicaStatusDelegates, Time time, AccountService accountService,
+      DiskMetrics diskMetrics) {
     this(replicaId, replicaId.getPartitionId().toString(), config, taskScheduler, longLivedTaskScheduler,
         diskIOScheduler, diskSpaceAllocator, metrics, storeUnderCompactionMetrics, replicaId.getReplicaPath(),
         replicaId.getCapacityInBytes(), factory, recovery, hardDelete, replicaStatusDelegates, time, accountService,
-        null);
+        null, diskMetrics);
   }
 
   /**
@@ -166,7 +167,8 @@ public class BlobStore implements Store {
       String dataDir, long capacityInBytes, StoreKeyFactory factory, MessageStoreRecovery recovery,
       MessageStoreHardDelete hardDelete, Time time) {
     this(null, storeId, config, taskScheduler, longLivedTaskScheduler, diskIOScheduler, diskSpaceAllocator, metrics,
-        storeUnderCompactionMetrics, dataDir, capacityInBytes, factory, recovery, hardDelete, null, time, null, null);
+        storeUnderCompactionMetrics, dataDir, capacityInBytes, factory, recovery, hardDelete, null, time, null, null,
+        null);
   }
 
   BlobStore(ReplicaId replicaId, String storeId, StoreConfig config, ScheduledExecutorService taskScheduler,
@@ -174,10 +176,11 @@ public class BlobStore implements Store {
       DiskSpaceAllocator diskSpaceAllocator, StoreMetrics metrics, StoreMetrics storeUnderCompactionMetrics,
       String dataDir, long capacityInBytes, StoreKeyFactory factory, MessageStoreRecovery recovery,
       MessageStoreHardDelete hardDelete, List<ReplicaStatusDelegate> replicaStatusDelegates, Time time,
-      AccountService accountService, BlobStoreStats blobStoreStats) {
+      AccountService accountService, BlobStoreStats blobStoreStats, DiskMetrics diskMetrics) {
     this.replicaId = replicaId;
     this.storeId = storeId;
     this.dataDir = dataDir;
+    this.diskMetrics = diskMetrics;
     this.taskScheduler = taskScheduler;
     this.longLivedTaskScheduler = longLivedTaskScheduler;
     this.diskIOScheduler = diskIOScheduler;
@@ -200,6 +203,7 @@ public class BlobStore implements Store {
     ttlUpdateBufferTimeMs = TimeUnit.SECONDS.toMillis(config.storeTtlUpdateBufferTimeSeconds);
     errorCount = new AtomicInteger(0);
     currentState = ReplicaState.OFFLINE;
+    remoteTokenTracker = replicaId == null ? null : new RemoteTokenTracker(replicaId);
     logger.debug(
         "The enable state of replicaStatusDelegate is {} on store {}. The high threshold is {} bytes and the low threshold is {} bytes",
         config.storeReplicaStatusDelegateEnable, storeId, this.thresholdBytesHigh, this.thresholdBytesLow);
@@ -239,24 +243,20 @@ public class BlobStore implements Store {
         }
 
         StoreDescriptor storeDescriptor = new StoreDescriptor(dataDir, config);
-        log = new Log(dataDir, capacityInBytes, diskSpaceAllocator, config, metrics);
+        log = new Log(dataDir, capacityInBytes, diskSpaceAllocator, config, metrics, diskMetrics);
         compactor = new BlobStoreCompactor(dataDir, storeId, factory, config, metrics, storeUnderCompactionMetrics,
             diskIOScheduler, diskSpaceAllocator, log, time, sessionId, storeDescriptor.getIncarnationId(),
-            accountService);
+            accountService, remoteTokenTracker, diskMetrics);
         index = new PersistentIndex(dataDir, storeId, taskScheduler, log, config, factory, recovery, hardDelete,
             diskIOScheduler, metrics, time, sessionId, storeDescriptor.getIncarnationId());
         compactor.initialize(index);
-        metrics.initializeIndexGauges(storeId, index, capacityInBytes);
-        long logSegmentForecastOffsetMs = TimeUnit.DAYS.toMillis(config.storeDeletedMessageRetentionDays);
-        long bucketSpanInMs = TimeUnit.MINUTES.toMillis(config.storeStatsBucketSpanInMinutes);
-        long queueProcessingPeriodInMs =
-            TimeUnit.MINUTES.toMillis(config.storeStatsRecentEntryProcessingIntervalInMinutes);
         if (blobStoreStats == null) {
-          blobStoreStats = new BlobStoreStats(storeId, index, config.storeStatsBucketCount, bucketSpanInMs,
-              logSegmentForecastOffsetMs, queueProcessingPeriodInMs, config.storeStatsWaitTimeoutInSecs,
-              config.storeEnableBucketForLogSegmentReports, time, longLivedTaskScheduler, taskScheduler,
-              diskIOScheduler, metrics);
+          blobStoreStats =
+              new BlobStoreStats(storeId, index, config, time, longLivedTaskScheduler, taskScheduler, diskIOScheduler,
+                  metrics);
         }
+        metrics.initializeIndexGauges(storeId, index, capacityInBytes, blobStoreStats,
+            config.storeEnableCurrentInvalidSizeMetric);
         checkCapacityAndUpdateReplicaStatusDelegate();
         logger.trace("The store {} is successfully started", storeId);
         onSuccess();
@@ -331,6 +331,10 @@ public class BlobStore implements Store {
     }
   }
 
+  ReplicaId getReplicaId() {
+    return this.replicaId;
+  }
+
   /**
    * Checks the state of the messages in the given {@link MessageWriteSet} in the given {@link FileSpan}.
    * @param messageSetToWrite Non-empty set of messages to write to the store.
@@ -344,7 +348,7 @@ public class BlobStore implements Store {
     for (MessageInfo info : messageSetToWrite.getMessageSetInfo()) {
       if (index.findKey(info.getStoreKey(), fileSpan,
           EnumSet.of(PersistentIndex.IndexEntryType.PUT, PersistentIndex.IndexEntryType.DELETE)) != null) {
-        if (index.wasRecentlySeen(info)) {
+        if (index.wasRecentlySeenOrCrcIsNull(info)) {
           existingIdenticalEntries++;
           metrics.identicalPutAttemptCount.inc();
         } else {
@@ -455,7 +459,6 @@ public class BlobStore implements Store {
       MessageWriteSetStateInStore state =
           checkWriteSetStateInStore(messageSetToWrite, new FileSpan(index.getStartOffset(), indexEndOffsetBeforeCheck));
       if (state == MessageWriteSetStateInStore.ALL_ABSENT) {
-        maybeCallBeforeSynchronization();
         synchronized (storeWriteLock) {
           // Validate that log end offset was not changed. If changed, check once again for existing
           // keys in store
@@ -467,7 +470,13 @@ public class BlobStore implements Store {
 
           if (state == MessageWriteSetStateInStore.ALL_ABSENT) {
             Offset endOffsetOfLastMessage = log.getEndOffset();
-            messageSetToWrite.writeTo(log);
+            long diskWriteStartTime = time.milliseconds();
+            long sizeWritten = messageSetToWrite.writeTo(log);
+
+            if (diskMetrics != null) {
+              diskMetrics.diskWriteTimePerMbInMs.update(
+                  ((time.milliseconds() - diskWriteStartTime) << 20) / sizeWritten);
+            }
             logger.trace("Store : {} message set written to log", dataDir);
 
             List<MessageInfo> messageInfo = messageSetToWrite.getMessageSetInfo();
@@ -488,7 +497,7 @@ public class BlobStore implements Store {
             FileSpan fileSpan = new FileSpan(indexEntries.get(0).getValue().getOffset(), endOffsetOfLastMessage);
             index.addToIndex(indexEntries, fileSpan);
             for (IndexEntry newEntry : indexEntries) {
-              blobStoreStats.handleNewPutEntry(newEntry.getValue());
+              blobStoreStats.handleNewPutEntry(newEntry.getKey(), newEntry.getValue());
             }
             logger.trace("Store : {} message set written to index ", dataDir);
             checkCapacityAndUpdateReplicaStatusDelegate();
@@ -535,7 +544,6 @@ public class BlobStore implements Store {
       List<IndexValue> originalPuts = new ArrayList<>();
       List<Short> lifeVersions = new ArrayList<>();
       Offset indexEndOffsetBeforeCheck = index.getCurrentEndOffset();
-      maybeCallInDeleteBetweenGetEndOffsetAndFindKey();
       for (MessageInfo info : infosToDelete) {
         IndexValue value =
             index.findKey(info.getStoreKey(), new FileSpan(index.getStartOffset(), indexEndOffsetBeforeCheck));
@@ -585,7 +593,6 @@ public class BlobStore implements Store {
               EnumSet.of(PersistentIndex.IndexEntryType.PUT)));
         }
       }
-      maybeCallBeforeSynchronization();
       synchronized (storeWriteLock) {
         Offset currentIndexEndOffset = index.getCurrentEndOffset();
         if (!currentIndexEndOffset.equals(indexEndOffsetBeforeCheck)) {
@@ -716,7 +723,6 @@ public class BlobStore implements Store {
         indexValuesToUpdate.add(value);
         lifeVersions.add(value.getLifeVersion());
       }
-      maybeCallBeforeSynchronization();
       synchronized (storeWriteLock) {
         Offset currentIndexEndOffset = index.getCurrentEndOffset();
         if (!currentIndexEndOffset.equals(indexEndOffsetBeforeCheck)) {
@@ -765,7 +771,8 @@ public class BlobStore implements Store {
               index.markAsPermanent(info.getStoreKey(), fileSpan, null, info.getOperationTimeMs(),
                   MessageInfo.LIFE_VERSION_FROM_FRONTEND);
           endOffsetOfLastMessage = fileSpan.getEndOffset();
-          blobStoreStats.handleNewTtlUpdateEntry(ttlUpdateValue, indexValuesToUpdate.get(correspondingPutIndex++));
+          blobStoreStats.handleNewTtlUpdateEntry(info.getStoreKey(), ttlUpdateValue,
+              indexValuesToUpdate.get(correspondingPutIndex++));
         }
         logger.trace("Store : {} ttl update has been marked in the index ", dataDir);
       }
@@ -826,7 +833,6 @@ public class BlobStore implements Store {
           metrics.undeleteAuthorizationFailureCount.inc();
         }
       }
-      maybeCallBeforeSynchronization();
       synchronized (storeWriteLock) {
         Offset currentIndexEndOffset = index.getCurrentEndOffset();
         if (!currentIndexEndOffset.equals(indexEndOffsetBeforeCheck)) {
@@ -871,31 +877,16 @@ public class BlobStore implements Store {
     }
   }
 
-  /**
-   * Call {@link #operationBeforeSynchronization} if it's not null. This is for testing only.
-   */
-  private void maybeCallBeforeSynchronization() throws Exception {
-    Callable<Void> callable = operationBeforeSynchronization;
-    if (callable != null) {
-      callable.call();
-    }
-  }
-
-  /**
-   * Call {@link #inDeleteBetweenGetEndOffsetAndFindKey} if it's not null. This is for testing only.
-   */
-  private void maybeCallInDeleteBetweenGetEndOffsetAndFindKey() throws Exception {
-    Callable<Void> callable = inDeleteBetweenGetEndOffsetAndFindKey;
-    if (callable != null) {
-      callable.call();
-    }
-  }
-
   @Override
-  public FindInfo findEntriesSince(FindToken token, long maxTotalSizeOfEntries) throws StoreException {
+  public FindInfo findEntriesSince(FindToken token, long maxTotalSizeOfEntries, String hostname,
+      String remoteReplicaPath) throws StoreException {
     checkStarted();
     final Timer.Context context = metrics.findEntriesSinceResponse.time();
     try {
+      if (hostname != null && !hostname.startsWith(Cloud_Replica_Keyword) && remoteTokenTracker != null) {
+        // only tokens from disk-backed replicas are tracked
+        remoteTokenTracker.updateTokenFromPeerReplica(token, hostname, remoteReplicaPath);
+      }
       FindInfo findInfo = index.findEntriesSince(token, maxTotalSizeOfEntries);
       onSuccess();
       return findInfo;
@@ -1141,8 +1132,7 @@ public class BlobStore implements Store {
       logger.error("Shutting down BlobStore {} because IO error count exceeds threshold", storeId);
       shutdown(true);
       // Explicitly disable replica to trigger Helix state transition: LEADER -> STANDBY -> INACTIVE -> OFFLINE
-      if (config.storeSetLocalPartitionStateEnabled && !isDisabled.getAndSet(true)
-          && replicaStatusDelegates != null) {
+      if (config.storeSetLocalPartitionStateEnabled && !isDisabled.getAndSet(true) && replicaStatusDelegates != null) {
         try {
           replicaStatusDelegates.forEach(delegate -> delegate.disableReplica(replicaId));
         } catch (Exception e) {
@@ -1210,9 +1200,31 @@ public class BlobStore implements Store {
    */
   void compact(CompactionDetails details, byte[] bundleReadBuffer) throws IOException, StoreException {
     checkStarted();
+    if (remoteTokenTracker != null) {
+      remoteTokenTracker.refreshPeerReplicaTokens();
+    }
     compactor.compact(details, bundleReadBuffer);
     checkCapacityAndUpdateReplicaStatusDelegate();
-    logger.trace("One cycle of compaction is completed on the store {}", storeId);
+    blobStoreStats.onCompactionFinished();
+    logger.info("One cycle of compaction is completed on the store {}", storeId);
+  }
+
+  /**
+   * Closes the last log segment periodically if replica is in sealed status.
+   * Hybrid compaction policy will support both statsBasedCompactionPolicy and compactAllPolicy.
+   * Make sure this method is running before compactAllPolicy so it will compact the auto closed log segment afterwards.
+   * @throws StoreException if any store exception occurred as part of ensuring capacity.
+   */
+  void closeLastLogSegmentIfQualified() throws StoreException {
+    synchronized (storeWriteLock) {
+      if (compactor.closeLastLogSegmentIfQualified()) {
+        //refresh journal.
+        long startTime = SystemTime.getInstance().milliseconds();
+        index.journal.cleanUpJournal();
+        logger.debug("Time to clean up journal size for store : {} in dataDir: {} is {} ms", storeId, dataDir,
+            SystemTime.getInstance().milliseconds() - startTime);
+      }
+    }
   }
 
   /**
@@ -1224,6 +1236,9 @@ public class BlobStore implements Store {
     checkStarted();
     if (CompactionLog.isCompactionInProgress(dataDir, storeId)) {
       logger.info("Resuming compaction of {}", this);
+      if (remoteTokenTracker != null) {
+        remoteTokenTracker.refreshPeerReplicaTokens();
+      }
       compactor.resumeCompaction(bundleReadBuffer);
       checkCapacityAndUpdateReplicaStatusDelegate();
     }

@@ -517,9 +517,10 @@ public class ReplicationTest extends ReplicationTestHelper {
     List<RemoteReplicaInfo> remoteReplicaInfos =
         replicationManager.partitionToPartitionInfo.get(existingPartition).getRemoteReplicaInfos();
     ReplicaId peerReplica1 = remoteReplicaInfos.get(0).getReplicaId();
-    // we purposely update lag to verify that local replica is present in ReplicaSyncUpManager.
-    assertTrue("Updating lag between local replica and peer replica should succeed",
-        mockHelixParticipant.getReplicaSyncUpManager().updateLagBetweenReplicas(localReplica, peerReplica1, 10L));
+
+    assertFalse("Sync up should not complete because not enough replicas have caught up",
+        mockHelixParticipant.getReplicaSyncUpManager()
+            .updateReplicaLagAndCheckSyncStatus(localReplica, peerReplica1, 10L, ReplicaState.INACTIVE));
     // pick another remote replica to update the replication lag
     ReplicaId peerReplica2 = remoteReplicaInfos.get(1).getReplicaId();
     replicationManager.updateTotalBytesReadByRemoteReplica(existingPartition,
@@ -536,7 +537,8 @@ public class ReplicationTest extends ReplicationTestHelper {
     // we purposely update lag against local replica to verify local replica is no longer in ReplicaSyncUpManager because
     // deactivation is complete and local replica should be removed from "replicaToLagInfos" map.
     assertFalse("Sync up should complete (2 replicas have caught up), hence updated should be false",
-        mockHelixParticipant.getReplicaSyncUpManager().updateLagBetweenReplicas(localReplica, peerReplica2, 0L));
+        mockHelixParticipant.getReplicaSyncUpManager()
+            .updateReplicaLagAndCheckSyncStatus(localReplica, peerReplica2, 0L, ReplicaState.INACTIVE));
     storageManager.shutdown();
   }
 
@@ -727,7 +729,8 @@ public class ReplicationTest extends ReplicationTestHelper {
     MockClusterMap clusterMap = new MockClusterMap();
     ClusterMapConfig clusterMapConfig = new ClusterMapConfig(verifiableProperties);
     MockHelixParticipant.metricRegistry = new MetricRegistry();
-    MockHelixParticipant mockHelixParticipant = new MockHelixParticipant(clusterMapConfig);
+    MockHelixParticipant mockHelixParticipant = Mockito.spy(new MockHelixParticipant(clusterMapConfig));
+    doNothing().when(mockHelixParticipant).setPartitionDisabledState(anyString(), anyBoolean());
     // choose a replica on local node and put decommission file into its dir
     ReplicaId localReplica = clusterMap.getReplicaIds(clusterMap.getDataNodeIds().get(0)).get(0);
     String partitionName = localReplica.getPartitionId().toPathString();
@@ -798,6 +801,8 @@ public class ReplicationTest extends ReplicationTestHelper {
         participantLatch.await(1, TimeUnit.SECONDS));
     // verify stats manager listener is called
     verify(mockHelixParticipant.mockStatsManagerListener).onPartitionBecomeDroppedFromOffline(anyString());
+    // verify setPartitionDisabledState method is called
+    verify(mockHelixParticipant).setPartitionDisabledState(partitionName, false);
     File storeDir = new File(localReplica.getReplicaPath());
     assertFalse("Store dir should not exist", storeDir.exists());
     storageManager.shutdown();
@@ -2052,7 +2057,7 @@ public class ReplicationTest extends ReplicationTestHelper {
           .get(i)
           .getReplicaId()
           .getPartitionId()
-          .isEqual(partitionId.toString()) ? 3 : 0;
+          .isEqual(partitionId.toPathString()) ? 3 : 0;
     }
     currentTimeMs = time.milliseconds();
     replicaThread.replicate();

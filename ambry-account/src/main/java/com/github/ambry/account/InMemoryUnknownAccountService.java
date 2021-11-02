@@ -28,9 +28,9 @@ import java.util.function.Consumer;
 class InMemoryUnknownAccountService implements AccountService {
   static final Account UNKNOWN_ACCOUNT =
       new Account(Account.UNKNOWN_ACCOUNT_ID, Account.UNKNOWN_ACCOUNT_NAME, Account.AccountStatus.ACTIVE,
-          Account.SNAPSHOT_VERSION_DEFAULT_VALUE,
+          Account.ACL_INHERITED_BY_CONTAINER_DEFAULT_VALUE, Account.SNAPSHOT_VERSION_DEFAULT_VALUE,
           Arrays.asList(Container.UNKNOWN_CONTAINER, Container.DEFAULT_PUBLIC_CONTAINER,
-              Container.DEFAULT_PRIVATE_CONTAINER));
+              Container.DEFAULT_PRIVATE_CONTAINER), Account.QUOTA_RESOURCE_TYPE_DEFAULT_VALUE);
   private static final Collection<Account> accounts =
       Collections.unmodifiableCollection(Collections.singletonList(UNKNOWN_ACCOUNT));
   private volatile boolean isOpen = true;

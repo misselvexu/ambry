@@ -16,6 +16,9 @@ package com.github.ambry.utils;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.EventLoopGroup;
+import io.netty.util.concurrent.EventExecutor;
+import io.netty.util.concurrent.SingleThreadEventExecutor;
 import java.io.BufferedReader;
 import java.io.DataInputStream;
 import java.io.File;
@@ -50,6 +53,7 @@ import java.util.Properties;
 import java.util.Random;
 import java.util.RandomAccess;
 import java.util.Set;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
@@ -63,7 +67,6 @@ import java.util.function.IntSupplier;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.slf4j.Logger;
@@ -131,6 +134,87 @@ public class Utils {
   }
 
   /**
+   * Return PartitionClassReport stats account container entry key of given {@code accountId} and {@code containerId}.
+   * For now, it's A[accountId]___C[containerId].
+   * @param accountId the account id.
+   * @param containerId the container id.
+   * @return the account container entry key in PartitionClassReport stats.
+   */
+  public static String partitionClassStatsAccountContainerKey(short accountId, short containerId) {
+    return "A[" + accountId + "]" + ACCOUNT_CONTAINER_SEPARATOR + "C[" + containerId + "]";
+  }
+
+  /**
+   * Return account id and container id from PartitionClassReport stats account container entry key. It's the opposite
+   * of {@link #partitionClassStatsAccountContainerKey}. It returns an array of short with exactly two elements. The first
+   * is the account id and the second is the container id.
+   * @param accountContainerKey The account container entry key in PartitionClassReport stats.
+   * @return An array of shorts with account id being the first element and container id being the second element.
+   */
+  public static short[] accountContainerIdFromPartitionClassStatsKey(String accountContainerKey) {
+    String[] parts = accountContainerKey.split(Utils.ACCOUNT_CONTAINER_SEPARATOR);
+    short accountId = Short.valueOf(parts[0].substring(2, parts[0].length() - 1));
+    short containerId = Short.valueOf(parts[1].substring(2, parts[1].length() - 1));
+    return new short[]{accountId, containerId};
+  }
+
+  /**
+   * Return partition key for stats report. For now, it's Partition[partitionId].
+   * @param partitionId the partition id.
+   * @return The partition key for stats report.
+   */
+  public static String statsPartitionKey(int partitionId) {
+    // This is the same value as AmbryPartition.toString. However, in AmbryPartition, the partition id is long type.
+    // Here it's an integer.
+    return "Partition[" + partitionId + "]";
+  }
+
+  /**
+   * Return account key for stats report. For now, it's A[accountId].
+   * @param accountId the account id.
+   * @return The account key for stats report.
+   */
+  public static String statsAccountKey(short accountId) {
+    return "A[" + accountId + "]";
+  }
+
+  /**
+   * Return container key for stats report. For now, it's C[containerId].
+   * @param containerId the container id.
+   * @return The container key for stats report.
+   */
+  public static String statsContainerKey(short containerId) {
+    return "C[" + containerId + "]";
+  }
+
+  /**
+   * Return partition id from partition key of stats report. It's the opposite of {@link #statsPartitionKey}.
+   * @param partitionKey the partition key of stats report.
+   * @return The partition id.
+   */
+  public static int partitionIdFromStatsPartitionKey(String partitionKey) {
+    return Integer.valueOf(partitionKey.substring("Partition[".length(), partitionKey.length() - 1));
+  }
+
+  /**
+   * Return account id from account key of stats report. It's the opposite of {@link #statsAccountKey}.
+   * @param accountKey the account key of stats report.
+   * @return The account id.
+   */
+  public static short accountIdFromStatsAccountKey(String accountKey) {
+    return Short.valueOf(accountKey.substring(2, accountKey.length() - 1));
+  }
+
+  /**
+   * Return container is from container key of stats report. It's the opposite of {@link #statsContainerKey}.
+   * @param containerKey the container key of stats report.
+   * @return The container id.
+   */
+  public static short containerIdFromStatsContainerKey(String containerKey) {
+    return Short.valueOf(containerKey.substring(2, containerKey.length() - 1));
+  }
+
+  /**
    * Gets the size of the string in serialized form
    * @param value the string of interest to be serialized
    * @return the size of the string in serialized form
@@ -147,6 +231,17 @@ public class Utils {
    */
   public static String readIntString(DataInputStream input) throws IOException {
     return readIntString(input, StandardCharsets.UTF_8);
+  }
+
+  /**
+   * Reads a nullable String whose length is an int from the given input stream
+   * @param input The input stream from which to read the String from
+   * @return The String read from the stream
+   * @throws IOException
+   */
+  public static String readNullableIntString(DataInputStream input) throws IOException {
+    String tmp = readIntString(input, StandardCharsets.UTF_8);
+    return tmp.isEmpty() ? null : tmp;
   }
 
   /**
@@ -318,19 +413,25 @@ public class Utils {
   }
 
   /**
-   * Extracts the cause of an {@link ExecutionException}. This is used to get the relevant domain-specific exception
-   * after unboxing a future.
-   * @param e the {@link Exception}
-   * @return if the cause is {@code null}, return {@code e} itself. If the cause is not an instance
-   *         of exception, return the {@link Throwable} wrapped in an exception. If not {@link ExecutionException},
-   *         return the exception itself. Otherwise, return the cause {@link Exception}.
+   * Extracts the cause of an {@link ExecutionException} or {@link CompletionException}. This is used to get the
+   * relevant domain-specific exception after unboxing various types of futures.
+   * @param throwable the {@link Throwable}
+   * @return If the supplied throwable is null, return null.
+   *         If not {@link ExecutionException} or {@link CompletionException}, return throwable itself.
+   *         If the cause is {@code null}, return {@code throwable} itself.
+   *         If the cause or original throwable is not an instance of exception, return the {@link Throwable} wrapped
+   *         in an exception. Otherwise, return the cause {@link Exception}.
    */
-  public static Exception extractExecutionExceptionCause(Exception e) {
-    Throwable cause = e.getCause();
-    if (!(e instanceof ExecutionException) || cause == null) {
-      return e;
+  public static Exception extractFutureExceptionCause(Throwable throwable) {
+    if (throwable == null) {
+      return null;
     }
-    return cause instanceof Exception ? (Exception) cause : new Exception(cause);
+    if (throwable instanceof CompletionException || throwable instanceof ExecutionException) {
+      if (throwable.getCause() != null) {
+        throwable = throwable.getCause();
+      }
+    }
+    return throwable instanceof Exception ? (Exception) throwable : new Exception(throwable);
   }
 
   /**
@@ -796,18 +897,6 @@ public class Utils {
   }
 
   /**
-   * Pretty prints specified {@link JSONArray} to specified file path.
-   *
-   * @param jsonArray to pretty print
-   * @param path file path
-   * @throws IOException
-   * @throws JSONException
-   */
-  public static void writeJsonArrayToFile(JSONArray jsonArray, String path) throws IOException, JSONException {
-    writeStringToFile(jsonArray.toString(2), path);
-  }
-
-  /**
    * Reads entire contents of specified file as a string.
    *
    * @param path file path to read
@@ -1102,9 +1191,14 @@ public class Utils {
    * @return {@code true} this cause indicates a possible early termination from the client. {@code false} otherwise.
    */
   public static boolean isPossibleClientTermination(Throwable cause) {
-    return cause instanceof IOException && (CLIENT_RESET_EXCEPTION_MSG.equals(cause.getMessage())
-        || CLIENT_BROKEN_PIPE_EXCEPTION_MSG.equals(cause.getMessage()) || SSL_ENGINE_CLOSED_EXCEPTION_MSG.equals(
-        cause.getMessage()));
+    if (cause instanceof IOException) {
+      String msg = cause.getMessage();
+      if (msg != null) {
+        return msg.endsWith(CLIENT_RESET_EXCEPTION_MSG) || msg.endsWith(CLIENT_BROKEN_PIPE_EXCEPTION_MSG)
+            || msg.endsWith(SSL_ENGINE_CLOSED_EXCEPTION_MSG);
+      }
+    }
+    return false;
   }
 
   /**
@@ -1190,6 +1284,20 @@ public class Utils {
   }
 
   /**
+   * Close a resource without throwing exception.
+   * @param resource the resource to close.
+   */
+  public static void closeQuietly(AutoCloseable resource) {
+    try {
+      if (resource != null) {
+        resource.close();
+      }
+    } catch (Exception e) {
+      logger.warn("Closing resource", e);
+    }
+  }
+
+  /**
    * A thread factory to use for {@link ScheduledExecutorService}s instantiated using
    * {@link #newScheduler(int, String, boolean)}.
    */
@@ -1240,5 +1348,25 @@ public class Utils {
     public int size() {
       return currentSize.getAsInt();
     }
+  }
+
+  /**
+   * Get number of total pending tasks in Netty EventLoopGroup.
+   */
+  public static long getNumberOfPendingTasks(final EventLoopGroup eventLoopGroup) {
+    int index = 0;
+    long totalPendingTasks = 0;
+    for (final EventExecutor eventExecutor : eventLoopGroup) {
+      if (eventExecutor instanceof SingleThreadEventExecutor) {
+        int pendingTasks = ((SingleThreadEventExecutor) eventExecutor).pendingTasks();
+        totalPendingTasks += pendingTasks;
+        logger.debug("EventLoop-{} pending tasks: {}", index, pendingTasks);
+        index++;
+      } else {
+        logger.warn("EventLoop is not SingleThreadEventExecutor");
+        break;
+      }
+    }
+    return totalPendingTasks;
   }
 }

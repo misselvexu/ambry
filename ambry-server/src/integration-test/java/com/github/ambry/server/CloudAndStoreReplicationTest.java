@@ -46,7 +46,6 @@ import com.github.ambry.utils.HelixControllerManager;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.TestUtils;
 import com.github.ambry.utils.Utils;
-import java.io.DataInputStream;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
@@ -89,7 +88,7 @@ public class CloudAndStoreReplicationTest {
   private final short containerId = Utils.getRandomShort(TestUtils.RANDOM);
   private final static int FOUR_MB_SZ = 4194304;
   private final String vcrRecoveryPartitionConfig;
-  private static int zkPort = 31997;
+  private static int zkPort = 31990;
   private static final String zkConnectString = "localhost:" + zkPort;
   private static final String vcrClusterName = "vcrTestCluster";
   private static final String cloudDc = "CloudDc";
@@ -301,13 +300,14 @@ public class CloudAndStoreReplicationTest {
 
     channel.send(getRequest);
     GetResponse getResponse =
-        GetResponse.readFrom(new DataInputStream(channel.receive().getInputStream()), recoveryCluster.getClusterMap());
+        GetResponse.readFrom(channel.receive().getInputStream(), recoveryCluster.getClusterMap());
 
     for (PartitionResponseInfo partitionResponseInfo : getResponse.getPartitionResponseInfoList()) {
       assertEquals("Error in getting the recovered blobs", ServerErrorCode.No_Error,
           partitionResponseInfo.getErrorCode());
+      //old value is 272. Adding 8 Bytes due to the two fields added 4 + 4 Blob Property BYTE.
       for (MessageInfo messageInfo : partitionResponseInfo.getMessageInfoList()) {
-        assertEquals(blobIdToSizeMap.get(messageInfo.getStoreKey()) + 272, messageInfo.getSize());
+        assertEquals(blobIdToSizeMap.get(messageInfo.getStoreKey()) + 280, messageInfo.getSize());
       }
     }
   }
