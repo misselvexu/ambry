@@ -13,18 +13,16 @@
  */
 package com.github.ambry.quota;
 
-import java.util.List;
-
-
 /**
- * Interface to apply application specific policy to make overall recommendation based on {@link QuotaRecommendation}s.
+ * Denotes the type of request for quota tracking purposes.
  */
-public interface ThrottlePolicy {
-
+public enum QuotaMethod {
   /**
-   * Provide overall recommendation by merging {@link QuotaRecommendation}s from all quota enforcers.
-   * @param quotaRecommendations {@link List} of {@link QuotaRecommendation}s.
-   * @return ThrottlingRecommendation object containing overall quota usage and recommendation.
+   * This denotes read requests for quota purposes (e.g, Get, GetBlobInfo etc).
    */
-  ThrottlingRecommendation recommend(List<QuotaRecommendation> quotaRecommendations);
+  READ,
+  /**
+   * This denotes write requests for quota purposes (e.g, PUT, POST, DELETE, TTLUPDATE etc).
+   */
+  WRITE
 }

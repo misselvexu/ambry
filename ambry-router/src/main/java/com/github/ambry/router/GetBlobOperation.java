@@ -38,7 +38,11 @@ import com.github.ambry.protocol.GetOption;
 import com.github.ambry.protocol.GetRequest;
 import com.github.ambry.protocol.GetResponse;
 import com.github.ambry.protocol.PartitionResponseInfo;
+import com.github.ambry.quota.Chargeable;
 import com.github.ambry.quota.QuotaChargeCallback;
+import com.github.ambry.quota.QuotaException;
+import com.github.ambry.quota.QuotaMethod;
+import com.github.ambry.quota.QuotaResource;
 import com.github.ambry.rest.RestServiceErrorCode;
 import com.github.ambry.rest.RestServiceException;
 import com.github.ambry.server.ServerErrorCode;
@@ -48,6 +52,7 @@ import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.Time;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.util.ReferenceCountUtil;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -162,7 +167,7 @@ class GetBlobOperation extends GetOperation {
     for (Integer key : chunkIndexToBuf.keySet()) {
       ByteBuf byteBuf = chunkIndexToBuf.remove(key);
       if (byteBuf != null) {
-        byteBuf.release();
+        ReferenceCountUtil.safeRelease(byteBuf);
       }
     }
     firstChunk.maybeReleaseDecryptionResultBuffer();
@@ -419,7 +424,7 @@ class GetBlobOperation extends GetOperation {
         int currentNumChunk = numChunksWrittenOut.get();
         ByteBuf byteBuf = chunkIndexToBufWaitingForRelease.remove(currentNumChunk);
         if (byteBuf != null) {
-          byteBuf.release();
+          ReferenceCountUtil.safeRelease(byteBuf);
         }
         lastChunkWrittenDoneTime.set(SystemTime.getInstance().milliseconds());
         numChunksWrittenOut.incrementAndGet();
@@ -579,7 +584,7 @@ class GetBlobOperation extends GetOperation {
    * to retrieve one data chunk at a time. Once the associated chunk is successfully retrieved, this object can be
    * reinitialized and used to retrieve a subsequent chunk.
    */
-  private class GetChunk {
+  private class GetChunk implements Chargeable {
     // map of correlation id to the request metadata for every request issued for this operation.
     protected final Map<Integer, GetRequestInfo> correlationIdToGetRequestInfo = new TreeMap<>();
     // progress tracker used to track whether the operation is completed or not and whether it succeeded or failed on complete
@@ -611,6 +616,8 @@ class GetBlobOperation extends GetOperation {
     private long chunkSize;
     // whether the operation on the current chunk has completed.
     private boolean chunkCompleted;
+    // whether the quota is already charged for this chunk.
+    private boolean isCharged;
 
     /**
      * Construct a GetChunk
@@ -665,6 +672,7 @@ class GetBlobOperation extends GetOperation {
       decryptJobMetricsTracker = new CryptoJobMetricsTracker(routerMetrics.decryptJobMetrics);
       correlationIdToGetRequestInfo.clear();
       state = ChunkState.Free;
+      isCharged = false;
     }
 
     /**
@@ -726,6 +734,58 @@ class GetBlobOperation extends GetOperation {
       }
     }
 
+    @Override
+    public boolean check() {
+      if (quotaChargeCallback == null || isCharged) {
+        return true;
+      }
+      return quotaChargeCallback.check();
+    }
+
+    @Override
+    public boolean charge() {
+      if (quotaChargeCallback == null || isCharged) {
+        return true;
+      }
+      try {
+        quotaChargeCallback.charge(chunkSize);
+        isCharged = true;
+      } catch (QuotaException quotaException) {
+        logger.warn(String.format("Quota charging failed in GetBlobOperation for blob {} due to {} ", blobId.toString(),
+            quotaException.toString()));
+      }
+      return isCharged;
+    }
+
+    @Override
+    public boolean quotaExceedAllowed() {
+      if(quotaChargeCallback == null) {
+        return true;
+      }
+      return quotaChargeCallback.quotaExceedAllowed();
+    }
+
+    @Override
+    public QuotaResource getQuotaResource() {
+      if(quotaChargeCallback == null) {
+        return null;
+      }
+      try {
+        return quotaChargeCallback.getQuotaResource();
+      } catch (QuotaException quotaException) {
+        logger.error(
+            String.format("Could create QuotaResource object during GetBlobOperation for the chunk {} due to {}. This should never happen.",
+                blobId.toString(), quotaException.toString()));
+      }
+      // A null return means quota resource could not be created for this chunk. The consumer should decide how to handle nulls.
+      return null;
+    }
+
+    @Override
+    public QuotaMethod getQuotaMethod() {
+      return quotaChargeCallback.getQuotaMethod();
+    }
+
     /**
      * Maybe process callbacks if applicable. This is a no-op for blobs that do not need any async processing.
      * As of now, decryption is the only async processing that could happen if applicable.
@@ -771,7 +831,7 @@ class GetBlobOperation extends GetOperation {
       if (isInProgress() && progressTracker.isCryptoJobRequired() && decryptCallbackResultInfo.decryptJobComplete) {
         DecryptJob.DecryptJobResult result = decryptCallbackResultInfo.result.getAndSet(null);
         if (result != null) {
-          result.getDecryptedBlobContent().release();
+          ReferenceCountUtil.safeRelease(result.getDecryptedBlobContent());
         }
       }
     }
@@ -816,7 +876,7 @@ class GetBlobOperation extends GetOperation {
         String hostname = replicaId.getDataNodeId().getHostname();
         Port port = RouterUtils.getPortToConnectTo(replicaId, routerConfig.routerEnableHttp2NetworkClient);
         GetRequest getRequest = createGetRequest(chunkBlobId, getOperationFlag(), getGetOption());
-        RequestInfo request = new RequestInfo(hostname, port, getRequest, replicaId);
+        RequestInfo request = new RequestInfo(hostname, port, getRequest, replicaId, this);
         int correlationId = getRequest.getCorrelationId();
         correlationIdToGetRequestInfo.put(correlationId, new GetRequestInfo(replicaId, time.milliseconds()));
         correlationIdToGetChunk.put(correlationId, this);
@@ -852,16 +912,16 @@ class GetBlobOperation extends GetOperation {
         if (state != ChunkState.Complete && quotaChargeCallback != null && chunkException == null) {
           try {
             if (chunkSize != -1) {
-              quotaChargeCallback.chargeQuota(chunkSize);
+              quotaChargeCallback.charge(chunkSize);
             } else {
               if (this instanceof FirstGetChunk && ((FirstGetChunk) this).blobType == BlobType.DataBlob
                   && blobInfo != null) {
-                quotaChargeCallback.chargeQuota(blobInfo.getBlobProperties().getBlobSize());
+                quotaChargeCallback.charge(blobInfo.getBlobProperties().getBlobSize());
               }
               // other cases mean that either this was a metadata blob, or there was an error.
             }
-          } catch (RouterException routerException) {
-            logger.info("Exception {} occurred during the quota charge event of blob {}", routerException,
+          } catch (QuotaException quotaException) {
+            logger.info("Exception {} occurred during the quota charge event of blob {}", quotaException,
                 blobId.getID());
           }
         }
@@ -897,7 +957,7 @@ class GetBlobOperation extends GetOperation {
 
           successfullyDeserialized = true;
         } finally {
-          chunkBuf.release();
+          ReferenceCountUtil.safeRelease(chunkBuf);
         }
       } else {
         // If successTarget > 1, then content reconciliation may have to be done. For now, ignore subsequent responses.
@@ -1011,7 +1071,7 @@ class GetBlobOperation extends GetOperation {
           logger.trace("Handling decrypt job call back for blob {} to set decrypt callback results", targetBlobId);
           if (isOperationComplete() || operationException.get() != null) {
             if (exception == null && result.getDecryptedBlobContent() != null) {
-              result.getDecryptedBlobContent().release();
+              ReferenceCountUtil.safeRelease(result.getDecryptedBlobContent());
             }
             return;
           }
@@ -1286,7 +1346,7 @@ class GetBlobOperation extends GetOperation {
                 progressTracker.setCryptoJobSuccess();
                 logger.trace("BlobContent available to process for simple blob {}", blobId);
               } else {
-                decryptedBlobContent.release();
+                ReferenceCountUtil.safeRelease(decryptedBlobContent);
                 progressTracker.setCryptoJobFailed();
               }
             } else {
@@ -1353,7 +1413,7 @@ class GetBlobOperation extends GetOperation {
         if (rawMode) {
           if (blobData != null) {
             // RawMode, release blob data.
-            blobData.release();
+            ReferenceCountUtil.safeRelease(blobData);
           }
           // Return the raw bytes from storage
           if (encryptionKey != null) {
@@ -1479,7 +1539,7 @@ class GetBlobOperation extends GetOperation {
                       routerMetrics.decryptTimeMs.update(System.currentTimeMillis() - startTimeMs);
                       if (isOperationComplete() || operationException.get() != null) {
                         if (result != null && result.getDecryptedBlobContent() != null) {
-                          result.getDecryptedBlobContent().release();
+                          ReferenceCountUtil.safeRelease(result.getDecryptedBlobContent());
                         }
                       } else {
                         decryptJobMetricsTracker.onJobCallbackProcessingStart();
@@ -1494,7 +1554,7 @@ class GetBlobOperation extends GetOperation {
           }
         }
       } finally {
-        serializedMetadataContent.release();
+        ReferenceCountUtil.safeRelease(serializedMetadataContent);
       }
     }
 
@@ -1551,7 +1611,7 @@ class GetBlobOperation extends GetOperation {
           }
         }
       } finally {
-        blobData.release();
+        ReferenceCountUtil.safeRelease(blobData);
       }
     }
 

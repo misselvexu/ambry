@@ -24,6 +24,7 @@ import com.github.ambry.commons.BlobIdFactory;
 import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.commons.Callback;
 import com.github.ambry.commons.LoggingNotificationSystem;
+import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.config.CryptoServiceConfig;
 import com.github.ambry.config.KMSConfig;
 import com.github.ambry.config.RouterConfig;
@@ -36,6 +37,10 @@ import com.github.ambry.messageformat.MetadataContentSerDe;
 import com.github.ambry.notification.NotificationBlobType;
 import com.github.ambry.protocol.PutRequest;
 import com.github.ambry.quota.QuotaChargeCallback;
+import com.github.ambry.quota.QuotaException;
+import com.github.ambry.quota.QuotaMethod;
+import com.github.ambry.quota.QuotaResource;
+import com.github.ambry.quota.QuotaResourceType;
 import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.store.StoreKey;
 import com.github.ambry.utils.ByteBufferInputStream;
@@ -125,7 +130,7 @@ public class PutManagerTest {
     this.testEncryption = testEncryption;
     this.metadataContentVersion = metadataContentVersion;
     // random chunkSize in the range [2, 1 MB]
-    chunkSize = random.nextInt(1024 * 1024) + 2;
+    chunkSize = random.nextInt(1024 * 1024) + 100;
     requestParallelism = 3;
     successTarget = 2;
     mockSelectorState.set(MockSelectorState.Good);
@@ -392,11 +397,31 @@ public class PutManagerTest {
           throw new RuntimeException("Throwing an exception in the user callback");
         }, new QuotaChargeCallback() {
           @Override
-          public void chargeQuota(long chunkSize) {
+          public void charge(long chunkSize) {
           }
 
           @Override
-          public void chargeQuota() {
+          public void charge() {
+          }
+
+          @Override
+          public boolean check() {
+            return false;
+          }
+
+          @Override
+          public boolean quotaExceedAllowed() {
+            return false;
+          }
+
+          @Override
+          public QuotaResource getQuotaResource() throws QuotaException {
+            return null;
+          }
+
+          @Override
+          public QuotaMethod getQuotaMethod() {
+            return null;
           }
         });
     submitPutsAndAssertSuccess(false);
@@ -740,6 +765,58 @@ public class PutManagerTest {
   }
 
   /**
+   * Test when channel is closed while chunk filler thread is not responding, PutManager would release the data chunks.
+   * @throws Exception
+   */
+  @Test
+  public void testChunkFillerSleepWithBuildingChunk() throws Exception {
+    VerifiableProperties vProps = getRouterConfigInVerifiableProperties();
+    MockNetworkClient networkClient =
+        new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
+            CHECKOUT_TIMEOUT_MS, mockServerLayout, mockTime).getMockNetworkClient();
+    PutManager manager = new PutManager(mockClusterMap, new ResponseHandler(mockClusterMap), notificationSystem,
+        new RouterConfig(vProps), new NonBlockingRouterMetrics(mockClusterMap, null),
+        new RouterCallback(networkClient, null), "0", kms, cryptoService, cryptoJobHandler, accountService, mockTime,
+        MockClusterMap.DEFAULT_PARTITION_CLASS);
+    BlobProperties blobProperties =
+        new BlobProperties(-1, "serviceId", "memberId", "contentType", false, Utils.Infinite_Time,
+            Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), false, null, null, null);
+    byte[] userMetadata = new byte[10];
+    byte[] content = new byte[chunkSize / 4];
+    random.nextBytes(content);
+    MockReadableStreamChannel channel =
+        new MockReadableStreamChannel(chunkSize / 2, false); // make sure we are not sending the entire chunk
+    FutureResult<String> future = new FutureResult<>();
+    manager.submitPutBlobOperation(blobProperties, userMetadata, channel, PutBlobOptions.DEFAULT, future, null, null);
+    channel.write(ByteBuffer.wrap(content));
+
+    // Sleep until
+    // Op has a building chunk
+    // Chunk Filler is sleeping
+    PutOperation op = manager.getPutOperations().iterator().next();
+    Assert.assertFalse(op.isOperationComplete());
+    PutOperation.PutChunk putChunk = op.putChunks.iterator().next();
+    Assert.assertTrue(putChunk.isBuilding());
+
+    manager.forceChunkFillerThreadToSleep();
+    Thread chunkFillerThread = TestUtils.getThreadByThisName("ChunkFillerThread");
+    Assert.assertTrue("ChunkFillerThread should have gone to WAITING state as there are no active operations",
+        waitForThreadState(chunkFillerThread, Thread.State.WAITING));
+
+    channel.beBad();
+    channel.write(ByteBuffer.wrap(content));
+
+    Assert.assertTrue(op.isOperationComplete());
+    Assert.assertTrue(putChunk.isBuilding());
+
+    manager.poll(new ArrayList<>(), new HashSet<>());
+    Assert.assertTrue(putChunk.isDataReleased());
+    Assert.assertEquals(0, manager.getPutOperations().size());
+    NonBlockingRouter.currentOperationsCount.incrementAndGet(); // Make sure this static field's value stay the same
+    manager.close();
+  }
+
+  /**
    * Test that the size in BlobProperties is ignored for puts, by attempting puts with varying values for size in
    * BlobProperties.
    */
@@ -816,7 +893,7 @@ public class PutManagerTest {
    */
   @Test
   public void testReplPolicyToPartitionClassMapping() throws Exception {
-    Account refAccount = accountService.createAndAddRandomAccount();
+    Account refAccount = accountService.createAndAddRandomAccount(QuotaResourceType.SERVICE);
     Map<Container, String> containerToPartClass = new HashMap<>();
     Iterator<Container> allContainers = refAccount.getAllContainers().iterator();
     Container container = allContainers.next();
@@ -905,10 +982,7 @@ public class PutManagerTest {
 
   // Methods used by the tests
 
-  /**
-   * @return Return a {@link NonBlockingRouter} created with default {@link VerifiableProperties}
-   */
-  private NonBlockingRouter getNonBlockingRouter() throws IOException, GeneralSecurityException {
+  private VerifiableProperties getRouterConfigInVerifiableProperties() {
     Properties properties = new Properties();
     properties.setProperty("router.hostname", "localhost");
     properties.setProperty("router.datacenter.name", LOCAL_DC);
@@ -916,7 +990,15 @@ public class PutManagerTest {
     properties.setProperty("router.put.request.parallelism", Integer.toString(requestParallelism));
     properties.setProperty("router.put.success.target", Integer.toString(successTarget));
     properties.setProperty("router.metadata.content.version", String.valueOf(metadataContentVersion));
-    VerifiableProperties vProps = new VerifiableProperties(properties);
+    return new VerifiableProperties(properties);
+  }
+
+  /**
+   * @return Return a {@link NonBlockingRouter} created with default {@link VerifiableProperties}
+   */
+  private NonBlockingRouter getNonBlockingRouter()
+      throws IOException, GeneralSecurityException, ReflectiveOperationException {
+    VerifiableProperties vProps = getRouterConfigInVerifiableProperties();
     if (testEncryption && instantiateEncryptionCast) {
       setupEncryptionCast(vProps);
     }

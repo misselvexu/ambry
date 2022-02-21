@@ -57,6 +57,7 @@ import org.apache.helix.model.InstanceConfig;
 import org.apache.helix.model.LiveInstance;
 
 import static com.github.ambry.clustermap.ClusterMapUtils.*;
+import static com.github.ambry.config.CloudConfig.*;
 
 
 /**
@@ -130,6 +131,7 @@ public class CloudToStoreReplicationManager extends ReplicationEngine {
 
     started = true;
     startupLatch.countDown();
+    logger.info("CloudToStoreReplicationManager started.");
   }
 
   /**
@@ -174,7 +176,8 @@ public class CloudToStoreReplicationManager extends ReplicationEngine {
           partitionName);
       return;
     }
-    CloudReplica peerCloudReplica = new CloudReplica(partitionId, getCloudDataNode());
+    DataNodeId cloudDataNode = getCloudDataNode();
+    CloudReplica peerCloudReplica = new CloudReplica(partitionId, cloudDataNode);
     FindTokenFactory findTokenFactory =
         tokenHelper.getFindTokenFactoryFromReplicaType(peerCloudReplica.getReplicaType());
     RemoteReplicaInfo remoteReplicaInfo =
@@ -189,7 +192,8 @@ public class CloudToStoreReplicationManager extends ReplicationEngine {
     partitionToPartitionInfo.put(partitionId, partitionInfo);
     mountPathToPartitionInfos.computeIfAbsent(localReplica.getMountPath(), key -> ConcurrentHashMap.newKeySet())
         .add(partitionInfo);
-    logger.info("Cloud Partition {} added to {}", partitionName, dataNodeId);
+    logger.info("Cloud Partition {} added to {}. CloudNode {} port {}", partitionName, dataNodeId, cloudDataNode,
+        cloudDataNode.getPortToConnectTo());
 
     // Reload replication token if exist.
     reloadReplicationTokenIfExists(localReplica, remoteReplicaInfos);
@@ -293,16 +297,24 @@ public class CloudToStoreReplicationManager extends ReplicationEngine {
 
       // create a new list of available vcr nodes.
       for (InstanceConfig instanceConfig : instanceConfigs) {
-        String instanceName = instanceConfig.getInstanceName();
-        Port sslPort =
-            getSslPortStr(instanceConfig) == null ? null : new Port(getSslPortStr(instanceConfig), PortType.SSL);
-        Port http2Port =
-            getHttp2PortStr(instanceConfig) == null ? null : new Port(getHttp2PortStr(instanceConfig), PortType.HTTP2);
-        CloudDataNode cloudDataNode = new CloudDataNode(instanceConfig.getHostName(),
-            new Port(Integer.parseInt(instanceConfig.getPort()), PortType.PLAINTEXT), sslPort, http2Port,
-            clusterMapConfig.clustermapVcrDatacenterName, clusterMapConfig);
-        newInstanceNameToCloudDataNode.put(instanceName, cloudDataNode);
-        newVcrNodes.add(cloudDataNode);
+        if (instanceConfig.getRecord().getBooleanField(VCR_HELIX_CONFIG_READY, false)) {
+          // only when VCR_HELIX_CONFIG_READY, we take action on it.
+          String instanceName = instanceConfig.getInstanceName();
+          Port sslPort =
+              getSslPortStr(instanceConfig) == null ? null : new Port(getSslPortStr(instanceConfig), PortType.SSL);
+          Port http2Port = getHttp2PortStr(instanceConfig) == null ? null
+              : new Port(getHttp2PortStr(instanceConfig), PortType.HTTP2);
+          CloudDataNode cloudDataNode = new CloudDataNode(instanceConfig.getHostName(),
+              new Port(Integer.parseInt(instanceConfig.getPort()), PortType.PLAINTEXT), sslPort, http2Port,
+              clusterMapConfig.clustermapVcrDatacenterName, clusterMapConfig);
+          newInstanceNameToCloudDataNode.put(instanceName, cloudDataNode);
+          newVcrNodes.add(cloudDataNode);
+          logger.info("Instance config change. VCR Node {} added. SslPort: {}, Http2Port: {}", cloudDataNode, sslPort,
+              http2Port);
+        } else {
+          logger.info("Instance config change received, but VCR_HELIX_CONFIG_READY is false. Instance: {}:{}",
+              instanceConfig.getHostName(), instanceConfig.getPort());
+        }
       }
 
       synchronized (notificationLock) {

@@ -25,6 +25,7 @@ import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.protocol.DeleteRequest;
 import com.github.ambry.protocol.DeleteResponse;
 import com.github.ambry.quota.QuotaChargeCallback;
+import com.github.ambry.quota.QuotaException;
 import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.Time;
 import java.util.Iterator;
@@ -68,6 +69,8 @@ class DeleteOperation {
   // the cause for failure of this operation. This will be set if and when the operation encounters an irrecoverable
   // failure.
   private final AtomicReference<Exception> operationException = new AtomicReference<Exception>();
+  // Quota charger for this operation.
+  private final OperationQuotaCharger operationQuotaCharger;
   // Denotes whether the operation is complete.
   private boolean operationCompleted = false;
 
@@ -102,6 +105,7 @@ class DeleteOperation {
     this.operationTracker =
         new SimpleOperationTracker(routerConfig, RouterOperation.DeleteOperation, blobId.getPartition(),
             originatingDcName, false, routerMetrics);
+    operationQuotaCharger = new OperationQuotaCharger(quotaChargeCallback, blobId, this.getClass().getSimpleName());
   }
 
   /**
@@ -128,7 +132,7 @@ class DeleteOperation {
       Port port = RouterUtils.getPortToConnectTo(replica, routerConfig.routerEnableHttp2NetworkClient);
       DeleteRequest deleteRequest = createDeleteRequest();
       deleteRequestInfos.put(deleteRequest.getCorrelationId(), new DeleteRequestInfo(time.milliseconds(), replica));
-      RequestInfo requestInfo = new RequestInfo(hostname, port, deleteRequest, replica);
+      RequestInfo requestInfo = new RequestInfo(hostname, port, deleteRequest, replica, operationQuotaCharger);
       requestRegistrationCallback.registerRequestToSend(this, requestInfo);
       replicaIterator.remove();
       if (RouterUtils.isRemoteReplica(routerConfig, replica)) {
@@ -311,9 +315,10 @@ class DeleteOperation {
       }
       if (quotaChargeCallback != null) {
         try {
-          quotaChargeCallback.chargeQuota();
-        } catch (RouterException routerException) {
-          logger.error("Exception  {} in quota charge event listener during delete operation", routerException.toString());
+          quotaChargeCallback.charge();
+        } catch (QuotaException quotaException) {
+          logger.error("Exception  {} in quota charge event listener during delete operation",
+              quotaException.toString());
         }
       }
       operationCompleted = true;

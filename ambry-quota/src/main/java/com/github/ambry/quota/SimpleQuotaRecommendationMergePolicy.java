@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright 2021 LinkedIn Corp. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,7 @@ import java.util.Map;
 
 
 /**
- * An implementation of {@link ThrottlePolicy} that creates a {@link ThrottlingRecommendation} to throttle if any one of
+ * An implementation of {@link QuotaRecommendationMergePolicy} that creates a {@link ThrottlingRecommendation} to throttle if any one of
  * {@link QuotaRecommendation} recommendation is to throttle, and takes the max of retry after time interval. Also
  * groups the quota usage for all the quotas.
  *
@@ -31,33 +31,31 @@ import java.util.Map;
  * false, we don't throttle on {@link QuotaName#READ_CAPACITY_UNIT} and {@link QuotaName#WRITE_CAPACITY_UNIT}. If the
  * {@link StorageQuotaConfig#shouldThrottle} is false, we don't throttle on {@link QuotaName#STORAGE_IN_GB}.
  */
-public class MaxThrottlePolicy implements ThrottlePolicy {
+public class SimpleQuotaRecommendationMergePolicy implements QuotaRecommendationMergePolicy {
   static final long DEFAULT_RETRY_AFTER_MS = ThrottlingRecommendation.NO_RETRY_AFTER_MS;
-  static final int DEFAULT_RECOMMENDED_HTTP_STATUS = HttpResponseStatus.OK.code();
   static final QuotaUsageLevel DEFAULT_QUOTA_USAGE_LEVEL = QuotaUsageLevel.HEALTHY;
 
   // Percentage usage at or below this limit is healthy.
-  static final int HEALTHY_USAGE_LEVEL_LIMIT = 80;
-  // Percentage usage level at or below this limit and above healthy limit will generate warning.
-  static final int WARNING_USAGE_LEVEL_LIMIT = 95;
-  // Percentage usage level at or below this limit and above warning limit will generate critical warning. Anything above will be fatal.
-  static final int CRITICAL_USAGE_LEVEL_LIMIT = 100;
+  private final int healthyUsageLevelLimit;
+  // Percentage usage level above which critical warning will be generated.
+  static final int CRITICAL_USAGE_LEVEL_LIMIT = 95;
 
   private final QuotaConfig quotaConfig;
 
   /**
-   * Constructor to create a {@link MaxThrottlePolicy}.
+   * Constructor to create a {@link SimpleQuotaRecommendationMergePolicy}.
    * @param quotaConfig The {@link QuotaConfig}.
    */
-  public MaxThrottlePolicy(QuotaConfig quotaConfig) {
+  public SimpleQuotaRecommendationMergePolicy(QuotaConfig quotaConfig) {
     this.quotaConfig = quotaConfig;
+    this.healthyUsageLevelLimit = quotaConfig.quotaUsageWarningThresholdInPercentage;
   }
 
   @Override
-  public ThrottlingRecommendation recommend(List<QuotaRecommendation> quotaRecommendations) {
+  public ThrottlingRecommendation mergeEnforcementRecommendations(List<QuotaRecommendation> quotaRecommendations) {
     boolean shouldThrottle = false;
     Map<QuotaName, Float> quotaUsagePercentage = new HashMap<>();
-    int recommendedHttpStatus = DEFAULT_RECOMMENDED_HTTP_STATUS;
+    HttpResponseStatus recommendedHttpStatus = QuotaRecommendationMergePolicy.ACCEPT_HTTP_STATUS;
     long retryAfterMs = DEFAULT_RETRY_AFTER_MS;
     for (QuotaRecommendation recommendation : quotaRecommendations) {
       boolean currentQuotaShouldThrottle = recommendation.shouldThrottle();
@@ -69,7 +67,7 @@ public class MaxThrottlePolicy implements ThrottlePolicy {
       }
       shouldThrottle = shouldThrottle | currentQuotaShouldThrottle;
       quotaUsagePercentage.put(recommendation.getQuotaName(), recommendation.getQuotaUsagePercentage());
-      recommendedHttpStatus = Math.max(recommendation.getRecommendedHttpStatus(), recommendedHttpStatus);
+      recommendedHttpStatus = QuotaUtils.quotaRecommendedHttpResponse(shouldThrottle);
       retryAfterMs = Math.max(recommendation.getRetryAfterMs(), retryAfterMs);
     }
     QuotaUsageLevel quotaUsageLevel = quotaUsagePercentage.isEmpty() ? DEFAULT_QUOTA_USAGE_LEVEL
@@ -84,13 +82,13 @@ public class MaxThrottlePolicy implements ThrottlePolicy {
    * @return QuotaWarningLevel object.
    */
   private QuotaUsageLevel computeWarningLevel(float usagePercentage) {
-    if (usagePercentage >= CRITICAL_USAGE_LEVEL_LIMIT) {
+    if (usagePercentage >= 100) {
       return QuotaUsageLevel.EXCEEDED;
     }
-    if (usagePercentage >= WARNING_USAGE_LEVEL_LIMIT) {
+    if (usagePercentage >= CRITICAL_USAGE_LEVEL_LIMIT) {
       return QuotaUsageLevel.CRITICAL;
     }
-    if (usagePercentage >= HEALTHY_USAGE_LEVEL_LIMIT) {
+    if (usagePercentage >= healthyUsageLevelLimit) {
       return QuotaUsageLevel.WARNING;
     }
     return QuotaUsageLevel.HEALTHY;

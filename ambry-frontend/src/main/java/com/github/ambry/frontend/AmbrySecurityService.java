@@ -25,9 +25,7 @@ import com.github.ambry.quota.QuotaManager;
 import com.github.ambry.quota.QuotaMode;
 import com.github.ambry.quota.QuotaName;
 import com.github.ambry.quota.QuotaUtils;
-import com.github.ambry.quota.RequestCostPolicy;
 import com.github.ambry.quota.ThrottlingRecommendation;
-import com.github.ambry.quota.UserQuotaRequestCostPolicy;
 import com.github.ambry.rest.RequestPath;
 import com.github.ambry.rest.ResponseStatus;
 import com.github.ambry.rest.RestMethod;
@@ -65,7 +63,7 @@ class AmbrySecurityService implements SecurityService {
   private final UrlSigningService urlSigningService;
   private final HostLevelThrottler hostLevelThrottler;
   private final QuotaManager quotaManager;
-  private final RequestCostPolicy requestCostPolicy;
+  private final AmbryCostModelPolicy ambryCostModelPolicy;
   private boolean isOpen;
 
   AmbrySecurityService(FrontendConfig frontendConfig, FrontendMetrics frontendMetrics,
@@ -75,7 +73,7 @@ class AmbrySecurityService implements SecurityService {
     this.urlSigningService = urlSigningService;
     this.hostLevelThrottler = hostLevelThrottler;
     this.quotaManager = quotaManager;
-    this.requestCostPolicy = new UserQuotaRequestCostPolicy(quotaManager.getQuotaConfig());
+    this.ambryCostModelPolicy = new SimpleAmbryCostModelPolicy();
     isOpen = true;
   }
 
@@ -162,10 +160,7 @@ class AmbrySecurityService implements SecurityService {
 
   @Override
   public void processRequestCharges(RestRequest restRequest, RestResponseChannel responseChannel, BlobInfo blobInfo) {
-    Map<QuotaName, Double> requestCost = requestCostPolicy.calculateRequestCost(restRequest, responseChannel, blobInfo)
-        .entrySet()
-        .stream()
-        .collect(Collectors.toMap(entry -> QuotaName.valueOf(entry.getKey()), entry -> entry.getValue()));
+    Map<String, Double> requestCost = ambryCostModelPolicy.calculateRequestCost(restRequest, responseChannel, blobInfo);
     setRequestCostHeader(requestCost, responseChannel);
     if (QuotaUtils.isRequestResourceQuotaManaged(restRequest) && quotaManager != null) {
       ThrottlingRecommendation throttlingRecommendation = quotaManager.getThrottleRecommendation(restRequest);
@@ -202,7 +197,7 @@ class AmbrySecurityService implements SecurityService {
         responseChannel.setHeader(RestUtils.Headers.DATE, new GregorianCalendar().getTime());
         switch (restMethod) {
           case HEAD:
-            options = RestUtils.buildGetBlobOptions(restRequest.getArgs(), null, GetOption.None,
+            options = RestUtils.buildGetBlobOptions(restRequest.getArgs(), null, GetOption.None, restRequest,
                 NO_BLOB_SEGMENT_IDX_SPECIFIED);
             responseChannel.setStatus(options.getRange() == null ? ResponseStatus.Ok : ResponseStatus.PartialContent);
             responseChannel.setHeader(RestUtils.Headers.LAST_MODIFIED,
@@ -211,7 +206,7 @@ class AmbrySecurityService implements SecurityService {
             break;
           case GET:
             if (!requestPath.matchesOperation(Operations.GET_SIGNED_URL)) {
-              options = RestUtils.buildGetBlobOptions(restRequest.getArgs(), null, GetOption.None,
+              options = RestUtils.buildGetBlobOptions(restRequest.getArgs(), null, GetOption.None, restRequest,
                   NO_BLOB_SEGMENT_IDX_SPECIFIED);
               responseChannel.setStatus(ResponseStatus.Ok);
               RestUtils.SubResource subResource = RestUtils.getRequestPath(restRequest).getSubResource();

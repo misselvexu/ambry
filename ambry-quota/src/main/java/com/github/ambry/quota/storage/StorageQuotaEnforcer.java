@@ -19,9 +19,9 @@ import com.github.ambry.account.AccountService;
 import com.github.ambry.account.Container;
 import com.github.ambry.accountstats.AccountStatsStore;
 import com.github.ambry.config.StorageQuotaConfig;
-import com.github.ambry.messageformat.BlobInfo;
 import com.github.ambry.quota.Quota;
 import com.github.ambry.quota.QuotaEnforcer;
+import com.github.ambry.quota.QuotaException;
 import com.github.ambry.quota.QuotaName;
 import com.github.ambry.quota.QuotaRecommendation;
 import com.github.ambry.quota.QuotaResource;
@@ -31,7 +31,9 @@ import com.github.ambry.rest.RestRequest;
 import com.github.ambry.rest.RestUtils;
 import com.github.ambry.utils.Pair;
 import com.github.ambry.utils.Utils;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
@@ -46,15 +48,15 @@ import org.slf4j.LoggerFactory;
  * An {@link QuotaEnforcer} implementation on each container's storage usage.
  */
 public class StorageQuotaEnforcer implements QuotaEnforcer {
+  private static final List<QuotaName> SUPPORTED_QUOTA_NAMES =
+      Collections.unmodifiableList(Arrays.asList(QuotaName.STORAGE_IN_GB));
   private static final Logger logger = LoggerFactory.getLogger(StorageQuotaEnforcer.class);
   private static final String STORAGE_QUOTA_SERVICE_PREFIX = "storage-quota-enforcer";
-  private static final int HTTP_STATUS_THROTTLE = 429;
-  private static final int HTTP_STATUS_ALLOW = 200;
   private static final long NO_RETRY = -1L;
   private static final long BYTES_IN_GB = 1024 * 1024 * 1024;
   // The quota recommendation returned when there is no quota found for the given account/container.
   private static final QuotaRecommendation NO_QUOTA_VALUE_RECOMMENDATION =
-      new QuotaRecommendation(false, 0.0f, QuotaName.STORAGE_IN_GB, HTTP_STATUS_ALLOW, NO_RETRY);
+      new QuotaRecommendation(false, 0.0f, QuotaName.STORAGE_IN_GB, NO_RETRY);
   protected final StorageUsageRefresher storageUsageRefresher;
   protected final QuotaSource quotaSource;
   protected final StorageQuotaConfig config;
@@ -112,14 +114,13 @@ public class StorageQuotaEnforcer implements QuotaEnforcer {
   }
 
   @Override
-  public QuotaRecommendation chargeAndRecommend(RestRequest restRequest, BlobInfo blobInfo,
-      Map<QuotaName, Double> requestCostMap) {
+  public QuotaRecommendation charge(RestRequest restRequest, Map<QuotaName, Double> requestCostMap) {
     if (!RestUtils.isUploadRequest(restRequest)) {
-      return NO_QUOTA_VALUE_RECOMMENDATION;
+      return null;
     }
     if (!requestCostMap.containsKey(QuotaName.STORAGE_IN_GB)) {
       // No cost for the desired QuotaName, then just call recommend
-      return recommend(restRequest);
+      return null;
     }
 
     // The cost is number of bytes in GB. Convert it back to raw number.
@@ -151,8 +152,17 @@ public class StorageQuotaEnforcer implements QuotaEnforcer {
     }
     boolean shouldThrottle = currentUsage >= quotaValue;
     float usagePercentage = currentUsage >= quotaValue ? 100f : ((float) currentUsage) / quotaValue * 100f;
-    return new QuotaRecommendation(shouldThrottle, usagePercentage, QuotaName.STORAGE_IN_GB,
-        shouldThrottle ? HTTP_STATUS_THROTTLE : HTTP_STATUS_ALLOW, NO_RETRY);
+    return new QuotaRecommendation(shouldThrottle, usagePercentage, QuotaName.STORAGE_IN_GB, NO_RETRY);
+  }
+
+  @Override
+  public boolean isQuotaExceedAllowed(RestRequest restRequest) {
+    return false;
+  }
+
+  @Override
+  public List<QuotaName> supportedQuotaNames() {
+    return SUPPORTED_QUOTA_NAMES;
   }
 
   /**
@@ -304,12 +314,15 @@ public class StorageQuotaEnforcer implements QuotaEnforcer {
    * @return The storage quota value (in bytes)
    */
   protected long getQuotaValueForResource(QuotaResource resource) {
+    long quotaValue = -1;
+    try {
     Quota quota = quotaSource.getQuota(resource, QuotaName.STORAGE_IN_GB);
-    if (quota != null) {
-      return (long) quota.getQuotaValue() * BYTES_IN_GB;
-    } else {
-      return -1;
+    quotaValue = (long) quota.getQuotaValue() * BYTES_IN_GB;
+    } catch (QuotaException quotaException) {
+      logger.warn("Quota not found for resource id: {}, type: {}", resource.getResourceId(),
+          resource.getQuotaResourceType());
     }
+    return quotaValue;
   }
 
   /**
