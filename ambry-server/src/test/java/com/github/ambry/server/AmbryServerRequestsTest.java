@@ -32,6 +32,7 @@ import com.github.ambry.commons.CommonTestUtils;
 import com.github.ambry.commons.ErrorMapping;
 import com.github.ambry.commons.ServerMetrics;
 import com.github.ambry.config.ClusterMapConfig;
+import com.github.ambry.config.DiskManagerConfig;
 import com.github.ambry.config.ReplicationConfig;
 import com.github.ambry.config.ServerConfig;
 import com.github.ambry.config.StatsManagerConfig;
@@ -49,6 +50,7 @@ import com.github.ambry.network.SocketRequestResponseChannel;
 import com.github.ambry.protocol.AdminRequest;
 import com.github.ambry.protocol.AdminRequestOrResponseType;
 import com.github.ambry.protocol.AdminResponse;
+import com.github.ambry.protocol.AdminResponseWithContent;
 import com.github.ambry.protocol.AmbryRequests;
 import com.github.ambry.protocol.BlobStoreControlAction;
 import com.github.ambry.protocol.BlobStoreControlAdminRequest;
@@ -100,6 +102,7 @@ import io.netty.buffer.Unpooled;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -110,7 +113,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Assume;
@@ -143,6 +148,7 @@ public class AmbryServerRequestsTest {
   private final MockStoreKeyConverterFactory storeKeyConverterFactory;
   private final ReplicationConfig replicationConfig;
   private final ServerConfig serverConfig;
+  private final DiskManagerConfig diskManagerConfig;
   private final ClusterMapConfig clusterMapConfig;
   private final ServerMetrics serverMetrics;
   private final String localDc;
@@ -162,6 +168,7 @@ public class AmbryServerRequestsTest {
     VerifiableProperties verifiableProperties = new VerifiableProperties(properties);
     replicationConfig = new ReplicationConfig(verifiableProperties);
     serverConfig = new ServerConfig(verifiableProperties);
+    diskManagerConfig = new DiskManagerConfig(verifiableProperties);
     clusterMapConfig = new ClusterMapConfig(verifiableProperties);
     StatsManagerConfig statsManagerConfig = new StatsManagerConfig(verifiableProperties);
     dataNodeId =
@@ -182,7 +189,7 @@ public class AmbryServerRequestsTest {
     serverMetrics = new ServerMetrics(clusterMap.getMetricRegistry(), AmbryRequests.class, AmbryServer.class);
     ambryRequests = new AmbryServerRequests(storageManager, requestResponseChannel, clusterMap, dataNodeId,
         clusterMap.getMetricRegistry(), serverMetrics, findTokenHelper, null, replicationManager, null, serverConfig,
-        storeKeyConverterFactory, statsManager, helixParticipant);
+        diskManagerConfig, storeKeyConverterFactory, statsManager, helixParticipant);
     storageManager.start();
     Mockito.when(mockDelegate.unseal(any())).thenReturn(true);
     Mockito.when(mockDelegate.unmarkStopped(anyList())).thenReturn(true);
@@ -302,7 +309,7 @@ public class AmbryServerRequestsTest {
    * @throws IOException
    */
   @Test
-  public void scheduleCompactionFailureTest() throws InterruptedException, IOException {
+  public void scheduleCompactionFailureTest() throws InterruptedException, IOException, StoreException {
     // partitionId not specified
     doScheduleCompactionTest(null, ServerErrorCode.Bad_Request);
 
@@ -501,7 +508,7 @@ public class AmbryServerRequestsTest {
         new MockStorageManager(validKeysInStore, clusterMap, dataNodeId, findTokenHelper, helixParticipant);
     ambryRequests = new AmbryServerRequests(storageManager, requestResponseChannel, clusterMap, dataNodeId,
         clusterMap.getMetricRegistry(), serverMetrics, findTokenHelper, null, replicationManager, null, serverConfig,
-        storeKeyConverterFactory, statsManager, helixParticipant);
+        diskManagerConfig, storeKeyConverterFactory, statsManager, helixParticipant);
     List<? extends PartitionId> partitionIds = clusterMap.getAllPartitionIds(null);
     PartitionId id = partitionIds.get(0);
     List<? extends ReplicaId> replicaIds = id.getReplicaIds();
@@ -626,7 +633,7 @@ public class AmbryServerRequestsTest {
         new MockStorageManager(validKeysInStore, clusterMap, dataNodeId, findTokenHelper, helixParticipant);
     ambryRequests = new AmbryServerRequests(storageManager, requestResponseChannel, clusterMap, dataNodeId,
         clusterMap.getMetricRegistry(), serverMetrics, findTokenHelper, null, replicationManager, null, serverConfig,
-        storeKeyConverterFactory, statsManager, helixParticipant);
+        diskManagerConfig, storeKeyConverterFactory, statsManager, helixParticipant);
 
     // find a partition that has a replica on current node
     ReplicaId localReplica = clusterMap.getReplicaIds(dataNodeId).get(0);
@@ -677,7 +684,7 @@ public class AmbryServerRequestsTest {
    * @throws IOException
    */
   @Test
-  public void stopBlobStoreFailureTest() throws InterruptedException, IOException {
+  public void stopBlobStoreFailureTest() throws InterruptedException, IOException, StoreException {
     List<? extends PartitionId> partitionIds = clusterMap.getAllPartitionIds(null);
     PartitionId id = partitionIds.get(0);
     short numReplicasCaughtUpPerPartition = 3;
@@ -859,7 +866,7 @@ public class AmbryServerRequestsTest {
         new ServerMetrics(clusterMap.getMetricRegistry(), AmbryRequests.class, AmbryServer.class);
     AmbryServerRequests other = new AmbryServerRequests(storageManager, requestResponseChannel, clusterMap, dataNodeId,
         clusterMap.getMetricRegistry(), serverMetrics, findTokenHelper, null, replicationManager, null, serverConfig,
-        storeKeyConverterFactory, statsManager, null);
+        diskManagerConfig, storeKeyConverterFactory, statsManager, null);
 
     AmbryServerRequests temp = ambryRequests;
     ambryRequests = other;
@@ -937,6 +944,119 @@ public class AmbryServerRequestsTest {
     assertEquals("cross-colo fetch bytes are not expected", responseList.get(0).sizeInBytes(),
         serverMetrics.crossColoFetchBytesRate.get(remoteNode.getDatacenterName()).getCount());
     responseList.forEach(Response::release);
+  }
+
+  /**
+   * Performs the AdminRequest and Response as well as checking if the content is a json and expected
+   * @param partitionId necessary to fulfill the {@link AdminRequest}
+   * @param description for what this function call is attempting to test
+   * @param expectedResponse the response that should be returned from {@link AdminResponseWithContent}
+   * @throws IOException
+   * @throws InterruptedException
+   */
+  public void doRequestAndHealthCheck(PartitionId partitionId, String description, JSONObject expectedResponse)
+      throws IOException, InterruptedException {
+
+    int correlationId = TestUtils.RANDOM.nextInt();
+    String clientId = TestUtils.getRandomString(10);
+
+    AdminRequest adminRequest =
+        new AdminRequest(AdminRequestOrResponseType.HealthCheck, partitionId, correlationId, clientId);
+
+    AdminResponseWithContent response =
+        (AdminResponseWithContent) sendRequestGetResponse(adminRequest, ServerErrorCode.No_Error);
+    String content = new String(response.getContent(), StandardCharsets.UTF_8);
+
+    //Ensures the response is as expected
+    JSONObject contentJSON = new JSONObject(content);
+
+    //Either compares the health by string or compares the arrays without order
+    assertEquals(description, expectedResponse.toString(), contentJSON.toString());
+  }
+
+  /**
+   * Allows an extra property to be made and then encapsulates this property in a new environment to be tested on
+   * @param properties the set of properties this environment will have
+   * @param propertyKey the new key to be added to the properties variable
+   * @param propertyValue the new value for the propertyKey
+   * @throws IOException
+   * @throws InterruptedException
+   * @throws StoreException
+   */
+  public void setPropertyToAmbryRequests(Properties properties, String propertyKey, String propertyValue)
+      throws IOException, InterruptedException, StoreException {
+    storageManager.shutdown();
+    properties.setProperty(propertyKey, propertyValue); //Adds the new key-value pair
+
+    //Initializes the new environment through clusterMap, storageManager, and AmbryRequests
+    ClusterMap clusterMap = new MockClusterMap();
+    DiskManagerConfig diskManagerConfig = new DiskManagerConfig(new VerifiableProperties(properties));
+    storageManager =
+        new MockStorageManager(validKeysInStore, clusterMap, dataNodeId, findTokenHelper, null, diskManagerConfig);
+    ambryRequests = new AmbryServerRequests(storageManager, requestResponseChannel, clusterMap, dataNodeId,
+        clusterMap.getMetricRegistry(), serverMetrics, findTokenHelper, null, replicationManager, null, serverConfig,
+        diskManagerConfig, storeKeyConverterFactory, statsManager, helixParticipant);
+    storageManager.start();
+  }
+
+  /**
+   * Tests Replica State and Disk State for appropriate responses from healthCheck admin endpoint
+   * @throws InterruptedException
+   * @throws IOException
+   */
+  @Test
+  public void healthCheckTest() throws InterruptedException, StoreException, IOException {
+
+    //retrieves writeable partitions to test with
+    List<? extends PartitionId> partitionIds = clusterMap.getWritablePartitionIds(DEFAULT_PARTITION_CLASS);
+    JSONObject expectedJSONReponse = new JSONObject();
+    expectedJSONReponse.put("brokenDisks", new JSONArray());
+    expectedJSONReponse.put("unstablePartitions", new JSONArray());
+
+    for (PartitionId id : partitionIds) {
+
+      // Test 1: "Good" response excepted where the host state is in either Standby or Leader
+      ReplicaState originalPartitionState = storageManager.getStore(id).getCurrentState();
+
+      //change Partition to Standby or Leader
+      storageManager.getStore(id)
+          .setCurrentState(TestUtils.RANDOM.nextInt() % 2 == 0 ? ReplicaState.STANDBY : ReplicaState.LEADER);
+
+      expectedJSONReponse.put("health", ServerHealthStatus.GOOD);
+      doRequestAndHealthCheck(id, "Payload was expected to indicate healthy host", expectedJSONReponse);
+
+      //Test 2: "BAD" response expected where we change partition to error State
+      //change all replica states in partition to ERROR
+      storageManager.getStore(id).setCurrentState(ReplicaState.ERROR);
+
+      expectedJSONReponse.put("health", ServerHealthStatus.BAD);
+      JSONArray unstablePartitions = new JSONArray();
+      JSONObject unstablePartition = new JSONObject();
+      unstablePartition.put("partitionId", id);
+      unstablePartition.put("reason", ReplicaState.ERROR);
+      unstablePartitions.put(unstablePartition);
+      expectedJSONReponse.put("unstablePartitions", unstablePartitions);
+      doRequestAndHealthCheck(id, "Payload was expected to be BAD with no disk healthchecks", expectedJSONReponse);
+
+      //restore the state of the Partition
+      storageManager.getStore(id).setCurrentState(originalPartitionState);
+      expectedJSONReponse.put("unstablePartitions", new JSONArray());
+    }
+
+    //Test 3: "GOOD" response expected, enabling disk healthchecking on the partition of interest and
+    // disk's should be healthy
+
+    Properties currentProperties = createProperties(validateRequestOnStoreState, true);
+    setPropertyToAmbryRequests(currentProperties, "disk.manager.disk.healthcheck.enabled", "true");
+    TimeUnit.SECONDS.sleep(5); // Enough time to perform each step of disk healthcheck(create,write,read,delete)
+
+    expectedJSONReponse.put("health", ServerHealthStatus.GOOD);
+    doRequestAndHealthCheck(partitionIds.get(0),
+        "Payload was expected to be GOOD with all disks passing disk healthcheck", expectedJSONReponse);
+
+    //Restores the environment from no longer using disk healthchecks
+    currentProperties = createProperties(validateRequestOnStoreState, true);
+    setPropertyToAmbryRequests(currentProperties, "disk.manager.disk.healthcheck.enabled", "false");
   }
 
   // helpers

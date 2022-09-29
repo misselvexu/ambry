@@ -15,7 +15,6 @@ package com.github.ambry.clustermap;
 
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.config.ClusterMapConfig;
-import com.github.ambry.utils.ByteBufferInputStream;
 import com.github.ambry.utils.SystemTime;
 import java.io.IOException;
 import java.io.InputStream;
@@ -162,11 +161,6 @@ public class HelixClusterManager implements ClusterMap {
       for (AmbryPartition partition : partitionMap.values()) {
         partition.resolvePartitionState();
       }
-      if (clusterMapConfig.clusterMapClusterChangeHandlerType.equals(
-          SimpleClusterChangeHandler.class.getSimpleName())) {
-        // capacity stats needs to be initialized only when SimpleClusterChangeHandler is adopted.
-        initializeCapacityStats();
-      }
       helixClusterManagerMetrics.initializeInstantiationMetric(true,
           initializationFailureMap.values().stream().filter(Objects::nonNull).count());
       helixClusterManagerMetrics.initializeXidMetric(currentXid);
@@ -235,25 +229,6 @@ public class HelixClusterManager implements ClusterMap {
       }
     }
     return manager;
-  }
-
-  /**
-   * Initialize capacity statistics.
-   */
-  private void initializeCapacityStats() {
-    for (DcInfo dcInfo : dcToDcInfo.values()) {
-      Map<AmbryDataNode, Set<AmbryDisk>> dataNodeToDisks = dcInfo.clusterChangeHandler.getDataNodeToDisksMap();
-      for (Set<AmbryDisk> disks : dataNodeToDisks.values()) {
-        for (AmbryDisk disk : disks) {
-          clusterWideRawCapacityBytes.getAndAdd(disk.getRawCapacityInBytes());
-        }
-      }
-    }
-    for (Set<AmbryReplica> partitionReplicas : ambryPartitionToAmbryReplicas.values()) {
-      long replicaCapacity = partitionReplicas.iterator().next().getCapacityInBytes();
-      clusterWideAllocatedRawCapacityBytes.getAndAdd(replicaCapacity * partitionReplicas.size());
-      clusterWideAllocatedUsableCapacityBytes.getAndAdd(replicaCapacity);
-    }
   }
 
   @Override

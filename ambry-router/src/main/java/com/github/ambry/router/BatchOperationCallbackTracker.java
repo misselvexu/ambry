@@ -17,11 +17,13 @@ import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.Callback;
 import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.quota.QuotaException;
+import com.github.ambry.quota.QuotaUtils;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,6 +38,9 @@ class BatchOperationCallbackTracker {
   private final FutureResult<Void> futureResult;
   private final Callback<Void> callback;
   private final long numBlobIds;
+  private final AtomicBoolean finalOperationReadyToDo = new AtomicBoolean(false);
+  private final BlobId finalBlobId;
+  private final BiConsumer<BlobId, Callback> finalOperation;
   private final QuotaChargeCallback quotaChargeCallback;
   private final ConcurrentMap<BlobId, Boolean> blobIdToAck = new ConcurrentHashMap<>();
   private final AtomicLong ackedCount = new AtomicLong(0);
@@ -44,11 +49,14 @@ class BatchOperationCallbackTracker {
   /**
    * Constructor
    * @param blobIds the {@link BlobId}s being tracked
+   * @param finalBlobId the final {@link BlobId} to send after all the {@code blobids} are acked.
    * @param futureResult the {@link FutureResult} to be triggered once acks are received for all blobs
    * @param callback the {@link Callback} to be triggered once acks are received for all blobs
    * @param quotaChargeCallback The {@link QuotaChargeCallback} to be triggered to account for quota usage.
+   * @param finalOperation The operation to call on the {@code finalBlobId}.
    */
-  BatchOperationCallbackTracker(List<BlobId> blobIds, FutureResult<Void> futureResult, Callback<Void> callback, QuotaChargeCallback quotaChargeCallback) {
+  BatchOperationCallbackTracker(List<BlobId> blobIds, BlobId finalBlobId, FutureResult<Void> futureResult,
+      Callback<Void> callback, QuotaChargeCallback quotaChargeCallback, BiConsumer<BlobId, Callback> finalOperation) {
     numBlobIds = blobIds.size();
     blobIds.forEach(blobId -> blobIdToAck.put(blobId, false));
     if (blobIdToAck.size() != numBlobIds) {
@@ -57,6 +65,8 @@ class BatchOperationCallbackTracker {
     this.futureResult = futureResult;
     this.callback = callback;
     this.quotaChargeCallback = quotaChargeCallback;
+    this.finalOperation = finalOperation;
+    this.finalBlobId = finalBlobId;
   }
 
   /**
@@ -67,13 +77,25 @@ class BatchOperationCallbackTracker {
   Callback<Void> getCallback(final BlobId blobId) {
     return (result, exception) -> {
       if (exception == null) {
-        if (blobIdToAck.put(blobId, true)) {
+        if (!blobIdToAck.containsKey(blobId)) {
+          complete(new RouterException("Ack for unknown " + blobId + " arrived",
+              RouterErrorCode.UnexpectedInternalError));
+        } else if (blobIdToAck.put(blobId, true)) {
           // already acked once
           complete(new RouterException("Ack for " + blobId + " arrived more than once",
               RouterErrorCode.UnexpectedInternalError));
         } else if (ackedCount.incrementAndGet() >= numBlobIds) {
           // acked for the first time for this blob id and all the blob ids have been acked
-          complete(null);
+          if(finalOperationReadyToDo.compareAndSet(false, true)) {
+            // if final operation hasn't been started yet, then start it.
+            blobIdToAck.put(finalBlobId, false);
+            NonBlockingRouter.currentOperationsCount.incrementAndGet();
+            finalOperation.accept(finalBlobId, getCallback(finalBlobId));
+          }
+
+          if(blobId.equals(finalBlobId)) {
+              complete(null);
+          }
         }
       } else {
         complete(exception);
@@ -82,14 +104,21 @@ class BatchOperationCallbackTracker {
   }
 
   /**
+   * @return if the operation is completed. Used for tests.
+   */
+  boolean isCompleted() {
+    return completed.get();
+  }
+
+  /**
    * Completes the batch operation
    * @param e the {@link Exception} that occurred (if any).
    */
   private void complete(Exception e) {
     if (completed.compareAndSet(false, true)) {
-      if (quotaChargeCallback != null) {
+      if (QuotaUtils.postProcessCharge(quotaChargeCallback)) {
         try {
-          quotaChargeCallback.charge();
+          quotaChargeCallback.checkAndCharge(false, true);
         } catch (QuotaException quotaException) {
           LOGGER.info("Exception {} while charging quota for ttl operation", quotaException.toString());
         }

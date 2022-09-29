@@ -26,10 +26,10 @@ import com.github.ambry.network.PortType;
 import com.github.ambry.network.RequestInfo;
 import com.github.ambry.network.SendWithCorrelationId;
 import com.github.ambry.quota.Chargeable;
+import com.github.ambry.quota.QuotaAction;
 import com.github.ambry.quota.QuotaMethod;
 import com.github.ambry.quota.QuotaResource;
 import com.github.ambry.quota.QuotaResourceType;
-import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -59,7 +59,8 @@ public class QuotaAwareOperationControllerTest {
   private static final Port PORT = new Port(80, PortType.PLAINTEXT);
   private static final SendWithCorrelationId SEND = Mockito.mock(SendWithCorrelationId.class);
   private static final ReplicaId REPLICA_ID = Mockito.mock(ReplicaId.class);
-  private static final QuotaResource TEST_QUOTA_RESOURCE = new QuotaResource("test", QuotaResourceType.ACCOUNT);
+  private static final QuotaResource TEST_QUOTA_RESOURCE1 = new QuotaResource("test1", QuotaResourceType.ACCOUNT);
+  private static final QuotaResource TEST_QUOTA_RESOURCE2 = new QuotaResource("test2", QuotaResourceType.ACCOUNT);
 
   private final PutManager putManager = Mockito.mock(PutManager.class);
   private final GetManager getManager = Mockito.mock(GetManager.class);
@@ -128,7 +129,7 @@ public class QuotaAwareOperationControllerTest {
 
   @Test
   public void testSimpleDrainageEmpty() {
-    TestChargeable chargeable = new TestChargeable(true, true, false, TEST_QUOTA_RESOURCE, quotaMethod);
+    TestChargeable chargeable = new TestChargeable(QuotaAction.ALLOW, TEST_QUOTA_RESOURCE1, quotaMethod);
     doAnswer((Answer<Void>) invocation -> {
       List<RequestInfo> requestsToSend = (List<RequestInfo>) invocation.getArguments()[0];
       requestsToSend.add(new RequestInfo(HOST, PORT, SEND, REPLICA_ID, chargeable));
@@ -136,32 +137,61 @@ public class QuotaAwareOperationControllerTest {
     }).when(putManager).poll(requestsToSend, requestsToDrop);
     quotaAwareOperationController.pollForRequests(requestsToSend, requestsToDrop);
     assertEquals(0, quotaAwareOperationController.getRequestQueue(quotaMethod).size());
-    chargeable.verifyCalls(1, 1, 0, 1);
+    assertEquals(0, quotaAwareOperationController.getDelayedQuotaResourcesInQueue());
+    assertEquals(0, quotaAwareOperationController.getOutOfQuotaResourcesInQueue());
+
+    assertTrue(quotaAwareOperationController.routerMetrics.totalQuotaQueueingDelay.getMeanRate() > 0);
+    assertTrue(quotaAwareOperationController.routerMetrics.addToQueueTime.getMeanRate() > 0);
+    assertTrue(quotaAwareOperationController.routerMetrics.drainRequestQueueTime.getMeanRate() > 0);
+    assertTrue(quotaAwareOperationController.routerMetrics.pollExceedAllowedRequestTime.getMeanRate() > 0);
+    assertTrue(quotaAwareOperationController.routerMetrics.pollExceedAllowedRequestTime.getMeanRate() > 0);
+    chargeable.verifyCalls(1, 1);
   }
 
   @Test
   public void testSimpleDrainageOutOfQuota() {
-    TestChargeable testChargeable =
-        new TestChargeable(Arrays.asList(false, true, false, true, true), true, false, TEST_QUOTA_RESOURCE,
-            Collections.singletonList(quotaMethod));
+    TestChargeable testChargeable1 = new TestChargeable(
+        Arrays.asList(QuotaAction.DELAY, QuotaAction.DELAY, QuotaAction.ALLOW, QuotaAction.DELAY, QuotaAction.DELAY,
+            QuotaAction.ALLOW), TEST_QUOTA_RESOURCE1, quotaMethod);
     doAnswer((Answer<Void>) invocation -> {
       List<RequestInfo> requestsToSend = (List<RequestInfo>) invocation.getArguments()[0];
-      requestsToSend.add(new RequestInfo(HOST, PORT, SEND, REPLICA_ID, testChargeable));
+      requestsToSend.add(new RequestInfo(HOST, PORT, SEND, REPLICA_ID, testChargeable1));
       return null;
     }).when(putManager).poll(requestsToSend, requestsToDrop);
     quotaAwareOperationController.pollForRequests(requestsToSend, requestsToDrop);
     assertEquals(1, quotaAwareOperationController.getRequestQueue(quotaMethod).size());
-    assertEquals(1, quotaAwareOperationController.getRequestQueue(quotaMethod).get(TEST_QUOTA_RESOURCE).size());
-    testChargeable.verifyCalls(1, 0, 1, 1);
+    assertEquals(1, quotaAwareOperationController.getRequestQueue(quotaMethod).get(TEST_QUOTA_RESOURCE1).size());
+    assertEquals(1, quotaAwareOperationController.getOutOfQuotaResourcesInQueue());
+    assertEquals(1, quotaAwareOperationController.getDelayedQuotaResourcesInQueue());
+    testChargeable1.verifyCalls(2, 1);
 
     quotaAwareOperationController.pollForRequests(requestsToSend, requestsToDrop);
     assertEquals(1, quotaAwareOperationController.getRequestQueue(quotaMethod).size());
-    assertEquals(1, quotaAwareOperationController.getRequestQueue(quotaMethod).get(TEST_QUOTA_RESOURCE).size());
-    testChargeable.verifyCalls(3, 1, 2, 2);
+    assertEquals(1, quotaAwareOperationController.getRequestQueue(quotaMethod).get(TEST_QUOTA_RESOURCE1).size());
+    assertEquals(1, quotaAwareOperationController.getOutOfQuotaResourcesInQueue());
+    assertEquals(1, quotaAwareOperationController.getDelayedQuotaResourcesInQueue());
+    testChargeable1.verifyCalls(5, 2);
 
     quotaAwareOperationController.pollForRequests(requestsToSend, requestsToDrop);
     assertEquals(0, quotaAwareOperationController.getRequestQueue(quotaMethod).size());
-    testChargeable.verifyCalls(4, 2, 2, 2);
+    assertEquals(0, quotaAwareOperationController.getOutOfQuotaResourcesInQueue());
+    assertEquals(0, quotaAwareOperationController.getDelayedQuotaResourcesInQueue());
+    testChargeable1.verifyCalls(6, 2);
+  }
+
+  @Test
+  public void testSimpleDrainageOutOfQuotaMultipleAccounts() {
+    TestChargeable testChargeable1 = new TestChargeable(QuotaAction.ALLOW, TEST_QUOTA_RESOURCE1, quotaMethod);
+    TestChargeable testChargeable2 = new TestChargeable(QuotaAction.ALLOW, TEST_QUOTA_RESOURCE2, quotaMethod);
+    doAnswer((Answer<Void>) invocation -> {
+      List<RequestInfo> requestsToSend = (List<RequestInfo>) invocation.getArguments()[0];
+      requestsToSend.add(new RequestInfo(HOST, PORT, SEND, REPLICA_ID, testChargeable1));
+      requestsToSend.add(new RequestInfo(HOST, PORT, SEND, REPLICA_ID, testChargeable2));
+      return null;
+    }).when(putManager).poll(requestsToSend, requestsToDrop);
+
+    quotaAwareOperationController.pollForRequests(requestsToSend, requestsToDrop);
+    assertEquals(0, quotaAwareOperationController.getRequestQueue(quotaMethod).size());
   }
 
   @Test
@@ -169,7 +199,7 @@ public class QuotaAwareOperationControllerTest {
     doAnswer((Answer<Void>) invocation -> {
       List<RequestInfo> requestsToSend = (List<RequestInfo>) invocation.getArguments()[0];
       requestsToSend.add(new RequestInfo(HOST, PORT, SEND, REPLICA_ID,
-          new TestChargeable(false, true, true, TEST_QUOTA_RESOURCE, quotaMethod)));
+          new TestChargeable(QuotaAction.ALLOW, TEST_QUOTA_RESOURCE1, quotaMethod)));
       return null;
     }).when(putManager).poll(requestsToSend, requestsToDrop);
     quotaAwareOperationController.pollForRequests(requestsToSend, requestsToDrop);
@@ -180,8 +210,8 @@ public class QuotaAwareOperationControllerTest {
   public void testDrainageForNullResourceIdOnly() {
     doAnswer((Answer<Void>) invocation -> {
       List<RequestInfo> requestsToSend = (List<RequestInfo>) invocation.getArguments()[0];
-      requestsToSend.add(new RequestInfo(HOST, PORT, SEND, REPLICA_ID,
-          new TestChargeable(false, true, false, null, quotaMethod)));
+      requestsToSend.add(
+          new RequestInfo(HOST, PORT, SEND, REPLICA_ID, new TestChargeable(QuotaAction.ALLOW, null, quotaMethod)));
       return null;
     }).when(putManager).poll(requestsToSend, requestsToDrop);
     quotaAwareOperationController.pollForRequests(requestsToSend, requestsToDrop);
@@ -192,68 +222,54 @@ public class QuotaAwareOperationControllerTest {
    * {@link Chargeable} implementation for test.
    */
   static class TestChargeable implements Chargeable {
-    private final boolean chargeOutput;
-    private final boolean quotaExceedAllowed;
     private final QuotaResource quotaResource;
-    private final List<Boolean> checkOutputs;
     private final List<QuotaMethod> quotaMethods;
-    private int numCheckCalls;
+    private final List<QuotaAction> chargeOutputs;
     private int numChargeCalls;
-    private int numQuotaExceedCalls;
     private int numGetQuotaResourceCalls;
     private int numGetQuotaMethodCalls;
 
     /**
      * Constructor for {@link TestChargeable}.
-     * @param checkOutput output of check method.
      * @param chargeOutput output of charge method.
-     * @param quotaExceedAllowed output of quotaExceedAllowed method.
      * @param quotaResource output of getQuotaResource method.
      * @param quotaMethod output of the getQuotaMethod method.
      */
-    public TestChargeable(boolean checkOutput, boolean chargeOutput, boolean quotaExceedAllowed,
-        QuotaResource quotaResource, QuotaMethod quotaMethod) {
-      this.checkOutputs = Collections.singletonList(checkOutput);
-      this.chargeOutput = chargeOutput;
-      this.quotaExceedAllowed = quotaExceedAllowed;
+    public TestChargeable(QuotaAction chargeOutput, QuotaResource quotaResource, QuotaMethod quotaMethod) {
+      this.chargeOutputs = Collections.singletonList(chargeOutput);
       this.quotaResource = quotaResource;
       this.quotaMethods = Collections.singletonList(quotaMethod);
     }
 
     /**
      * Constructor for {@link TestChargeable}.
-     * @param checkOutputs {@link List} representing the sequence of outputs of check method.
+     * @param chargeOutputs {@link List} of {@link QuotaAction} as output of charge method.
+     * @param quotaResource output of getQuotaResource method.
+     * @param quotaMethod output of the getQuotaMethod method.
+     */
+    public TestChargeable(List<QuotaAction> chargeOutputs, QuotaResource quotaResource, QuotaMethod quotaMethod) {
+      this.chargeOutputs = chargeOutputs;
+      this.quotaResource = quotaResource;
+      this.quotaMethods = Collections.singletonList(quotaMethod);
+    }
+
+    /**
+     * Constructor for {@link TestChargeable}.
      * @param chargeOutput output of charge method.
-     * @param quotaExceedAllowed output of quotaExceedAllowed method.
      * @param quotaResource output of getQuotaResource method.
      * @param quotaMethods {@link List} of {@link QuotaMethod}s representing the sequence of output of get quota method calls.
      */
-    public TestChargeable(List<Boolean> checkOutputs, boolean chargeOutput, boolean quotaExceedAllowed,
-        QuotaResource quotaResource, List<QuotaMethod> quotaMethods) {
-      this.checkOutputs = checkOutputs;
-      this.chargeOutput = chargeOutput;
-      this.quotaExceedAllowed = quotaExceedAllowed;
+    public TestChargeable(QuotaAction chargeOutput, QuotaResource quotaResource, List<QuotaMethod> quotaMethods) {
+      this.chargeOutputs = Collections.singletonList(chargeOutput);
       this.quotaResource = quotaResource;
       this.quotaMethods = quotaMethods;
     }
 
     @Override
-    public boolean check() {
-      boolean out = checkOutputs.get(numCheckCalls % checkOutputs.size());
-      numCheckCalls++;
-      return out;
-    }
-
-    @Override
-    public boolean charge() {
+    public QuotaAction checkAndCharge(boolean shouldCheckExceedAllowed) {
+      QuotaAction out = chargeOutputs.get(numChargeCalls % chargeOutputs.size());
       numChargeCalls++;
-      return chargeOutput;
-    }
-
-    @Override
-    public boolean quotaExceedAllowed() {
-      numQuotaExceedCalls++;
-      return quotaExceedAllowed;
+      return out;
     }
 
     @Override
@@ -271,16 +287,11 @@ public class QuotaAwareOperationControllerTest {
 
     /**
      * Verify that the interface methods have been called expected number of times.
-     * @param numCheckCalls expected number of check calls.
      * @param numChargeCalls expected number of charge calls.
-     * @param numQuotaExceedCalls expected number of quotaExceedAllowed calls.
      * @param numGetQuotaResourceCalls expected number of getQuotaResource calls.
      */
-    public void verifyCalls(int numCheckCalls, int numChargeCalls, int numQuotaExceedCalls,
-        int numGetQuotaResourceCalls) {
+    public void verifyCalls(int numChargeCalls, int numGetQuotaResourceCalls) {
       assertEquals("Invalid charge calls", numChargeCalls, this.numChargeCalls);
-      assertEquals("Invalid check calls", numCheckCalls, this.numCheckCalls);
-      assertEquals("Invalid quotaExceeded calls", numQuotaExceedCalls, this.numQuotaExceedCalls);
       assertEquals("Invalid getQuotaResource calls", numGetQuotaResourceCalls, this.numGetQuotaResourceCalls);
     }
   }

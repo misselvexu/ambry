@@ -20,6 +20,7 @@ import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.FrontendConfig;
 import com.github.ambry.config.QuotaConfig;
+import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.named.NamedBlobDb;
 import com.github.ambry.named.NamedBlobDbFactory;
@@ -67,7 +68,7 @@ public class FrontendRestRequestServiceFactory implements RestRequestServiceFact
     this.accountService = Objects.requireNonNull(accountService, "Provided AccountService is null");
     clusterMapConfig = new ClusterMapConfig(verifiableProperties);
     frontendConfig = new FrontendConfig(verifiableProperties);
-    frontendMetrics = new FrontendMetrics(clusterMap.getMetricRegistry());
+    frontendMetrics = new FrontendMetrics(clusterMap.getMetricRegistry(), frontendConfig);
     logger.trace("Instantiated FrontendRestRequestServiceFactory");
   }
 
@@ -98,7 +99,7 @@ public class FrontendRestRequestServiceFactory implements RestRequestServiceFact
       QuotaConfig quotaConfig = new QuotaConfig(verifiableProperties);
       QuotaManager quotaManager = ((QuotaManagerFactory) Utils.getObj(quotaConfig.quotaManagerFactory, quotaConfig,
           new SimpleQuotaRecommendationMergePolicy(quotaConfig), accountService, accountStatsStore,
-          clusterMap.getMetricRegistry())).getQuotaManager();
+          clusterMap.getMetricRegistry(), new RouterConfig(verifiableProperties))).getQuotaManager();
       SecurityServiceFactory securityServiceFactory =
           Utils.getObj(frontendConfig.securityServiceFactory, verifiableProperties, clusterMap, accountService,
               urlSigningService, idSigningService, accountAndContainerInjector, quotaManager);

@@ -30,6 +30,7 @@ import com.github.ambry.config.QuotaConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.quota.AmbryQuotaManager;
+import com.github.ambry.quota.QuotaMetrics;
 import com.github.ambry.quota.SimpleQuotaRecommendationMergePolicy;
 import com.github.ambry.quota.QuotaManager;
 import com.github.ambry.quota.QuotaMode;
@@ -113,7 +114,8 @@ public class PostBlobHandlerTest {
         QuotaConfig quotaConfig = QuotaTestUtils.createQuotaConfig(Collections.emptyMap(), false, QuotaMode.TRACKING);
         QUOTA_MANAGER =
             new AmbryQuotaManager(quotaConfig, new SimpleQuotaRecommendationMergePolicy(quotaConfig),
-                Mockito.mock(AccountService.class), null, new MetricRegistry());
+                Mockito.mock(AccountService.class), null, new QuotaMetrics(new MetricRegistry()),
+                QuotaTestUtils.getDefaultRouterConfig());
       } catch (Exception e) {
         throw new IllegalStateException(e);
       }
@@ -123,7 +125,7 @@ public class PostBlobHandlerTest {
   }
 
   private final MockTime time = new MockTime();
-  private final FrontendMetrics metrics = new FrontendMetrics(new MetricRegistry());
+  private final FrontendMetrics metrics;
   private final InMemoryRouter router;
   private final FrontendTestIdConverterFactory idConverterFactory;
   private final FrontendTestSecurityServiceFactory securityServiceFactory;
@@ -138,7 +140,9 @@ public class PostBlobHandlerTest {
     Properties props = new Properties();
     VerifiableProperties verifiableProperties = new VerifiableProperties(props);
     router = new InMemoryRouter(verifiableProperties, CLUSTER_MAP);
-    injector = new AccountAndContainerInjector(ACCOUNT_SERVICE, metrics, new FrontendConfig(verifiableProperties));
+    FrontendConfig frontendConfig = new FrontendConfig(verifiableProperties);
+    metrics = new FrontendMetrics(new MetricRegistry(), frontendConfig);
+    injector = new AccountAndContainerInjector(ACCOUNT_SERVICE, metrics, frontendConfig);
     idSigningService = new AmbryIdSigningService();
     initPostBlobHandler(props);
   }
@@ -202,7 +206,11 @@ public class PostBlobHandlerTest {
     // invalid TTL
     doChunkUploadTest(1024, true, UUID.randomUUID().toString(), 1025, Utils.Infinite_Time,
         restServiceExceptionChecker(RestServiceErrorCode.InvalidArgs));
+    // TTL > default chunkUploadInitialChunkTtlSecs
     doChunkUploadTest(1024, true, UUID.randomUUID().toString(), 1025, frontendConfig.chunkUploadInitialChunkTtlSecs + 1,
+        null);
+    // TTL > chunkUploadMaxChunkTtlSecs
+    doChunkUploadTest(1024, true, UUID.randomUUID().toString(), 1025, frontendConfig.chunkUploadMaxChunkTtlSecs + 1,
         restServiceExceptionChecker(RestServiceErrorCode.InvalidArgs));
     // ensure that the chunk upload request requirements are not enforced for non chunk uploads.
     doChunkUploadTest(1024, false, null, null, Utils.Infinite_Time, null);

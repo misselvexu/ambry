@@ -73,6 +73,12 @@ public class NettySslFactory implements SSLFactory {
       sslParams.setEndpointIdentificationAlgorithm(endpointIdentification);
       sslEngine.setSSLParameters(sslParams);
     }
+    if (logger.isTraceEnabled()) {
+      String[] supportedProtocols = sslEngine.getSupportedProtocols();
+      String[] enabledProtocols = sslEngine.getEnabledProtocols();
+      logger.trace("NettySslFactory creating SSLEngine for {}: supportedProtocols: {}, enabledProtocols: {}", mode.name(),
+          String.join(",", supportedProtocols), String.join(",", enabledProtocols));
+    }
     return sslEngine;
   }
 
@@ -151,8 +157,7 @@ public class NettySslFactory implements SSLFactory {
    * @throws GeneralSecurityException
    * @throws IOException
    */
-  static TrustManagerFactory getTrustManagerFactory(SSLConfig config)
-      throws GeneralSecurityException, IOException {
+  static TrustManagerFactory getTrustManagerFactory(SSLConfig config) throws GeneralSecurityException, IOException {
     TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
     KeyStore ks = loadKeyStore(config.sslTruststorePath, config.sslTruststoreType, config.sslTruststorePassword);
     tmf.init(ks);

@@ -13,6 +13,7 @@
  */
 package com.github.ambry.router;
 
+import com.codahale.metrics.Timer;
 import com.github.ambry.account.AccountService;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.commons.ResponseHandler;
@@ -20,7 +21,9 @@ import com.github.ambry.config.RouterConfig;
 import com.github.ambry.network.NetworkClient;
 import com.github.ambry.network.NetworkClientFactory;
 import com.github.ambry.network.RequestInfo;
+import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.notification.NotificationSystem;
+import com.github.ambry.quota.QuotaAction;
 import com.github.ambry.quota.QuotaMethod;
 import com.github.ambry.quota.QuotaResource;
 import com.github.ambry.quota.QuotaResourceType;
@@ -29,10 +32,12 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -46,6 +51,9 @@ public class QuotaAwareOperationController extends OperationController {
   private static final QuotaResource UNKNOWN_QUOTA_RESOURCE = new QuotaResource("UNKNOWN", QuotaResourceType.ACCOUNT);
   private final Map<QuotaResource, LinkedList<RequestInfo>> readRequestQueue = new HashMap<>();
   private final Map<QuotaResource, LinkedList<RequestInfo>> writeRequestQueue = new HashMap<>();
+  private final List<RequestInfo> nonCompliantRequests = new ArrayList<>();
+  private volatile int outOfQuotaResourcesInQueue = 0;
+  private volatile int delayedQuotaResourcesInQueue = 0;
 
   /**
    * Constructor for {@link QuotaAwareOperationController} class.
@@ -76,18 +84,25 @@ public class QuotaAwareOperationController extends OperationController {
     super(suffix, defaultPartitionClass, accountService, networkClientFactory, clusterMap, routerConfig,
         responseHandler, notificationSystem, routerMetrics, kms, cryptoService, cryptoJobHandler, time,
         nonBlockingRouter);
+    routerMetrics.initializeRequestQueueMetrics(readRequestQueue, writeRequestQueue, suffix);
   }
 
   @Override
   protected void pollForRequests(List<RequestInfo> requestsToSend, Set<Integer> requestsToDrop) {
+    Timer.Context timer = null;
     try {
       List<RequestInfo> newRequestsToSend = new ArrayList<>();
       pollNewRequests(newRequestsToSend, requestsToDrop);
+      timer = routerMetrics.totalQuotaQueueingDelay.time();
       addToRequestQueue(newRequestsToSend);
       drainRequestQueue(requestsToSend);
     } catch (Exception e) {
       logger.error("Operation Manager poll received an unexpected error: ", e);
       routerMetrics.operationManagerPollErrorCount.inc();
+    } finally {
+      if (timer != null) {
+        timer.stop();
+      }
     }
   }
 
@@ -112,14 +127,20 @@ public class QuotaAwareOperationController extends OperationController {
    * @param requestInfos {@link List} of {@link RequestInfo} objects.
    */
   private void addToRequestQueue(List<RequestInfo> requestInfos) {
+    Timer.Context timer = routerMetrics.addToQueueTime.time();
     for (RequestInfo requestInfo : requestInfos) {
-      QuotaResource quotaResource = requestInfo.getChargeable().getQuotaResource();
+      QuotaResource quotaResource = null;
+      if (requestInfo.getChargeable() != null) {
+        quotaResource = requestInfo.getChargeable().getQuotaResource();
+      }
       if (quotaResource == null) {
+        routerMetrics.requestsWithUnknownQuotaResourceRate.mark();
         quotaResource = UNKNOWN_QUOTA_RESOURCE;
       }
       getRequestQueue(requestInfo.getChargeable().getQuotaMethod()).putIfAbsent(quotaResource, new LinkedList<>());
       getRequestQueue(requestInfo.getChargeable().getQuotaMethod()).get(quotaResource).add(requestInfo);
     }
+    timer.stop();
   }
 
   /**
@@ -127,36 +148,19 @@ public class QuotaAwareOperationController extends OperationController {
    * @param requestsToSend a list of {@link RequestInfo} that will contain the requests to be sent out.
    */
   private void drainRequestQueue(List<RequestInfo> requestsToSend) {
+    Timer.Context timer = routerMetrics.drainRequestQueueTime.time();
+    int outOfQuotaRequests = 0;
+    int delayedRequests = 0;
     for (QuotaMethod quotaMethod : QuotaMethod.values()) {
-      pollQuotaCompliantRequests(requestsToSend, getRequestQueue(quotaMethod));
-      pollQuotaExceedAllowedRequestsIfAny(requestsToSend, getRequestQueue(quotaMethod));
+      Map<QuotaResource, LinkedList<RequestInfo>> queue = getRequestQueue(quotaMethod);
+      pollQuotaCompliantRequests(requestsToSend, queue);
+      outOfQuotaRequests += queue.size();
+      pollQuotaExceedAllowedRequestsIfAny(requestsToSend, queue);
+      delayedRequests += queue.size();
     }
-  }
-
-  /**
-   * Poll for out of quota requests that are allowed to exceed quota.
-   * @param requestsToSend {@link List} of {@link RequestInfo} to be sent.
-   * @param requestQueue {@link Map} of {@link QuotaResource} to {@link List} of {@link RequestInfo} from which the requests to be sent will be polled.
-   */
-  private void pollQuotaExceedAllowedRequestsIfAny(List<RequestInfo> requestsToSend,
-      Map<QuotaResource, LinkedList<RequestInfo>> requestQueue) {
-    List<QuotaResource> quotaResources = new ArrayList<>(requestQueue.keySet());
-    Collections.shuffle(quotaResources);
-    while (!requestQueue.isEmpty()) {
-      for (QuotaResource quotaResource : quotaResources) {
-        RequestInfo requestInfo = requestQueue.get(quotaResource).getFirst();
-        if (!requestInfo.getChargeable().quotaExceedAllowed()) {
-          // If quota exceeded requests aren't allowed, then there is nothing more to do.
-          return;
-        }
-        requestInfo.getChargeable().charge();
-        requestsToSend.add(requestInfo);
-        requestQueue.get(quotaResource).removeFirst();
-        if (requestQueue.get(quotaResource).isEmpty()) {
-          requestQueue.remove(quotaResource);
-        }
-      }
-    }
+    outOfQuotaResourcesInQueue = outOfQuotaRequests;
+    delayedQuotaResourcesInQueue = delayedRequests;
+    timer.stop();
   }
 
   /**
@@ -166,28 +170,91 @@ public class QuotaAwareOperationController extends OperationController {
    */
   private void pollQuotaCompliantRequests(List<RequestInfo> requestsToSend,
       Map<QuotaResource, LinkedList<RequestInfo>> requestQueue) {
-    for (QuotaResource quotaResource : requestQueue.keySet()) {
+    Timer.Context timer = routerMetrics.pollQuotaCompliantRequestTime.time();
+    Iterator<Map.Entry<QuotaResource, LinkedList<RequestInfo>>> requestQueueIterator =
+        requestQueue.entrySet().iterator();
+    while (requestQueueIterator.hasNext()) {
+      QuotaResource quotaResource = requestQueueIterator.next().getKey();
       if (quotaResource.equals(UNKNOWN_QUOTA_RESOURCE)) {
         // If there are requests for which QuotaResource couldn't be found, this is most likely a bug.
         // As a temporary hack, we will consider all those requests to be quota compliant.
         requestsToSend.addAll(requestQueue.get(UNKNOWN_QUOTA_RESOURCE));
-        requestQueue.remove(UNKNOWN_QUOTA_RESOURCE);
+        requestQueueIterator.remove();
         continue;
       }
-      while (!requestQueue.get(quotaResource).isEmpty()) {
+      boolean quotaAvailable = true;
+      while (!requestQueue.get(quotaResource).isEmpty() && quotaAvailable) {
         RequestInfo requestInfo = requestQueue.get(quotaResource).getFirst();
-        if (requestInfo.getChargeable().check()) {
-          requestsToSend.add(requestInfo);
-          requestQueue.get(quotaResource).removeFirst();
-          requestInfo.getChargeable().charge();
-        } else {
-          break;
+        QuotaAction recommendedQuotaAction = requestInfo.getChargeable().checkAndCharge(false);
+        switch (recommendedQuotaAction) {
+          case ALLOW:
+            requestsToSend.add(requestInfo);
+            requestQueue.get(quotaResource).removeFirst();
+            break;
+          case DELAY:
+            quotaAvailable = false;
+            break;
+          case REJECT:
+            quotaAvailable = false;
+            logger.warn(
+                "Rejecting request for quota resource {} because of reject recommendation.", quotaResource.toString());
+            routerMetrics.rejectedRequestRate.mark();
+            nonCompliantRequests.add(requestInfo);
+            requestQueue.get(quotaResource).removeFirst();
+            break;
         }
       }
       if (requestQueue.get(quotaResource).isEmpty()) {
-        requestQueue.remove(quotaResource);
+        requestQueueIterator.remove();
       }
     }
+    timer.stop();
+  }
+
+  /**
+   * Poll for out of quota requests that are allowed to exceed quota.
+   * @param requestsToSend {@link List} of {@link RequestInfo} to be sent.
+   * @param requestQueue {@link Map} of {@link QuotaResource} to {@link List} of {@link RequestInfo} from which the requests to be sent will be polled.
+   */
+  private void pollQuotaExceedAllowedRequestsIfAny(List<RequestInfo> requestsToSend,
+      Map<QuotaResource, LinkedList<RequestInfo>> requestQueue) {
+    Timer.Context timer = routerMetrics.pollExceedAllowedRequestTime.time();
+    List<QuotaResource> quotaResources = new ArrayList<>(requestQueue.keySet());
+    Collections.shuffle(quotaResources);
+    while (!requestQueue.isEmpty()) {
+      Iterator<QuotaResource> iter = quotaResources.listIterator();
+      while(iter.hasNext()) {
+        QuotaResource quotaResource = iter.next();
+        RequestInfo requestInfo = requestQueue.get(quotaResource).getFirst();
+        QuotaAction quotaAction = requestInfo.getChargeable().checkAndCharge(true);
+        switch (quotaAction) {
+          case ALLOW:
+            routerMetrics.exceedAllowedRequestRate.mark();
+            requestsToSend.add(requestInfo);
+            break;
+          case DELAY:
+            routerMetrics.delayedRequestRate.mark();
+            return;
+          case REJECT:
+            routerMetrics.rejectedRequestRate.mark();
+            nonCompliantRequests.add(requestInfo);
+        }
+        requestQueue.get(quotaResource).removeFirst();
+        if (requestQueue.get(quotaResource).isEmpty()) {
+          requestQueue.remove(quotaResource);
+          iter.remove();
+        }
+      }
+    }
+    timer.stop();
+  }
+
+  @Override
+  protected List<ResponseInfo> getNonQuotaCompliantResponses() {
+    List<ResponseInfo> nonCompliantResponses = nonCompliantRequests.
+        stream().map(requestInfo -> new ResponseInfo(requestInfo, true)).collect(Collectors.toList());
+    nonCompliantRequests.clear();
+    return nonCompliantResponses;
   }
 
   /**
@@ -196,5 +263,21 @@ public class QuotaAwareOperationController extends OperationController {
    */
   Map<QuotaResource, LinkedList<RequestInfo>> getRequestQueue(QuotaMethod quotaMethod) {
     return quotaMethod == QuotaMethod.READ ? readRequestQueue : writeRequestQueue;
+  }
+
+  /**
+   * @return the value of {@code outOfQuotaResourcesInQueue} representing the count of out of {@link QuotaResource}s with
+   * requests in the queue.
+   */
+  int getOutOfQuotaResourcesInQueue() {
+    return outOfQuotaResourcesInQueue;
+  }
+
+  /**
+   * @return the value of {@code delayedResourcesInQueue} representing the count of {@link QuotaResource}s with delayed
+   * requests in the queue.
+   */
+  int getDelayedQuotaResourcesInQueue() {
+    return delayedQuotaResourcesInQueue;
   }
 }

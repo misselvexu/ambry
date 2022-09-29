@@ -33,6 +33,7 @@ allprojects {
     apply plugin: 'idea'
     apply plugin: 'project-report'
     apply plugin: 'jacoco'
+    apply plugin: 'org.gradle.test-retry'
 
     repositories {
         mavenCentral()
@@ -98,7 +99,12 @@ subprojects {
         testCompile "org.apache.logging.log4j:log4j-api:$log4jVersion"
         testCompile "org.apache.logging.log4j:log4j-slf4j-impl:$log4jVersion"
         testCompile "junit:junit:$junitVersion"
-        testCompile "org.mockito:mockito-core:2.+"
+        testCompile "org.mockito:mockito-core:$mockitoVersion"
+        // Add PowerMock to support more unit test scenarios.
+        // See https://github.com/powermock/powermock/wiki/Mockito for detail about PowerMock.
+        testCompile "org.powermock:powermock-api-mockito2:$powermockVersion"
+        testCompile "org.powermock:powermock-core:$powermockVersion"
+        testCompile "org.powermock:powermock-module-junit4:$powermockVersion"
         testRuntime project(':log4j-test-config')
     }
 
@@ -114,6 +120,19 @@ subprojects {
     test {
         testLogging {
             exceptionFormat = 'full'
+            events "PASSED", "SKIPPED", "FAILED"
+        }
+        // Plugin for retrying flaky tests. Reference: https://github.com/gradle/test-retry-gradle-plugin
+        retry {
+            // The maximum number of times to retry an individual test
+            maxRetries = 3
+            // The maximum number of test failures that are allowed (per module) before retrying is disabled. The count applies to
+            // each round of test execution. For example, if maxFailures is 5 and 4 tests initially fail and then 3
+            // again on retry, this will not be considered too many failures and retrying will continue (if maxRetries {@literal >} 1).
+            // If 5 or more tests were to fail initially then no retry would be attempted.
+            maxFailures = 10
+            // Whether tests that initially fail and then pass on retry should fail the task.
+            failOnPassedAfterRetry = false
         }
         maxHeapSize = "3g"
         systemProperty 'io.netty.leakDetection.level', 'paranoid'
@@ -121,6 +140,9 @@ subprojects {
         systemProperty 'io.netty.allocator.smallCacheSize', '0'
         systemProperty 'io.netty.allocator.normalCacheSize', '0'
         systemProperty 'io.netty.allocator.maxCachedBufferCapacity', '0'
+
+        // make sure Powermockito would be happy
+        jvmArgs '--add-exports=java.xml/jdk.xml.internal=ALL-UNNAMED'
     }
 
     task intTest(type: Test) {
@@ -132,6 +154,18 @@ subprojects {
             exceptionFormat = 'full'
             events 'started', 'failed', 'passed', 'skipped'
             showStandardStreams = false
+        }
+        // Allow for retrying flaky integration tests.
+        retry {
+            // The maximum number of times to retry an individual test
+            maxRetries = 3
+            // The maximum number of test failures that are allowed (per module) before retrying is disabled. The count applies to
+            // each round of test execution. For example, if maxFailures is 5 and 4 tests initially fail and then 3
+            // again on retry, this will not be considered too many failures and retrying will continue (if maxRetries {@literal >} 1).
+            // If 5 or more tests were to fail initially then no retry would be attempted.
+            maxFailures = 10
+            // Whether tests that initially fail and then pass on retry should fail the task.
+            failOnPassedAfterRetry = false
         }
         maxHeapSize = "3g"
         systemProperty 'io.netty.leakDetection.level', 'paranoid'
@@ -188,6 +222,42 @@ project(':ambry-api') {
     }
 }
 
+project(':ambry-messageformat') {
+    dependencies {
+        compile project(':ambry-api'),
+                project(':ambry-utils')
+        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-api', configuration: 'testArchives')
+    }
+}
+
+project(':ambry-commons') {
+    dependencies {
+        compile project(':ambry-api'),
+                project(':ambry-messageformat'),
+                project(':ambry-utils')
+
+        // See https://github.com/facebook/zstd/releases for Zstd releases.  On Jan 2022, latest release is 1.5.2
+        // See https://repo.maven.apache.org/maven2/com/github/luben/zstd-jni/ for library versions.
+        compile "com.github.luben:zstd-jni:$zstdVersion"
+
+        // See https://github.com/lz4/lz4/releases for LZ4 releases.
+        // There are JNI and Pure Java LZ4 provided at https://repo.maven.apache.org/maven2/org/lz4
+        // The latest LZ4 library is 1.8.0 on 06/2021.
+        compile "org.lz4:lz4-java:$lz4Version"
+
+        compile "org.conscrypt:conscrypt-openjdk-uber:$conscryptVersion"
+        compile "io.netty:netty-all:$nettyVersion"
+        compile "io.netty:netty-tcnative-boringssl-static:$nettyTcnativeVersion"
+        compile "org.apache.helix:helix-core:$helixVersion"
+        compile "com.github.ben-manes.caffeine:caffeine:3.1.1"
+        testCompile project(':ambry-test-utils')
+        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
+    }
+}
+
+
 project(':ambry-account') {
     dependencies {
         compile project(':ambry-api'),
@@ -215,20 +285,6 @@ project(':ambry-clustermap') {
         testCompile project(':ambry-test-utils')
         testCompile project(path: ':ambry-api', configuration: 'testArchives')
 
-    }
-}
-
-project(':ambry-commons') {
-    dependencies {
-        compile project(':ambry-api'),
-                project(':ambry-messageformat'),
-                project(':ambry-utils')
-        compile "org.conscrypt:conscrypt-openjdk-uber:$conscryptVersion"
-        compile "io.netty:netty-all:$nettyVersion"
-        compile "io.netty:netty-tcnative-boringssl-static:$nettyTcnativeVersion"
-        compile "org.apache.helix:helix-core:$helixVersion"
-        testCompile project(':ambry-test-utils')
-        testCompile project(path: ':ambry-clustermap', configuration: 'testArchives')
     }
 }
 
@@ -297,15 +353,6 @@ project(':ambry-store') {
     }
 }
 
-project(':ambry-messageformat') {
-    dependencies {
-        compile project(':ambry-api'),
-                project(':ambry-utils')
-        compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
-        testCompile project(':ambry-test-utils')
-        testCompile project(path: ':ambry-api', configuration: 'testArchives')
-    }
-}
 
 project(':ambry-replication') {
     dependencies {
@@ -414,6 +461,7 @@ project(':ambry-frontend') {
         compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         testCompile project(':ambry-test-utils')
         testCompile project(':ambry-quota')
+        testCompile project(':ambry-named-mysql')
         testCompile project(path: ':ambry-api', configuration: 'testArchives')
         testCompile project(path: ':ambry-rest', configuration: 'testArchives')
     }
@@ -433,7 +481,7 @@ project(':ambry-cloud') {
         compile "com.azure:azure-security-keyvault-secrets:$azureSecurityKeyvaultSecretsVersion"
         compile "io.dropwizard.metrics:metrics-core:$metricsVersion"
         compile "io.dropwizard.metrics:metrics-jmx:$metricsVersion"
-        compile "com.microsoft.azure:azure-cosmosdb:$azureCosmosDbVersion"
+        compile "com.azure:azure-cosmos:$azureCosmosDbAsyncVersion"
         compile "com.microsoft.azure:msal4j:$azureMsal4jVersion"
         compile "org.apache.helix:helix-lock:$helixVersion"
         testCompile project(':ambry-router')

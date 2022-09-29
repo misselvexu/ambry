@@ -53,6 +53,7 @@ import java.util.Properties;
 import java.util.Random;
 import java.util.RandomAccess;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -426,12 +427,25 @@ public class Utils {
     if (throwable == null) {
       return null;
     }
-    if (throwable instanceof CompletionException || throwable instanceof ExecutionException) {
-      if (throwable.getCause() != null) {
-        throwable = throwable.getCause();
-      }
+    while ((throwable instanceof CompletionException || throwable instanceof ExecutionException)
+        && throwable.getCause() != null) {
+      // Extract nested exception for CompletionException and ExecutionException
+      throwable = throwable.getCause();
     }
     return throwable instanceof Exception ? (Exception) throwable : new Exception(throwable);
+  }
+
+  /**
+   * Returns an exceptionally completed {@link CompletableFuture}.
+   * @param cause to complete the future with
+   * @param <T> type of the future
+   * @return An exceptionally completed CompletableFuture
+   */
+  public static <T> CompletableFuture<T> completedExceptionally(Throwable cause) {
+    CompletableFuture<T> result = new CompletableFuture<>();
+    result.completeExceptionally(cause);
+
+    return result;
   }
 
   /**
@@ -1284,6 +1298,46 @@ public class Utils {
   }
 
   /**
+   * Check whether the given String is null or empty and throw IllegalArgumentException if so.
+   *
+   * @param parameter The string parameter to check.
+   * @param exceptionMessage The IllegalArgumentException message to use if null or empty.
+   */
+  public static void checkNotNullOrEmpty(String parameter, String exceptionMessage) {
+    if (parameter == null) {
+      throw new NullPointerException(exceptionMessage);
+    } else if(parameter.length() == 0) {
+      throw new IllegalArgumentException(exceptionMessage);
+    }
+  }
+
+  /**
+   * Check whether the given byte array is null or empty and throw IllegalArgumentException if so.
+   *
+   * @param array The array to check.
+   * @param exceptionMessage The IllegalArgumentException message to use if null or empty.
+   */
+  public static void checkNotNullOrEmpty(byte[] array, String exceptionMessage) {
+    if (array == null || array.length == 0) {
+      throw new IllegalArgumentException(exceptionMessage);
+    }
+  }
+
+  /**
+   * Check the given value is in the specific range (min and max).
+   * If outside the range, through IllegalArgumentException using the provided message.
+   * @param value The value to check.
+   * @param min The minimum inclusive.
+   * @param max The maximum inclusive.
+   * @param exceptionMessage The error message if outside the range.
+   */
+  public static void checkValueInRange(int value, int min, int max, String exceptionMessage) {
+    if (value < min || value > max) {
+      throw new IllegalArgumentException(exceptionMessage);
+    }
+  }
+
+  /**
    * Close a resource without throwing exception.
    * @param resource the resource to close.
    */
@@ -1369,4 +1423,27 @@ public class Utils {
     }
     return totalPendingTasks;
   }
+
+  /**
+   * This is a helper interface for getException().
+   * Java built-in interfaces like Runnable and Supplier do not support lambda functions that throw checked exceptions.
+   * This one interface allows lambda to call exceptions that throws checked exceptions.
+   */
+  public interface RunnableThatThrow<E extends Exception> {
+    void run() throws E;
+  }
+
+  /**
+   * Invoke a lambda function and intentionally ignore any exceptions thrown.
+   * @param function The lambda function to invoke.
+   */
+  public static void ignoreException(RunnableThatThrow<Exception> function) {
+    try {
+      function.run();
+    }
+    catch (Exception ex) {
+      // Exception is intentionally ignored.
+    }
+  }
+
 }

@@ -351,6 +351,22 @@ class IndexSegment implements Iterable<IndexEntry> {
   }
 
   /**
+   * @return The direct memory usage for this Index Segment in bytes.
+   */
+  long getDirectMemoryUsage() {
+    rwLock.readLock().lock();
+    try {
+      if (sealed.get() && config.storeIndexMemState == IndexMemState.IN_DIRECT_MEM) {
+        return serEntries.capacity();
+      } else {
+        return 0;
+      }
+    } finally {
+      rwLock.readLock().unlock();
+    }
+  }
+
+  /**
    * @return life version of reset key.
    */
   short getResetKeyLifeVersion() throws StoreException {
@@ -442,6 +458,29 @@ class IndexSegment implements Iterable<IndexEntry> {
       rwLock.readLock().unlock();
     }
     return toReturn != null ? Collections.unmodifiableNavigableSet(toReturn) : null;
+  }
+
+  /**
+   * Return all the keys in the IndexSegment in a set.
+   * @return
+   */
+  Set<StoreKey> getAllStoreKeys() throws StoreException {
+    Set<StoreKey> keys = new HashSet<>();
+    rwLock.readLock().lock();
+    boolean isSealed = sealed.get();
+    NavigableMap<StoreKey, ConcurrentSkipListSet<IndexValue>> indexCopy = index;
+    ByteBuffer buffer = serEntries;
+    rwLock.readLock().unlock();
+    if (isSealed) {
+      buffer = buffer.duplicate();
+      int numOfIndexEntries = numberOfEntries(buffer);
+      for (int i = 0; i < numOfIndexEntries; i++) {
+        keys.add(getKeyAt(buffer, i));
+      }
+    } else {
+      keys.addAll(indexCopy.keySet());
+    }
+    return keys;
   }
 
   /**

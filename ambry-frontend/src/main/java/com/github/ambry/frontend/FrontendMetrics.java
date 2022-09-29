@@ -17,6 +17,7 @@ import com.codahale.metrics.Counter;
 import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
 import com.codahale.metrics.MetricRegistry;
+import com.github.ambry.config.FrontendConfig;
 import com.github.ambry.utils.AsyncOperationTracker;
 
 
@@ -36,6 +37,7 @@ public class FrontendMetrics {
   public final RestRequestMetricsGroup getUserMetadataMetricsGroup;
   public final RestRequestMetricsGroup getPeersMetricsGroup;
   public final RestRequestMetricsGroup getReplicasMetricsGroup;
+  public final RestRequestMetricsGroup getBlobChunkIdsMetricsGroup;
   public final RestRequestMetricsGroup getSignedUrlMetricsGroup;
   public final RestRequestMetricsGroup getClusterMapSnapshotMetricsGroup;
   public final RestRequestMetricsGroup getAccountsMetricsGroup;
@@ -67,11 +69,29 @@ public class FrontendMetrics {
   public final AsyncOperationTracker.Metrics updateBlobTtlIdConversionMetrics;
   public final AsyncOperationTracker.Metrics updateBlobTtlSecurityProcessResponseMetrics;
 
+  public final AsyncOperationTracker.Metrics deleteBlobSecurityProcessRequestMetrics;
+  public final AsyncOperationTracker.Metrics deleteBlobSecurityPostProcessRequestMetrics;
+  public final AsyncOperationTracker.Metrics deleteBlobRouterMetrics;
+  public final AsyncOperationTracker.Metrics deleteBlobIdConversionMetrics;
+  public final AsyncOperationTracker.Metrics deleteBlobSecurityProcessResponseMetrics;
+
   public final AsyncOperationTracker.Metrics undeleteBlobSecurityProcessRequestMetrics;
   public final AsyncOperationTracker.Metrics undeleteBlobSecurityPostProcessRequestMetrics;
   public final AsyncOperationTracker.Metrics undeleteBlobRouterMetrics;
   public final AsyncOperationTracker.Metrics undeleteBlobIdConversionMetrics;
   public final AsyncOperationTracker.Metrics undeleteBlobSecurityProcessResponseMetrics;
+
+  public final AsyncOperationTracker.Metrics headBlobSecurityProcessRequestMetrics;
+  public final AsyncOperationTracker.Metrics headBlobSecurityPostProcessRequestMetrics;
+  public final AsyncOperationTracker.Metrics headBlobRouterMetrics;
+  public final AsyncOperationTracker.Metrics headBlobIdConversionMetrics;
+  public final AsyncOperationTracker.Metrics headBlobSecurityProcessResponseMetrics;
+
+  public final AsyncOperationTracker.Metrics getBlobSecurityProcessRequestMetrics;
+  public final AsyncOperationTracker.Metrics getBlobSecurityPostProcessRequestMetrics;
+  public final AsyncOperationTracker.Metrics getBlobRouterMetrics;
+  public final AsyncOperationTracker.Metrics getBlobIdConversionMetrics;
+  public final AsyncOperationTracker.Metrics getBlobSecurityProcessResponseMetrics;
 
   public final AsyncOperationTracker.Metrics putSecurityProcessRequestMetrics;
   public final AsyncOperationTracker.Metrics putSecurityPostProcessRequestMetrics;
@@ -216,49 +236,60 @@ public class FrontendMetrics {
   /**
    * Creates an instance of FrontendMetrics using the given {@code metricRegistry}.
    * @param metricRegistry the {@link MetricRegistry} to use for the metrics.
+   * @param frontendConfig the {@link FrontendConfig} to use for the metrics.
    */
-  public FrontendMetrics(MetricRegistry metricRegistry) {
+  public FrontendMetrics(MetricRegistry metricRegistry, FrontendConfig frontendConfig) {
     // RestRequestMetricsGroup
     // DELETE
     deleteBlobMetricsGroup =
-        new RestRequestMetricsGroup(FrontendRestRequestService.class, "DeleteBlob", false, true, metricRegistry);
+        new RestRequestMetricsGroup(FrontendRestRequestService.class, "DeleteBlob", false, metricRegistry,
+            frontendConfig);
     // GET
     getBlobMetricsGroup =
-        new RestRequestMetricsGroup(FrontendRestRequestService.class, "GetBlob", true, true, metricRegistry);
+        new RestRequestMetricsGroup(FrontendRestRequestService.class, "GetBlob", true, metricRegistry, frontendConfig);
     getBlobInfoMetricsGroup =
-        new RestRequestMetricsGroup(FrontendRestRequestService.class, "GetBlobInfo", true, true, metricRegistry);
+        new RestRequestMetricsGroup(FrontendRestRequestService.class, "GetBlobInfo", true, metricRegistry,
+            frontendConfig);
     getUserMetadataMetricsGroup =
-        new RestRequestMetricsGroup(FrontendRestRequestService.class, "GetUserMetadata", true, false, metricRegistry);
-    getPeersMetricsGroup = new RestRequestMetricsGroup(GetPeersHandler.class, "GetPeers", false, false, metricRegistry);
+        new RestRequestMetricsGroup(FrontendRestRequestService.class, "GetUserMetadata", true, metricRegistry,
+            frontendConfig);
+    getPeersMetricsGroup =
+        new RestRequestMetricsGroup(GetPeersHandler.class, "GetPeers", false, metricRegistry, frontendConfig);
     getReplicasMetricsGroup =
-        new RestRequestMetricsGroup(FrontendRestRequestService.class, "GetReplicas", false, false, metricRegistry);
+        new RestRequestMetricsGroup(FrontendRestRequestService.class, "GetReplicas", false, metricRegistry,
+            frontendConfig);
+    getBlobChunkIdsMetricsGroup =
+        new RestRequestMetricsGroup(FrontendRestRequestService.class, "GetBlobChunkIds", false, metricRegistry,
+            frontendConfig);
     getSignedUrlMetricsGroup =
-        new RestRequestMetricsGroup(GetSignedUrlHandler.class, "GetSignedUrl", false, true, metricRegistry);
+        new RestRequestMetricsGroup(GetSignedUrlHandler.class, "GetSignedUrl", false, metricRegistry, frontendConfig);
     getClusterMapSnapshotMetricsGroup =
-        new RestRequestMetricsGroup(GetClusterMapSnapshotHandler.class, "GetClusterMapSnapshot", false, false,
-            metricRegistry);
+        new RestRequestMetricsGroup(GetClusterMapSnapshotHandler.class, "GetClusterMapSnapshot", false, metricRegistry,
+            frontendConfig);
     getAccountsMetricsGroup =
-        new RestRequestMetricsGroup(GetAccountsHandler.class, "GetAccounts", false, false, metricRegistry);
+        new RestRequestMetricsGroup(GetAccountsHandler.class, "GetAccounts", false, metricRegistry, frontendConfig);
     getStatsReportMetricsGroup =
-        new RestRequestMetricsGroup(GetStatsReportHandler.class, "GetStatsReport", false, false, metricRegistry);
+        new RestRequestMetricsGroup(GetStatsReportHandler.class, "GetStatsReport", false, metricRegistry,
+            frontendConfig);
     // HEAD
     headBlobMetricsGroup =
-        new RestRequestMetricsGroup(FrontendRestRequestService.class, "HeadBlob", false, false, metricRegistry);
+        new RestRequestMetricsGroup(FrontendRestRequestService.class, "HeadBlob", false, metricRegistry,
+            frontendConfig);
     // OPTIONS
     optionsMetricsGroup =
-        new RestRequestMetricsGroup(FrontendRestRequestService.class, "Options", false, false, metricRegistry);
+        new RestRequestMetricsGroup(FrontendRestRequestService.class, "Options", false, metricRegistry, frontendConfig);
     // POST
     postBlobMetricsGroup =
-        new RestRequestMetricsGroup(FrontendRestRequestService.class, "PostBlob", true, true, metricRegistry);
+        new RestRequestMetricsGroup(FrontendRestRequestService.class, "PostBlob", true, metricRegistry, frontendConfig);
     postAccountsMetricsGroup =
-        new RestRequestMetricsGroup(PostAccountsHandler.class, "PostAccounts", false, false, metricRegistry);
+        new RestRequestMetricsGroup(PostAccountsHandler.class, "PostAccounts", false, metricRegistry, frontendConfig);
     // PUT
     updateBlobTtlMetricsGroup =
-        new RestRequestMetricsGroup(TtlUpdateHandler.class, "UpdateBlobTtl", false, true, metricRegistry);
+        new RestRequestMetricsGroup(TtlUpdateHandler.class, "UpdateBlobTtl", false, metricRegistry, frontendConfig);
     undeleteBlobMetricsGroup =
-        new RestRequestMetricsGroup(UndeleteHandler.class, "UndeleteBlob", false, true, metricRegistry);
+        new RestRequestMetricsGroup(UndeleteHandler.class, "UndeleteBlob", false, metricRegistry, frontendConfig);
     putBlobMetricsGroup =
-        new RestRequestMetricsGroup(NamedBlobPutHandler.class, "PutBlob", false, true, metricRegistry);
+        new RestRequestMetricsGroup(NamedBlobPutHandler.class, "PutBlob", false, metricRegistry, frontendConfig);
     // AsyncOperationTracker.Metrics instances
     postSecurityProcessRequestMetrics =
         new AsyncOperationTracker.Metrics(PostBlobHandler.class, "postSecurityProcessRequest", metricRegistry);
@@ -285,6 +316,16 @@ public class FrontendMetrics {
     updateBlobTtlSecurityProcessResponseMetrics =
         new AsyncOperationTracker.Metrics(TtlUpdateHandler.class, "securityProcessResponse", metricRegistry);
 
+    deleteBlobSecurityProcessRequestMetrics =
+        new AsyncOperationTracker.Metrics(DeleteBlobHandler.class, "securityProcessRequest", metricRegistry);
+    deleteBlobSecurityPostProcessRequestMetrics =
+        new AsyncOperationTracker.Metrics(DeleteBlobHandler.class, "securityPostProcessRequest", metricRegistry);
+    deleteBlobRouterMetrics = new AsyncOperationTracker.Metrics(DeleteBlobHandler.class, "router", metricRegistry);
+    deleteBlobIdConversionMetrics =
+        new AsyncOperationTracker.Metrics(DeleteBlobHandler.class, "idConversion", metricRegistry);
+    deleteBlobSecurityProcessResponseMetrics =
+        new AsyncOperationTracker.Metrics(DeleteBlobHandler.class, "securityProcessResponse", metricRegistry);
+
     undeleteBlobSecurityProcessRequestMetrics =
         new AsyncOperationTracker.Metrics(UndeleteHandler.class, "securityProcessRequest", metricRegistry);
     undeleteBlobSecurityPostProcessRequestMetrics =
@@ -294,6 +335,25 @@ public class FrontendMetrics {
         new AsyncOperationTracker.Metrics(UndeleteHandler.class, "idConversion", metricRegistry);
     undeleteBlobSecurityProcessResponseMetrics =
         new AsyncOperationTracker.Metrics(UndeleteHandler.class, "securityProcessResponse", metricRegistry);
+
+    headBlobSecurityProcessRequestMetrics =
+        new AsyncOperationTracker.Metrics(HeadBlobHandler.class, "securityProcessRequest", metricRegistry);
+    headBlobSecurityPostProcessRequestMetrics =
+        new AsyncOperationTracker.Metrics(HeadBlobHandler.class, "securityPostProcessRequest", metricRegistry);
+    headBlobRouterMetrics = new AsyncOperationTracker.Metrics(HeadBlobHandler.class, "router", metricRegistry);
+    headBlobIdConversionMetrics = new AsyncOperationTracker.Metrics(HeadBlobHandler.class, "idConversion", metricRegistry);
+    headBlobSecurityProcessResponseMetrics =
+        new AsyncOperationTracker.Metrics(HeadBlobHandler.class, "securityProcessResponse", metricRegistry);
+
+    getBlobSecurityProcessRequestMetrics =
+        new AsyncOperationTracker.Metrics(GetBlobHandler.class, "securityProcessRequest", metricRegistry);
+    getBlobSecurityPostProcessRequestMetrics =
+        new AsyncOperationTracker.Metrics(GetBlobHandler.class, "securityPostProcessRequest", metricRegistry);
+    getBlobRouterMetrics = new AsyncOperationTracker.Metrics(GetBlobHandler.class, "router", metricRegistry);
+    getBlobIdConversionMetrics =
+        new AsyncOperationTracker.Metrics(GetBlobHandler.class, "idConversion", metricRegistry);
+    getBlobSecurityProcessResponseMetrics =
+        new AsyncOperationTracker.Metrics(GetBlobHandler.class, "securityProcessResponse", metricRegistry);
 
     putSecurityProcessRequestMetrics =
         new AsyncOperationTracker.Metrics(NamedBlobPutHandler.class, "putSecurityProcessRequest", metricRegistry);

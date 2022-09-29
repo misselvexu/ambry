@@ -20,7 +20,6 @@ import com.github.ambry.account.Container;
 import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.commons.SSLFactory;
 import com.github.ambry.commons.TestSSLUtils;
-import com.github.ambry.server.RouterServerTestFramework.*;
 import com.github.ambry.utils.SystemTime;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -252,6 +251,8 @@ public class RouterServerPlaintextTest {
       operations.add(OperationType.GET_INFO);
       operations.add(OperationType.GET_AUTHORIZATION_FAILURE);
       operations.add(OperationType.GET);
+      operations.add(OperationType.TTL_UPDATE);
+      operations.add(OperationType.AWAIT_TTL_UPDATE);
       operations.add(OperationType.TTL_UPDATE);
       operations.add(OperationType.AWAIT_TTL_UPDATE);
       operations.add(OperationType.GET);

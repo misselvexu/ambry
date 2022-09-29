@@ -18,7 +18,6 @@ import com.github.ambry.account.Container;
 import com.github.ambry.frontend.Operations;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.protocol.GetOption;
-import com.github.ambry.quota.QuotaName;
 import com.github.ambry.quota.ThrottlingRecommendation;
 import com.github.ambry.router.ByteRange;
 import com.github.ambry.router.ByteRanges;
@@ -53,6 +52,11 @@ import org.slf4j.LoggerFactory;
  * Common utility functions that will be used across implementations of REST interfaces.
  */
 public class RestUtils {
+
+  /**
+   * The default extension to add to blob id returned back to client.
+   */
+  public static final String DEFAULT_EXTENSION = "bin";
 
   /**
    * Ambry specific HTTP headers.
@@ -380,6 +384,13 @@ public class RestUtils {
      * To be set to {@code true} if failures reason should be attached to frontend responses.
      */
     public static final String SEND_FAILURE_REASON = KEY_PREFIX + "send-failure-reason";
+
+    /**
+     * The key to store a hint for filename to return in response. This is an internal key to convey a potential filename
+     * to the component that set the filename in the response. Notice that this is just a hint, the final filename in
+     * may not be the same as the value in this key.
+     */
+    public static final String FILENAME_HINT = KEY_PREFIX + "filename-hint";
   }
 
   /**
@@ -410,7 +421,12 @@ public class RestUtils {
      * where NON-NEGATIVE_INTEGER is a non-negative integer that represents the index
      * of a segment one wants to GET
      */
-    Segment
+    Segment,
+
+    /**
+     * Return all chunk IDs of a composite blob ID.
+     */
+    BlobChunkIds
   }
 
   public static final class MultipartPost {
@@ -633,9 +649,7 @@ public class RestUtils {
           RestServiceErrorCode.InvalidArgs);
     }
     boolean resolveRangeOnEmptyBlob = getBooleanHeader(args, Headers.RESOLVE_RANGE_ON_EMPTY_BLOB, false);
-    return new GetBlobOptionsBuilder().operationType(
-        subResource == null || subResource == SubResource.Segment ? GetBlobOptions.OperationType.All
-            : GetBlobOptions.OperationType.BlobInfo)
+    return new GetBlobOptionsBuilder().operationType(getBlobOptionsOperationType(subResource))
         .getOption(getOption)
         .blobSegment(blobSegmentIdx)
         .range(rangeHeaderValue != null ? RestUtils.buildByteRange(rangeHeaderValue) : null)
@@ -1180,6 +1194,25 @@ public class RestUtils {
     sb.append(", Container: " + ((container == null) ? "null" : container.toString()));
     sb.append("]");
     return sb.toString();
+  }
+
+  /**
+   * Get Operation type based on {@link SubResource}.
+   * @param subResource the {@link SubResource} for the request, or {@code null} if no sub-resource is requested.
+   * @return Operation type based on {@link SubResource}.
+   */
+  private static GetBlobOptions.OperationType getBlobOptionsOperationType(SubResource subResource) {
+    if (subResource == null) {
+      return GetBlobOptions.OperationType.All;
+    }
+    switch (subResource) {
+      case Segment:
+        return GetBlobOptions.OperationType.All;
+      case BlobChunkIds:
+        return GetBlobOptions.OperationType.BlobChunkIds;
+      default:
+        return GetBlobOptions.OperationType.BlobInfo;
+    }
   }
 
   /**

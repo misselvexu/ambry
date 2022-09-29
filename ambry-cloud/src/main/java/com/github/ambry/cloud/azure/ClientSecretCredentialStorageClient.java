@@ -19,6 +19,7 @@ import com.azure.identity.ClientSecretCredential;
 import com.azure.storage.blob.BlobServiceAsyncClient;
 import com.azure.storage.blob.BlobServiceClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
+import com.azure.storage.blob.batch.BlobBatchAsyncClient;
 import com.azure.storage.blob.batch.BlobBatchClient;
 import com.azure.storage.blob.models.BlobStorageException;
 import com.azure.storage.common.policy.RequestRetryOptions;
@@ -39,39 +40,23 @@ public class ClientSecretCredentialStorageClient extends StorageClient {
    * @param blobLayoutStrategy {@link AzureBlobLayoutStrategy} object.
    */
   public ClientSecretCredentialStorageClient(CloudConfig cloudConfig, AzureCloudConfig azureCloudConfig,
-      AzureMetrics azureMetrics, AzureBlobLayoutStrategy blobLayoutStrategy) {
-    super(cloudConfig, azureCloudConfig, azureMetrics, blobLayoutStrategy);
+      AzureMetrics azureMetrics, AzureBlobLayoutStrategy blobLayoutStrategy,
+      AzureCloudConfig.StorageAccountInfo storageAccountInfo) {
+    super(cloudConfig, azureCloudConfig, azureMetrics, blobLayoutStrategy, storageAccountInfo);
   }
 
   /**
    * Constructor for {@link ClientSecretCredentialStorageClient} object for testing.
-   * @param blobServiceClient {@link BlobServiceClient} object.
-   * @param blobBatchClient {@link BlobBatchClient} object.
+   * @param blobServiceAsyncClient {@link BlobServiceClient} object.
+   * @param blobBatchAsyncClient {@link BlobBatchClient} object.
    * @param azureMetrics {@link AzureMetrics} object.
    * @param blobLayoutStrategy {@link AzureBlobLayoutStrategy} object.
    * @param azureCloudConfig {@link AzureCloudConfig} object.
    */
-  public ClientSecretCredentialStorageClient(BlobServiceClient blobServiceClient, BlobBatchClient blobBatchClient,
-      AzureMetrics azureMetrics, AzureBlobLayoutStrategy blobLayoutStrategy, AzureCloudConfig azureCloudConfig) {
-    super(blobServiceClient, blobBatchClient, azureMetrics, blobLayoutStrategy, azureCloudConfig);
-  }
-
-  /**
-   * @param httpClient {@link HttpClient} object.
-   * @param configuration {@link Configuration} object.
-   * @param retryOptions {@link RequestRetryOptions} object.
-   * @param azureCloudConfig {@link AzureCloudConfig} object.
-   * @return BlobServiceClient object.
-   */
-  @Override
-  protected BlobServiceClient buildBlobServiceClient(HttpClient httpClient, Configuration configuration,
-      RequestRetryOptions retryOptions, AzureCloudConfig azureCloudConfig) {
-    return new BlobServiceClientBuilder().credential(AzureUtils.getClientSecretCredential(azureCloudConfig))
-        .endpoint(azureCloudConfig.azureStorageEndpoint)
-        .httpClient(httpClient)
-        .retryOptions(retryOptions)
-        .configuration(configuration)
-        .buildClient();
+  public ClientSecretCredentialStorageClient(BlobServiceAsyncClient blobServiceAsyncClient,
+      BlobBatchAsyncClient blobBatchAsyncClient, AzureMetrics azureMetrics, AzureBlobLayoutStrategy blobLayoutStrategy,
+      AzureCloudConfig azureCloudConfig, AzureCloudConfig.StorageAccountInfo storageAccountInfo) {
+    super(blobServiceAsyncClient, blobBatchAsyncClient, azureMetrics, blobLayoutStrategy, azureCloudConfig, storageAccountInfo);
   }
 
   /**
@@ -86,7 +71,7 @@ public class ClientSecretCredentialStorageClient extends StorageClient {
   protected BlobServiceAsyncClient buildBlobServiceAsyncClient(HttpClient httpClient, Configuration configuration,
       RequestRetryOptions retryOptions, AzureCloudConfig azureCloudConfig) {
     return new BlobServiceClientBuilder().credential(AzureUtils.getClientSecretCredential(azureCloudConfig))
-        .endpoint(azureCloudConfig.azureStorageEndpoint)
+        .endpoint(storageAccountInfo() != null ? storageAccountInfo().getStorageEndpoint() : azureCloudConfig.azureStorageEndpoint)
         .httpClient(httpClient)
         .retryOptions(retryOptions)
         .configuration(configuration)

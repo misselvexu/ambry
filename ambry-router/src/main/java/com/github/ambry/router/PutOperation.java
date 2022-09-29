@@ -37,11 +37,9 @@ import com.github.ambry.notification.NotificationSystem;
 import com.github.ambry.protocol.Crc32Impl;
 import com.github.ambry.protocol.PutRequest;
 import com.github.ambry.protocol.PutResponse;
-import com.github.ambry.quota.Chargeable;
 import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.quota.QuotaException;
-import com.github.ambry.quota.QuotaMethod;
-import com.github.ambry.quota.QuotaResource;
+import com.github.ambry.quota.QuotaUtils;
 import com.github.ambry.rest.NettyRequest;
 import com.github.ambry.rest.RestRequest;
 import com.github.ambry.server.ServerErrorCode;
@@ -60,6 +58,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
@@ -699,6 +698,13 @@ class PutOperation {
   }
 
   /**
+   * @return QuotaChargeCallback associated with this request.
+   */
+  public QuotaChargeCallback getQuotaChargeCallback() {
+    return quotaChargeCallback;
+  }
+
+  /**
    * Called whenever the channel has data but no free or building chunk is available to be filled.
    */
   private void maybeStartTrackingWaitForChunkTime() {
@@ -978,12 +984,14 @@ class PutOperation {
     switch (routerErrorCode) {
       case InsufficientCapacity:
         return 1;
-      case AmbryUnavailable:
+      case TooManyRequests:
         return 2;
-      case UnexpectedInternalError:
+      case AmbryUnavailable:
         return 3;
-      case OperationTimedOut:
+      case UnexpectedInternalError:
         return 4;
+      case OperationTimedOut:
+        return 5;
       default:
         return Integer.MIN_VALUE;
     }
@@ -995,7 +1003,7 @@ class PutOperation {
    * handles a chunk of data and takes it to completion, and once done, moves on to handle more chunks of data. This
    * why there is a reference to the "current chunk" in the comments.
    */
-  class PutChunk implements Chargeable {
+  class PutChunk {
     // the position of the current chunk in the overall blob.
     private int chunkIndex;
     // the blobId of the current chunk.
@@ -1035,11 +1043,11 @@ class PutOperation {
     // the list of partitions already attempted for this chunk.
     private List<PartitionId> attemptedPartitionIds = new ArrayList<PartitionId>();
     // map of correlation id to the request metadata for every request issued for the current chunk.
-    private final Map<Integer, ChunkPutRequestInfo> correlationIdToChunkPutRequestInfo = new TreeMap<>();
+    private final Map<Integer, RequestInfo> correlationIdToChunkPutRequestInfo = new LinkedHashMap<>();
     // list of buffers that were once associated with this chunk and are not yet freed.
     private final Logger logger = LoggerFactory.getLogger(PutChunk.class);
-    // whether the quota is already charged for this chunk.
-    private boolean isCharged;
+    // Tracks quota charging for this chunk.
+    private OperationQuotaCharger operationQuotaCharger;
 
     /**
      * Construct a PutChunk
@@ -1067,7 +1075,8 @@ class PutOperation {
       // this assignment should be the last statement as this immediately makes this chunk available to the
       // ChunkFiller thread for filling.
       state = ChunkState.Free;
-      isCharged = false;
+      operationQuotaCharger =
+          new OperationQuotaCharger(quotaChargeCallback, PutOperation.class.getSimpleName(), routerMetrics);
     }
 
     /**
@@ -1160,59 +1169,6 @@ class PutOperation {
       return operationTracker;
     }
 
-    @Override
-    public boolean check() {
-      if (quotaChargeCallback == null || isCharged) {
-        return true;
-      }
-
-      return quotaChargeCallback.check();
-    }
-
-    @Override
-    public boolean charge() {
-      if (quotaChargeCallback == null || isCharged) {
-        return true;
-      }
-      try {
-        quotaChargeCallback.charge(chunkBlobProperties.getBlobSize());
-        isCharged = true;
-      } catch (QuotaException quotaException) {
-        logger.warn(String.format("Quota charging failed in GetBlobOperation for blob %s due to %s ", blobId.toString(),
-            quotaException.toString()));
-      }
-      return isCharged;
-    }
-
-    @Override
-    public boolean quotaExceedAllowed() {
-      if (quotaChargeCallback == null) {
-        return true;
-      }
-      return quotaChargeCallback.quotaExceedAllowed();
-    }
-
-    @Override
-    public QuotaResource getQuotaResource() {
-      if (quotaChargeCallback == null) {
-        return null;
-      }
-      try {
-        return quotaChargeCallback.getQuotaResource();
-      } catch (QuotaException quotaException) {
-        logger.error(String.format(
-            "Could create QuotaResource object during GetBlobOperation for the chunk %s due to %s. This should never happen.",
-            blobId.toString(), quotaException.toString()));
-      }
-      // A null return means quota resource could not be created for this chunk. The consumer should decide how to handle nulls.
-      return null;
-    }
-
-    @Override
-    public QuotaMethod getQuotaMethod() {
-      return quotaChargeCallback.getQuotaMethod();
-    }
-
     /**
      * Prepare this chunk for building, that is, for being filled with data from the channel.
      * @param chunkIndex the position in the overall blob that this chunk is going to  be in.
@@ -1228,21 +1184,11 @@ class PutOperation {
     private void prepareForSending() {
       try {
         // Determine data type to set
-        BlobDataType blobDataType = null;
-        if (isMetadataChunk()) {
-          blobDataType = BlobDataType.METADATA;
-        } else if (chunkIndex == 0) {
-          // TODO: need more data to distinguish between Simple and Data Chunk
-          blobDataType = BlobDataType.DATACHUNK;
-        } else {
-          blobDataType = BlobDataType.DATACHUNK;
-        }
+        BlobDataType blobDataType = isMetadataChunk() ? BlobDataType.METADATA : BlobDataType.DATACHUNK;
 
-        // if this is part of a retry, make sure no previously attempted partitions are retried.
-        if (partitionId != null) {
-          attemptedPartitionIds.add(partitionId);
-        }
         partitionId = getPartitionForPut(partitionClass, attemptedPartitionIds);
+        // To ensure previously attempted partitions are not retried for this PUT after a failure.
+        attemptedPartitionIds.add(partitionId);
 
         chunkBlobId =
             new BlobId(routerConfig.routerBlobidCurrentVersion, BlobIdType.NATIVE, clusterMap.getLocalDatacenterId(),
@@ -1379,6 +1325,7 @@ class PutOperation {
       if (updateMetric) {
         routerMetrics.chunkFillTimeMs.update(time.milliseconds() - chunkFreeAtMs);
       }
+
       if (!passedInBlobProperties.isEncrypted()) {
         prepareForSending();
         chunkReadyAtMs = time.milliseconds();
@@ -1453,12 +1400,14 @@ class PutOperation {
       }
       if (done) {
         // the chunk is complete now. We can charge against quota for the chunk if its not a metadata chunk.
-        if (quotaChargeCallback != null && !(this instanceof MetadataPutChunk) && chunkException == null) {
+        if (QuotaUtils.postProcessCharge(quotaChargeCallback) && !(this instanceof MetadataPutChunk)
+            && chunkException == null) {
           try {
-            quotaChargeCallback.charge(chunkBlobProperties.getBlobSize());
+            quotaChargeCallback.checkAndCharge(false, true, chunkBlobProperties.getBlobSize());
           } catch (QuotaException quotaException) {
             // For now we only log for quota charge exceptions for in progress requests.
-            logger.info("{}: Exception {} while handling quota charge event", loggingContext, quotaException.toString());
+            logger.info("{}: Exception {} while handling quota charge event", loggingContext,
+                quotaException.toString());
           }
         }
         state = ChunkState.Complete;
@@ -1488,26 +1437,41 @@ class PutOperation {
      * @param requestRegistrationCallback The callback to use to notify the networking layer of dropped requests.
      */
     private void cleanupExpiredInFlightRequests(RequestRegistrationCallback<PutOperation> requestRegistrationCallback) {
-      Iterator<Map.Entry<Integer, ChunkPutRequestInfo>> inFlightRequestsIterator =
+      Iterator<Map.Entry<Integer, RequestInfo>> inFlightRequestsIterator =
           correlationIdToChunkPutRequestInfo.entrySet().iterator();
       while (inFlightRequestsIterator.hasNext()) {
-        Map.Entry<Integer, ChunkPutRequestInfo> entry = inFlightRequestsIterator.next();
+        Map.Entry<Integer, RequestInfo> entry = inFlightRequestsIterator.next();
         int correlationId = entry.getKey();
-        ChunkPutRequestInfo info = entry.getValue();
-        if (time.milliseconds() - info.startTimeMs > routerConfig.routerRequestTimeoutMs) {
-          onErrorResponse(info.replicaId, TrackedRequestFinalState.FAILURE);
-          logger.warn("{}: PutRequest with correlationId {} in flight has expired for replica {} {}", loggingContext,
-              correlationId, info.replicaId.getDataNodeId(), info);
+        RequestInfo requestInfo = entry.getValue();
+        // If request times out due to no response from server or due to being stuck in router itself (due to bandwidth
+        // throttling, etc) for long time, drop the request.
+        long currentTimeInMs = time.milliseconds();
+        RouterUtils.RouterRequestExpiryReason routerRequestExpiryReason =
+            RouterUtils.isRequestExpired(requestInfo, currentTimeInMs);
+        if (routerRequestExpiryReason != RouterUtils.RouterRequestExpiryReason.NO_TIMEOUT) {
+          onErrorResponse(requestInfo.getReplicaId(), TrackedRequestFinalState.FAILURE);
+          logger.warn("{}: PutRequest with correlationId {} in flight has expired for replica {} {} due to {} ",
+              loggingContext, correlationId, requestInfo.getReplicaId().getDataNodeId(), requestInfo,
+              routerRequestExpiryReason.name());
           // Do not notify this as a failure to the response handler, as this timeout could simply be due to
           // connection unavailability. If there is indeed a network error, the NetworkClient will provide an error
           // response and the response handler will be notified accordingly.
-          setChunkException(
-              RouterUtils.buildTimeoutException(correlationId, info.replicaId.getDataNodeId(), chunkBlobId));
+          setChunkException(RouterUtils.buildTimeoutException(correlationId, requestInfo.getReplicaId().getDataNodeId(),
+              chunkBlobId));
           requestRegistrationCallback.registerRequestToDrop(correlationId);
           inFlightRequestsIterator.remove();
         } else {
-          // the entries are ordered by correlation id and time. Break on the first request that has not timed out.
-          break;
+          // Note: Even though the requests are ordered by correlation id and their creation time, we cannot break out of
+          // the while loop here. This is because time outs for all requests may not be equal now.
+
+          // For example, request 1 in the map may have been assigned high time out since it might be sent at a
+          // time when the load is high and request 2 may have been assigned lower time out value since the load might have
+          // decreased by the time it is sent out. In this case, we should continue iterating the loop and clean up
+          // request 2 in the map.
+
+          // The cost of iterating all entries should be okay since the map contains outstanding requests whose number
+          // should be small. The maximum outstanding requests possible would be equal to the operation parallelism value
+          // and may be few more if adaptive operation tracker is used.
         }
       }
     }
@@ -1522,12 +1486,13 @@ class PutOperation {
         String hostname = replicaId.getDataNodeId().getHostname();
         Port port = RouterUtils.getPortToConnectTo(replicaId, routerConfig.routerEnableHttp2NetworkClient);
         PutRequest putRequest = createPutRequest();
-        RequestInfo request = new RequestInfo(hostname, port, putRequest, replicaId, null);
+        RequestInfo requestInfo =
+            new RequestInfo(hostname, port, putRequest, replicaId, prepareQuotaCharger(), time.milliseconds(),
+                routerConfig.routerRequestNetworkTimeoutMs, routerConfig.routerRequestTimeoutMs);
         int correlationId = putRequest.getCorrelationId();
-        correlationIdToChunkPutRequestInfo.put(correlationId,
-            new ChunkPutRequestInfo(replicaId, putRequest, time.milliseconds()));
+        correlationIdToChunkPutRequestInfo.put(correlationId, requestInfo);
         correlationIdToPutChunk.put(correlationId, this);
-        requestRegistrationCallback.registerRequestToSend(PutOperation.this, request);
+        requestRegistrationCallback.registerRequestToSend(PutOperation.this, requestInfo);
         replicaIterator.remove();
         if (RouterUtils.isRemoteReplica(routerConfig, replicaId)) {
           logger.debug("{}: Making request with correlationId {} to a remote replica {} in {}", loggingContext,
@@ -1589,8 +1554,8 @@ class PutOperation {
      */
     void handleResponse(ResponseInfo responseInfo, PutResponse putResponse) {
       int correlationId = responseInfo.getRequestInfo().getRequest().getCorrelationId();
-      ChunkPutRequestInfo chunkPutRequestInfo = correlationIdToChunkPutRequestInfo.remove(correlationId);
-      if (chunkPutRequestInfo == null) {
+      RequestInfo requestInfo = correlationIdToChunkPutRequestInfo.remove(correlationId);
+      if (requestInfo == null) {
         // Ignore right away. This could mean:
         // - the response is valid for this chunk, but was timed out and removed from the map.
         // - the response is for an earlier attempt of this chunk (slipped put scenario). And the map was cleared
@@ -1599,15 +1564,20 @@ class PutOperation {
         logger.debug("{}: No matching request found for {}", loggingContext, correlationId);
         return;
       }
-      long requestLatencyMs = time.milliseconds() - chunkPutRequestInfo.startTimeMs;
+      if (responseInfo.isQuotaRejected()) {
+        processQuotaRejectedResponse(correlationId, requestInfo.getReplicaId());
+        return;
+      }
+      // Track the over all time taken for the response since the creation of the request.
+      long requestLatencyMs = time.milliseconds() - requestInfo.getRequestCreateTime();
       routerMetrics.routerRequestLatencyMs.update(requestLatencyMs);
-      routerMetrics.getDataNodeBasedMetrics(chunkPutRequestInfo.replicaId.getDataNodeId()).putRequestLatencyMs.update(
+      routerMetrics.getDataNodeBasedMetrics(requestInfo.getReplicaId().getDataNodeId()).putRequestLatencyMs.update(
           requestLatencyMs);
       boolean isSuccessful;
       TrackedRequestFinalState putRequestFinalState = null;
       if (responseInfo.getError() != null) {
         logger.debug("{}: PutRequest with response correlationId {} timed out for replica {} ", loggingContext,
-            correlationId, chunkPutRequestInfo.replicaId.getDataNodeId());
+            correlationId, requestInfo.getReplicaId().getDataNodeId());
         setChunkException(new RouterException(
             "Operation timed out because of " + responseInfo.getError() + " at DataNode " + responseInfo.getDataNode(),
             RouterErrorCode.OperationTimedOut));
@@ -1617,7 +1587,7 @@ class PutOperation {
         if (putResponse == null) {
           logger.debug(
               "{}: PutRequest with response correlationId {} received an unexpected error on response deserialization from replica {} ",
-              loggingContext, correlationId, chunkPutRequestInfo.replicaId.getDataNodeId());
+              loggingContext, correlationId, requestInfo.getReplicaId().getDataNodeId());
           setChunkException(new RouterException("Response deserialization received an unexpected error",
               RouterErrorCode.UnexpectedInternalError));
           isSuccessful = false;
@@ -1646,7 +1616,7 @@ class PutOperation {
               // chunkException will be set within processServerError.
               logger.trace(
                   "{}: Replica {} returned an error {} for a PutRequest with response correlationId : {} and blobId {}",
-                  loggingContext, chunkPutRequestInfo.replicaId, putResponse.getError(), putResponse.getCorrelationId(),
+                  loggingContext, requestInfo.getReplicaId(), putResponse.getError(), putResponse.getCorrelationId(),
                   blobId);
               processServerError(putResponse.getError());
               isSuccessful = false;
@@ -1658,15 +1628,28 @@ class PutOperation {
         }
       }
       if (isSuccessful) {
-        operationTracker.onResponse(chunkPutRequestInfo.replicaId, TrackedRequestFinalState.SUCCESS);
-        if (RouterUtils.isRemoteReplica(routerConfig, chunkPutRequestInfo.replicaId)) {
+        operationTracker.onResponse(requestInfo.getReplicaId(), TrackedRequestFinalState.SUCCESS);
+        if (RouterUtils.isRemoteReplica(routerConfig, requestInfo.getReplicaId())) {
           logger.trace("{}: Cross colo request successful for remote replica in {} ", loggingContext,
-              chunkPutRequestInfo.replicaId.getDataNodeId().getDatacenterName());
+              requestInfo.getReplicaId().getDataNodeId().getDatacenterName());
           routerMetrics.crossColoSuccessCount.inc();
         }
       } else {
-        onErrorResponse(chunkPutRequestInfo.replicaId, putRequestFinalState);
+        onErrorResponse(requestInfo.getReplicaId(), putRequestFinalState);
       }
+      checkAndMaybeComplete();
+    }
+
+    /**
+     * Process response if it was rejected due to quota compliance.
+     * @param correlationId correlation id of the request.
+     * @param replicaId {@link ReplicaId} of the request.
+     */
+    private void processQuotaRejectedResponse(int correlationId, ReplicaId replicaId) {
+      logger.debug("{}: PutRequest with response correlationId {} was rejected because quota was exceeded.",
+          loggingContext, correlationId);
+      setChunkException(new RouterException("QuotaExceeded", RouterErrorCode.TooManyRequests));
+      onErrorResponse(replicaId, TrackedRequestFinalState.QUOTA_REJECTED, false);
       checkAndMaybeComplete();
     }
 
@@ -1676,10 +1659,23 @@ class PutOperation {
      * @param putRequestFinalState the {@link RouterErrorCode} associated with failed response.
      */
     private void onErrorResponse(ReplicaId replicaId, TrackedRequestFinalState putRequestFinalState) {
+      onErrorResponse(replicaId, putRequestFinalState, true);
+    }
+
+    /**
+     * Perform the necessary actions when a request to a replica fails.
+     * @param replicaId the {@link ReplicaId} associated with the failed response.
+     * @param putRequestFinalState the {@link RouterErrorCode} associated with failed response.
+     * @param updateDataNodeMetrics {@code true} if data node metrics should be updated. {@code false} otherwise.
+     */
+    private void onErrorResponse(ReplicaId replicaId, TrackedRequestFinalState putRequestFinalState,
+        boolean updateDataNodeMetrics) {
       // For Put, final state could be TIMED_OUT, REQUEST_DISABLED and FAILURE
       operationTracker.onResponse(replicaId, putRequestFinalState);
       routerMetrics.routerRequestErrorCount.inc();
-      routerMetrics.getDataNodeBasedMetrics(replicaId.getDataNodeId()).putRequestErrorCount.inc();
+      if (updateDataNodeMetrics) {
+        routerMetrics.getDataNodeBasedMetrics(replicaId.getDataNodeId()).putRequestErrorCount.inc();
+      }
     }
 
     /**
@@ -1707,23 +1703,15 @@ class PutOperation {
     }
 
     /**
-     * A class that holds information about requests sent out by this PutChunk.
+     * Set the blobId and chunkSize in the operationQuotaCharger, and return the {@link OperationQuotaCharger} object.
+     * Note that this method might set the blobId and chunkSize for the same chunk multiple times. This is ok because
+     * these are idempotent operation for the same chunk.
+     * @return OperationQuotaCharger object.
      */
-    private class ChunkPutRequestInfo {
-      final ReplicaId replicaId;
-      final PutRequest putRequest;
-      final long startTimeMs;
-
-      /**
-       * Construct a ChunkPutRequestInfo
-       * @param replicaId the replica to which this request is being sent.
-       * @param startTimeMs the time at which this request was created.
-       */
-      ChunkPutRequestInfo(ReplicaId replicaId, PutRequest putRequest, long startTimeMs) {
-        this.replicaId = replicaId;
-        this.putRequest = putRequest;
-        this.startTimeMs = startTimeMs;
-      }
+    private OperationQuotaCharger prepareQuotaCharger() {
+      operationQuotaCharger.setBlobId(chunkBlobId);
+      operationQuotaCharger.setChunkSize(chunkBlobSize);
+      return operationQuotaCharger;
     }
   }
 

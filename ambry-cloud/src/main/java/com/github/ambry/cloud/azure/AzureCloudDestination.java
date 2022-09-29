@@ -13,8 +13,13 @@
  */
 package com.github.ambry.cloud.azure;
 
-import com.azure.storage.blob.BlobServiceClient;
-import com.azure.storage.blob.batch.BlobBatchClient;
+import com.azure.cosmos.CosmosAsyncClient;
+import com.azure.cosmos.CosmosAsyncContainer;
+import com.azure.cosmos.CosmosAsyncDatabase;
+import com.azure.cosmos.CosmosException;
+import com.azure.cosmos.implementation.HttpConstants;
+import com.azure.storage.blob.BlobServiceAsyncClient;
+import com.azure.storage.blob.batch.BlobBatchAsyncClient;
 import com.azure.storage.blob.models.BlobErrorCode;
 import com.azure.storage.blob.models.BlobStorageException;
 import com.codahale.metrics.MetricRegistry;
@@ -36,12 +41,6 @@ import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.replication.FindToken;
 import com.github.ambry.store.StoreException;
 import com.github.ambry.utils.Utils;
-import com.microsoft.azure.cosmosdb.Document;
-import com.microsoft.azure.cosmosdb.DocumentClientException;
-import com.microsoft.azure.cosmosdb.ResourceResponse;
-import com.microsoft.azure.cosmosdb.internal.HttpConstants;
-import com.microsoft.azure.cosmosdb.internal.HttpConstants.StatusCodes;
-import com.microsoft.azure.cosmosdb.rx.AsyncDocumentClient;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -53,11 +52,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static com.azure.cosmos.implementation.HttpConstants.StatusCodes.*;
 
 
 /**
@@ -116,30 +121,38 @@ class AzureCloudDestination implements CloudDestination {
 
   /**
    * Test constructor.
-   * @param storageClient the {@link BlobServiceClient} to use.
-   * @param asyncDocumentClient the {@link AsyncDocumentClient} to use.
-   * @param cosmosCollectionLink the CosmosDB collection link to use.
+   * @param storageAsyncClient the {@link BlobServiceAsyncClient} to use.
+   * @param blobBatchAsyncClient the {@link BlobBatchAsyncClient} to use.
+   * @param cosmosAsyncClient the {@link CosmosAsyncClient} to use.
+   * @param cosmosAsyncDatabase the {@link CosmosAsyncDatabase} to use.
+   * @param cosmosAsyncContainer the {@link CosmosAsyncContainer} to use.
+   * @param cosmosDatabase the cosmos Database to use.
+   * @param cosmosContainerForMetadata the CosmosDB collection to use for blob metadata.
+   * @param cosmosContainerForDeletedAmbryContainers the CosmosDB collection to use for deleted Containers.
    * @param clusterName the name of the Ambry cluster.
    * @param azureMetrics the {@link AzureMetrics} to use.
    * @param azureReplicationFeedType the {@link AzureReplicationFeed.FeedType} to use for replication from Azure.
    * @param clusterMap {@link ClusterMap} object.
    * @param isVcr whether this instance is a VCR.
    */
-  AzureCloudDestination(BlobServiceClient storageClient, BlobBatchClient blobBatchClient,
-      AsyncDocumentClient asyncDocumentClient, String cosmosCollectionLink, String cosmosDeletedContainerCollectionLink,
-      String clusterName, AzureMetrics azureMetrics, AzureReplicationFeed.FeedType azureReplicationFeedType,
-      ClusterMap clusterMap, boolean isVcr, Properties configProps) throws CloudStorageException {
+  AzureCloudDestination(BlobServiceAsyncClient storageAsyncClient, BlobBatchAsyncClient blobBatchAsyncClient,
+      CosmosAsyncClient cosmosAsyncClient, CosmosAsyncDatabase cosmosAsyncDatabase,
+      CosmosAsyncContainer cosmosAsyncContainer, String cosmosDatabase, String cosmosContainerForMetadata,
+      String cosmosContainerForDeletedAmbryContainers, String clusterName, AzureMetrics azureMetrics,
+      AzureReplicationFeed.FeedType azureReplicationFeedType, ClusterMap clusterMap, boolean isVcr,
+      Properties configProps) throws CloudStorageException {
     this.azureMetrics = azureMetrics;
     this.blobLayoutStrategy = new AzureBlobLayoutStrategy(clusterName);
     this.cloudConfig = new CloudConfig(new VerifiableProperties(configProps));
     AzureCloudConfig azureCloudConfig = new AzureCloudConfig(new VerifiableProperties(configProps));
     this.azureBlobDataAccessor =
-        new AzureBlobDataAccessor(storageClient, blobBatchClient, clusterName, azureMetrics, azureCloudConfig);
+        new AzureBlobDataAccessor(storageAsyncClient, blobBatchAsyncClient, clusterName, azureMetrics, azureCloudConfig,
+            cloudConfig);
     this.queryBatchSize = AzureCloudConfig.DEFAULT_QUERY_BATCH_SIZE;
     VcrMetrics vcrMetrics = new VcrMetrics(new MetricRegistry());
     this.cosmosDataAccessor =
-        new CosmosDataAccessor(asyncDocumentClient, cosmosCollectionLink, cosmosDeletedContainerCollectionLink,
-            vcrMetrics, azureMetrics);
+        new CosmosDataAccessor(cosmosAsyncClient, cosmosAsyncDatabase, cosmosAsyncContainer, cosmosDatabase,
+            cosmosContainerForMetadata, cosmosContainerForDeletedAmbryContainers, vcrMetrics, azureMetrics);
     this.azureStorageCompactor =
         new AzureStorageCompactor(azureBlobDataAccessor, cosmosDataAccessor, cloudConfig, vcrMetrics, azureMetrics);
     this.azureContainerCompactor =
@@ -157,17 +170,19 @@ class AzureCloudDestination implements CloudDestination {
     if (e instanceof BlobStorageException) {
       azureMetrics.storageErrorCount.inc();
       statusCode = ((BlobStorageException) e).getStatusCode();
-    } else if (e instanceof DocumentClientException) {
+    } else if (e instanceof CosmosException) {
       azureMetrics.documentErrorCount.inc();
-      statusCode = ((DocumentClientException) e).getStatusCode();
-      retryDelayMs = ((DocumentClientException) e).getRetryAfterInMilliseconds();
+      statusCode = ((CosmosException) e).getStatusCode();
+      retryDelayMs = ((CosmosException) e).getRetryAfterDuration().toMillis();
     } else {
       // Note: catch-all since ABS can throw things like IOException, IllegalStateException
-      azureMetrics.storageErrorCount.inc();
-      statusCode = StatusCodes.INTERNAL_SERVER_ERROR;
+      if (azureMetrics != null) {
+        azureMetrics.storageErrorCount.inc();
+      }
+      statusCode = HttpConstants.StatusCodes.INTERNAL_SERVER_ERROR;
     }
     // Everything is retryable except NOT_FOUND
-    boolean isRetryable = (statusCode != StatusCodes.NOTFOUND && !(e instanceof StoreException));
+    boolean isRetryable = (statusCode != NOTFOUND && !(e instanceof StoreException));
     return new CloudStorageException(message, e, statusCode, isRetryable, retryDelayMs);
   }
 
@@ -203,74 +218,180 @@ class AzureCloudDestination implements CloudDestination {
   @Override
   public boolean uploadBlob(BlobId blobId, long inputLength, CloudBlobMetadata cloudBlobMetadata,
       InputStream blobInputStream) throws CloudStorageException {
+    try {
+      // Use the async version to upload the blob and wait on the result
+      return uploadBlobAsync(blobId, inputLength, cloudBlobMetadata, blobInputStream).join();
+    } catch (CompletionException e) {
+      Exception ex = Utils.extractFutureExceptionCause(e);
+      if (ex instanceof CloudStorageException) {
+        throw ((CloudStorageException) ex);
+      }
+      throw new RuntimeException("Error uploading blob " + blobId, ex);
+    }
+  }
 
+  @Override
+  public CompletableFuture<Boolean> uploadBlobAsync(BlobId blobId, long inputLength,
+      CloudBlobMetadata cloudBlobMetadata, InputStream blobInputStream) {
     Objects.requireNonNull(blobId, "BlobId cannot be null");
     Objects.requireNonNull(blobInputStream, "Input stream cannot be null");
-    try {
-      Timer.Context backupTimer = azureMetrics.backupSuccessLatency.time();
-      boolean uploaded =
-          azureBlobDataAccessor.uploadIfNotExists(blobId, inputLength, cloudBlobMetadata, blobInputStream);
-      // Note: if uploaded is false, still attempt to insert the metadata document
-      // since it is possible that a previous attempt failed.
+    CompletableFuture<Boolean> resultFuture = new CompletableFuture<>();
+    Timer.Context backupTimer = azureMetrics.backupSuccessLatency.time();
+    azureBlobDataAccessor.uploadAsyncIfNotExists(blobId, inputLength, cloudBlobMetadata, blobInputStream)
+        .whenComplete((isBlobUploaded, throwableOnBlobUpload) -> {
+          if (throwableOnBlobUpload != null) {
+            // Received an error when uploading to Azure blob storage
+            azureMetrics.backupErrorCount.inc();
+            backupTimer.stop();
+            Exception ex = Utils.extractFutureExceptionCause(throwableOnBlobUpload);
+            resultFuture.completeExceptionally(toCloudStorageException("Error uploading blob " + blobId, ex));
+          } else {
+            // Note: Even if upload to ABS returned false, still attempt to insert the metadata document since it is possible that
+            // a previous attempt to insert metadata to Cosmos failed.
+            cosmosDataAccessor.upsertMetadataAsync(cloudBlobMetadata)
+                .whenComplete((metadataResponse, throwableOnMetadataUpload) -> {
+                  backupTimer.stop();
+                  if (throwableOnMetadataUpload != null) {
+                    azureMetrics.backupErrorCount.inc();
+                    Exception ex = Utils.extractFutureExceptionCause(throwableOnMetadataUpload);
+                    resultFuture.completeExceptionally(toCloudStorageException("Error uploading blob " + blobId, ex));
+                  } else {
+                    if (isBlobUploaded) {
+                      azureMetrics.backupSuccessByteRate.mark(inputLength);
+                    }
+                    // Complete the result future as true if the blob was successfully uploaded to ABS and Cosmos.
+                    resultFuture.complete(isBlobUploaded);
+                  }
+                });
+          }
+        });
 
-      cosmosDataAccessor.upsertMetadata(cloudBlobMetadata);
-      backupTimer.stop();
-      if (uploaded) {
-        azureMetrics.backupSuccessByteRate.mark(inputLength);
-      }
-      return uploaded;
-    } catch (Exception e) {
-      azureMetrics.backupErrorCount.inc();
-      throw toCloudStorageException("Error uploading blob " + blobId, e);
-    }
+    return resultFuture;
   }
 
   @Override
   public void downloadBlob(BlobId blobId, OutputStream outputStream) throws CloudStorageException {
     try {
-      azureBlobDataAccessor.downloadBlob(blobId, outputStream);
-    } catch (Exception e) {
-      throw toCloudStorageException("Error downloading blob " + blobId, e);
+      // Use the async version to download blob and wait on the result.
+      downloadBlobAsync(blobId, outputStream).join();
+    } catch (CompletionException e) {
+      Exception ex = Utils.extractFutureExceptionCause(e);
+      if (ex instanceof CloudStorageException) {
+        throw ((CloudStorageException) ex);
+      }
+      throw new RuntimeException("Error downloading blob " + blobId, ex);
     }
+  }
+
+  @Override
+  public CompletableFuture<Void> downloadBlobAsync(BlobId blobId, OutputStream outputStream) {
+    CompletableFuture<Void> resultFuture = new CompletableFuture<>();
+    azureBlobDataAccessor.downloadBlobAsync(blobId, outputStream).whenComplete((response, throwable) -> {
+      if (throwable != null) {
+        Exception ex = Utils.extractFutureExceptionCause(throwable);
+        resultFuture.completeExceptionally(toCloudStorageException("Error downloading blob " + blobId, ex));
+      } else {
+        resultFuture.complete(null);
+      }
+    });
+    return resultFuture;
   }
 
   @Override
   public boolean deleteBlob(BlobId blobId, long deletionTime, short lifeVersion,
       CloudUpdateValidator cloudUpdateValidator) throws CloudStorageException {
+    try {
+      // Use the async version to delete blob and wait on the result.
+      return deleteBlobAsync(blobId, deletionTime, lifeVersion, cloudUpdateValidator).join();
+    } catch (CompletionException e) {
+      Exception ex = Utils.extractFutureExceptionCause(e);
+      if (ex instanceof CloudStorageException) {
+        throw ((CloudStorageException) ex);
+      }
+      throw new RuntimeException("Error deleting blob " + blobId, ex);
+    }
+  }
+
+  @Override
+  public CompletableFuture<Boolean> deleteBlobAsync(BlobId blobId, long deletionTime, short lifeVersion,
+      CloudUpdateValidator cloudUpdateValidator) {
     Map<String, Object> updateFields = new HashMap<>();
     // TODO Frontend support needs to handle the special case of life version = MessageInfo.LIFE_VERSION_FROM_FRONTEND
     updateFields.put(CloudBlobMetadata.FIELD_LIFE_VERSION, lifeVersion);
     updateFields.put(CloudBlobMetadata.FIELD_DELETION_TIME, deletionTime);
-    UpdateResponse updateResponse = updateBlobMetadata(blobId, updateFields, cloudUpdateValidator);
-    return updateResponse.wasUpdated;
+    return updateBlobMetadata(blobId, updateFields, cloudUpdateValidator).thenApply(
+        (updateResponse -> updateResponse.wasUpdated));
   }
 
   @Override
   public short updateBlobExpiration(BlobId blobId, long expirationTime, CloudUpdateValidator cloudUpdateValidator)
       throws CloudStorageException {
-    UpdateResponse updateResponse =
-        updateBlobMetadata(blobId, Collections.singletonMap(CloudBlobMetadata.FIELD_EXPIRATION_TIME, expirationTime),
-            cloudUpdateValidator);
-    return updateResponse.metadata.containsKey(CloudBlobMetadata.FIELD_LIFE_VERSION) ? Short.parseShort(
-        updateResponse.metadata.get(CloudBlobMetadata.FIELD_LIFE_VERSION)) : 0;
+    try {
+      // Use the async version to updateBlobExpiration and wait on the result.
+      return updateBlobExpirationAsync(blobId, expirationTime, cloudUpdateValidator).join();
+    } catch (CompletionException e) {
+      Exception ex = Utils.extractFutureExceptionCause(e);
+      if (ex instanceof CloudStorageException) {
+        throw ((CloudStorageException) ex);
+      }
+      throw new RuntimeException("Error updating blob " + blobId, ex);
+    }
+  }
+
+  @Override
+  public CompletableFuture<Short> updateBlobExpirationAsync(BlobId blobId, long expirationTime,
+      CloudUpdateValidator cloudUpdateValidator) {
+    return updateBlobMetadata(blobId, Collections.singletonMap(CloudBlobMetadata.FIELD_EXPIRATION_TIME, expirationTime),
+        cloudUpdateValidator).thenApply(
+        (updateResponse -> updateResponse.metadata.containsKey(CloudBlobMetadata.FIELD_LIFE_VERSION) ? Short.parseShort(
+            updateResponse.metadata.get(CloudBlobMetadata.FIELD_LIFE_VERSION)) : 0));
   }
 
   @Override
   public short undeleteBlob(BlobId blobId, short lifeVersion, CloudUpdateValidator cloudUpdateValidator)
       throws CloudStorageException {
+    try {
+      // Use the async version to undeleteBlob and wait on the result.
+      return undeleteBlobAsync(blobId, lifeVersion, cloudUpdateValidator).join();
+    } catch (CompletionException e) {
+      Exception ex = Utils.extractFutureExceptionCause(e);
+      if (ex instanceof CloudStorageException) {
+        throw ((CloudStorageException) ex);
+      }
+      throw new RuntimeException("Error undeleting blob " + blobId, ex);
+    }
+  }
+
+  @Override
+  public CompletableFuture<Short> undeleteBlobAsync(BlobId blobId, short lifeVersion,
+      CloudUpdateValidator cloudUpdateValidator) {
     Map<String, Object> updateFields = new HashMap<>();
     // TODO Frontend support needs to handle the special case of life version = MessageInfo.LIFE_VERSION_FROM_FRONTEND
     updateFields.put(CloudBlobMetadata.FIELD_LIFE_VERSION, lifeVersion);
     updateFields.put(CloudBlobMetadata.FIELD_DELETION_TIME, Utils.Infinite_Time);
-    UpdateResponse updateResponse = updateBlobMetadata(blobId, updateFields, cloudUpdateValidator);
-    return Short.parseShort(updateResponse.metadata.getOrDefault(CloudBlobMetadata.FIELD_LIFE_VERSION, "0"));
+    return updateBlobMetadata(blobId, updateFields, cloudUpdateValidator).thenApply((updateResponse -> Short.parseShort(
+        updateResponse.metadata.getOrDefault(CloudBlobMetadata.FIELD_LIFE_VERSION, "0"))));
   }
 
   @Override
   public Map<String, CloudBlobMetadata> getBlobMetadata(List<BlobId> blobIds) throws CloudStorageException {
+    try {
+      // Use the async version to getBlobMetadata and wait on the result.
+      return getBlobMetadataAsync(blobIds).join();
+    } catch (CompletionException e) {
+      Exception ex = Utils.extractFutureExceptionCause(e);
+      if (ex instanceof CloudStorageException) {
+        throw ((CloudStorageException) ex);
+      }
+      throw new RuntimeException("Error getting metadata of blobs " + blobIds, ex);
+    }
+  }
+
+  @Override
+  public CompletableFuture<Map<String, CloudBlobMetadata>> getBlobMetadataAsync(List<BlobId> blobIds) {
     Objects.requireNonNull(blobIds, "blobIds cannot be null");
     if (blobIds.isEmpty()) {
-      return Collections.emptyMap();
+      return CompletableFuture.completedFuture(Collections.emptyMap());
     }
 
     // For single blob GET request (isVcr = false), get metadata from ABS instead of Cosmos
@@ -278,18 +399,35 @@ class AzureCloudDestination implements CloudDestination {
     // previous upload could have resulted in a missing record in Cosmos; the findMissingKeys result
     // needs to include that store key to replay the upload.
     if (!isVcr && blobIds.size() == 1) {
-      CloudBlobMetadata metadata = azureBlobDataAccessor.getBlobMetadata(blobIds.get(0));
-      return metadata == null ? Collections.emptyMap() : Collections.singletonMap(metadata.getId(), metadata);
+      return azureBlobDataAccessor.getBlobMetadataAsync(blobIds.get(0)).handle((cloudBlobMetadata, throwable) -> {
+        if (throwable != null) {
+          Exception ex = Utils.extractFutureExceptionCause(throwable);
+          throw new CompletionException(
+              toCloudStorageException("Failed to query metadata for blob" + blobIds.get(0), ex));
+        } else {
+          if (cloudBlobMetadata == null) {
+            return Collections.emptyMap();
+          } else {
+            return Collections.singletonMap(cloudBlobMetadata.getId(), cloudBlobMetadata);
+          }
+        }
+      });
     }
 
     // CosmosDB has query size limit of 256k chars.
     // Break list into chunks if necessary to avoid overflow.
     List<CloudBlobMetadata> metadataList = new ArrayList<>();
+    CompletableFuture<Void> resultFuture = CompletableFuture.completedFuture(null);
     List<List<BlobId>> chunkedBlobIdList = Utils.partitionList(blobIds, queryBatchSize);
     for (List<BlobId> batchOfBlobs : chunkedBlobIdList) {
-      metadataList.addAll(getBlobMetadataChunked(batchOfBlobs));
+      // Issue metadata queries one after another since parallel queries can be expensive resulting in 429s from cosmos.
+      resultFuture =
+          resultFuture.thenCompose(unused -> getBlobMetadataChunked(batchOfBlobs).thenAccept(metadataList::addAll));
     }
-    return metadataList.stream().collect(Collectors.toMap(CloudBlobMetadata::getId, Function.identity(), (x, y) -> x));
+
+    return Objects.requireNonNull(resultFuture)
+        .thenApply(unused -> metadataList.stream()
+            .collect(Collectors.toMap(CloudBlobMetadata::getId, Function.identity(), (x, y) -> x)));
   }
 
   @Override
@@ -303,24 +441,31 @@ class AzureCloudDestination implements CloudDestination {
   }
 
   /**
-   * Get metadata for specified list of blobs.
+   * Get metadata for specified list of blobs asynchronously.
    * @param blobIds {@link List} of {@link BlobId}s to get metadata of.
-   * @return {@link List} of {@link CloudBlobMetadata} for the blobs list.
-   * @throws CloudStorageException
+   * @return a {@link CompletableFuture} that will eventually contain either the {@link List} of
+   *         {@link CloudBlobMetadata} for the blobs list or an exception if an error occurred.
    */
-  private List<CloudBlobMetadata> getBlobMetadataChunked(List<BlobId> blobIds) throws CloudStorageException {
+  private CompletableFuture<List<CloudBlobMetadata>> getBlobMetadataChunked(List<BlobId> blobIds) {
+    CompletableFuture<List<CloudBlobMetadata>> resultFuture = new CompletableFuture<>();
     if (blobIds.isEmpty() || blobIds.size() > queryBatchSize) {
-      throw new IllegalArgumentException("Invalid input list size: " + blobIds.size());
+      resultFuture.completeExceptionally(new IllegalArgumentException("Invalid input list size: " + blobIds.size()));
+      return resultFuture;
     }
     String quotedBlobIds = blobIds.stream().map(s -> '"' + s.getID() + '"').collect(Collectors.joining(","));
     String query = String.format(BATCH_ID_QUERY_TEMPLATE, quotedBlobIds);
     String partitionPath = blobIds.get(0).getPartition().toPathString();
-    try {
-      return cosmosDataAccessor.queryMetadata(partitionPath, query, azureMetrics.missingKeysQueryTime);
-    } catch (DocumentClientException dex) {
-      throw toCloudStorageException(
-          "Failed to query metadata for " + blobIds.size() + " blobs in partition " + partitionPath, dex);
-    }
+    cosmosDataAccessor.queryMetadataAsync(partitionPath, query, azureMetrics.missingKeysQueryTime)
+        .whenComplete((blobMetadataList, throwable) -> {
+          Exception ex = Utils.extractFutureExceptionCause(throwable);
+          if (throwable != null) {
+            resultFuture.completeExceptionally(toCloudStorageException(
+                "Failed to query metadata for " + blobIds.size() + " blobs in partition " + partitionPath, ex));
+          } else {
+            resultFuture.complete(blobMetadataList);
+          }
+        });
+    return resultFuture;
   }
 
   @Override
@@ -328,91 +473,131 @@ class AzureCloudDestination implements CloudDestination {
       throws CloudStorageException {
     try {
       return azureReplicationFeed.getNextEntriesAndUpdatedToken(findToken, maxTotalSizeOfEntries, partitionPath);
-    } catch (DocumentClientException dex) {
-      throw toCloudStorageException("Failed to query blobs for partition " + partitionPath, dex);
+    } catch (CosmosException cex) {
+      throw toCloudStorageException("Failed to query blobs for partition " + partitionPath, cex);
     }
   }
 
   /**
-   * Update the metadata for the specified blob.
+   * Update the metadata for the specified blob asynchronously.
    * @param blobId The {@link BlobId} to update.
    * @param updateFields map of fields and new values to update.
    * @param cloudUpdateValidator {@link CloudUpdateValidator} passed by the caller to validate the update.
-   * @return {@link UpdateResponse} object containing updated metadata.
-   * @throws CloudStorageException if the update fails.
+   * @return a {@link CompletableFuture} that will eventually contain either the {@link UpdateResponse} object
+   *         containing updated metadata or an exception if an error occurred.
    */
-  private UpdateResponse updateBlobMetadata(BlobId blobId, Map<String, Object> updateFields,
-      CloudUpdateValidator cloudUpdateValidator) throws CloudStorageException {
+  private CompletableFuture<UpdateResponse> updateBlobMetadata(BlobId blobId, Map<String, Object> updateFields,
+      CloudUpdateValidator cloudUpdateValidator) {
     Objects.requireNonNull(blobId, "BlobId cannot be null");
     updateFields.keySet().forEach(field -> Objects.requireNonNull(updateFields.get(field)));
+
+    CompletableFuture<UpdateResponse> resultFuture = new CompletableFuture<>();
 
     // We update the blob metadata value in two places:
     // 1) the blob storage entry metadata (so GET's can be served entirely from ABS)
     // 2) the CosmosDB metadata collection
-    try {
-      boolean updatedStorage = false;
-      Map<String, String> metadataMap = null;
-      UpdateResponse updateResponse = null;
-      try {
-        updateResponse = azureBlobDataAccessor.updateBlobMetadata(blobId, updateFields, cloudUpdateValidator);
-        // Note: if blob does not exist will throw exception with NOT_FOUND status
-        metadataMap = updateResponse.metadata;
-        updatedStorage = updateResponse.wasUpdated;
-      } catch (BlobStorageException bex) {
-        if (bex.getErrorCode() == BlobErrorCode.BLOB_NOT_FOUND) {
-          // There is a corner case where compaction of this partition hit partial failure leaving the record
-          // in Cosmos but not ABS.  If that happens, a late arriving update event can get stuck in a loop
-          // where findMissingKeys says the blob exists (because Cosmos has it), but the subsequent update
-          // attempt fails.  So we check for that case here.
-          CloudBlobMetadata cosmosMetadata = cosmosDataAccessor.getMetadataOrNull(blobId);
-          if (cosmosMetadata != null) {
-            if (cosmosMetadata.isCompactionCandidate(
-                TimeUnit.HOURS.toMillis(cloudConfig.cloudBlobCompactionIntervalHours))) {
-              logger.warn("Inconsistency: Cosmos contains record for inactive blob {}, removing it.", blobId.getID());
-              cosmosDataAccessor.deleteMetadata(cosmosMetadata);
-              azureMetrics.blobUpdateRecoverCount.inc();
+    azureBlobDataAccessor.updateBlobMetadataAsync(blobId, updateFields, cloudUpdateValidator)
+        .whenComplete((blobStorageUpdateResponse, throwableOnBlobStorageUpdate) -> {
+          if (throwableOnBlobStorageUpdate != null) {
+            // There is an error updating the blob metadata in ABS.
+            azureMetrics.blobUpdateErrorCount.inc();
+            Exception blobUpdateException = Utils.extractFutureExceptionCause(throwableOnBlobStorageUpdate);
+            if (blobUpdateException instanceof BlobStorageException
+                && ((BlobStorageException) blobUpdateException).getErrorCode() == BlobErrorCode.BLOB_NOT_FOUND) {
+              // There is a corner case where compaction of this partition hit partial failure leaving the record
+              // in Cosmos but not ABS.  If that happens, a late arriving update event can get stuck in a loop
+              // where findMissingKeys says the blob exists (because Cosmos has it), but the subsequent update
+              // attempt fails.  So we check for that case here.
+              cosmosDataAccessor.getMetadataOrNullAsync(blobId).whenComplete((cosmosMetadata, throwableOnCosmosGet) -> {
+                if (throwableOnCosmosGet != null) {
+                  // Received an exception when trying to find blob metadata in cosmos. Complete the result future with the original exception from ABS.
+                  resultFuture.completeExceptionally(
+                      toCloudStorageException("Error updating blob metadata: " + blobId, blobUpdateException));
+                } else {
+                  if (cosmosMetadata != null) {
+                    // If the blob is found in cosmos. Check if it is a compaction candidate. If yes, delete the record in the cosmos.
+                    if (cosmosMetadata.isCompactionCandidate(
+                        TimeUnit.HOURS.toMillis(cloudConfig.cloudBlobCompactionIntervalHours))) {
+                      logger.warn("Inconsistency: Cosmos contains record for inactive blob {}, removing it.",
+                          blobId.getID());
+                      cosmosDataAccessor.deleteMetadataAsync(cosmosMetadata)
+                          .whenComplete((deleteMetadataResponse, throwableOnCosmosDelete) -> {
+                            // Blob is deleted in cosmos too now.
+                            azureMetrics.blobUpdateRecoverCount.inc();
+                            resultFuture.completeExceptionally(
+                                toCloudStorageException("Error updating blob metadata: " + blobId,
+                                    blobUpdateException));
+                          });
+                    } else {
+                      // If the blob is still active but ABS does not have it, we are in deeper trouble.
+                      logger.error("Inconsistency: Cosmos contains record for active blob {} that is missing from ABS!",
+                          blobId.getID());
+                      resultFuture.completeExceptionally(
+                          toCloudStorageException("Error updating blob metadata: " + blobId, blobUpdateException));
+                    }
+                  } else {
+                    // Blob is not found in cosmos too. Complete the result future.
+                    resultFuture.completeExceptionally(
+                        toCloudStorageException("Error updating blob metadata: " + blobId, blobUpdateException));
+                  }
+                }
+              });
             } else {
-              // If the blob is still active but ABS does not have it, we are in deeper trouble.
-              logger.error("Inconsistency: Cosmos contains record for active blob {} that is missing from ABS!",
-                  blobId.getID());
+              // If the exception from ABS is any thing other than NOT_FOUND, complete the result future immediately.
+              CloudStorageException cse =
+                  toCloudStorageException("Error updating blob metadata: " + blobId, blobUpdateException);
+              resultFuture.completeExceptionally(cse);
             }
+          } else {
+            // Blob is updated in blob storage. Now update in cosmos.
+            // Note: even if nothing changed in blob storage, still attempt to update Cosmos since this could be a retry
+            // of a request where ABS was updated but Cosmos update failed.
+            AtomicReference<Map<String, String>> metadataMap =
+                new AtomicReference<>(blobStorageUpdateResponse.metadata);
+            AtomicBoolean updatedStorage = new AtomicBoolean(blobStorageUpdateResponse.wasUpdated);
+            cosmosDataAccessor.updateMetadataAsync(blobId, metadataMap.get())
+                .whenComplete((cosmosMetadata, throwableOnCosmosUpdate) -> {
+                  AtomicBoolean updatedCosmos = new AtomicBoolean(false);
+                  if (throwableOnCosmosUpdate != null) {
+                    // Received an exception when trying to update the metadata in cosmos.
+                    Exception ex = Utils.extractFutureExceptionCause(throwableOnCosmosUpdate);
+                    if (ex instanceof CosmosException && ((CosmosException) ex).getStatusCode() == NOTFOUND) {
+                      // If the exception is due to blob not being found in Cosmos, it is an inconsistent state since
+                      //blob exists in ABS. Recover by inserting the updated map into cosmos.
+                      azureMetrics.blobUpdateRecoverCount.inc();
+                      cosmosDataAccessor.upsertMetadataAsync(CloudBlobMetadata.fromMap(metadataMap.get()))
+                          .whenComplete((updatedCosmosMetadata, throwableOnCosmosUpsert) -> {
+                            if (throwableOnCosmosUpsert != null) {
+                              azureMetrics.blobUpdateErrorCount.inc();
+                              resultFuture.completeExceptionally(
+                                  toCloudStorageException("Error updating blob metadata: " + blobId,
+                                      (Exception) throwableOnCosmosUpsert));
+                            } else {
+                              updatedCosmos.set(updatedCosmosMetadata != null);
+                              resultFuture.complete(new UpdateResponse(updatedStorage.get() || updatedCosmos.get(),
+                                  blobStorageUpdateResponse.metadata));
+                            }
+                          });
+                    } else {
+                      azureMetrics.blobUpdateErrorCount.inc();
+                      // We got some other exception apart from blob_not_found when updating cosmos. Consider the update operation as failed.
+                      resultFuture.completeExceptionally(
+                          toCloudStorageException("Error updating blob metadata: " + blobId, ex));
+                    }
+                  } else {
+                    // Updated cosmos successfully.
+                    updatedCosmos.set(cosmosMetadata != null);
+                    azureMetrics.blobUpdatedCount.inc();
+                    logger.debug("Updated metadata response {} for blob {} metadata fields {} to values {}.",
+                        updatedStorage.get() || updatedCosmos.get(), blobId, updateFields.keySet(),
+                        updateFields.values());
+                    resultFuture.complete(new UpdateResponse(updatedStorage.get() || updatedCosmos.get(),
+                        blobStorageUpdateResponse.metadata));
+                  }
+                });
           }
-        }
-        throw bex;
-      }
-
-      // Note: even if nothing changed in blob storage, still attempt to update Cosmos since this could be a retry
-      // of a request where ABS was updated but Cosmos update failed.
-      boolean updatedCosmos = false;
-      try {
-        ResourceResponse<Document> response = cosmosDataAccessor.updateMetadata(blobId, metadataMap);
-        updatedCosmos = response != null;
-      } catch (DocumentClientException dex) {
-        if (dex.getStatusCode() == HttpConstants.StatusCodes.NOTFOUND) {
-          // blob exists in ABS but not Cosmos - inconsistent state
-          // Recover by inserting the updated map into cosmos
-          cosmosDataAccessor.upsertMetadata(CloudBlobMetadata.fromMap(metadataMap));
-          azureMetrics.blobUpdateRecoverCount.inc();
-          updatedCosmos = true;
-        } else {
-          throw dex;
-        }
-      }
-
-      if (updatedStorage || updatedCosmos) {
-        logger.debug("Updated blob {} metadata set fields {} to values {}.", blobId, updateFields.keySet(),
-            updateFields.values());
-        azureMetrics.blobUpdatedCount.inc();
-        return updateResponse;
-      } else {
-        logger.debug("Blob {} already has keys {} with values {} in ABS and Cosmos", blobId, updateFields.keySet(),
-            updateFields.values());
-        return new UpdateResponse(false, metadataMap);
-      }
-    } catch (Exception e) {
-      azureMetrics.blobUpdateErrorCount.inc();
-      throw toCloudStorageException("Error updating blob metadata: " + blobId, e);
-    }
+        });
+    return resultFuture;
   }
 
   @Override
@@ -427,10 +612,10 @@ class AzureCloudDestination implements CloudDestination {
     // Write to container partitionPath, blob filename "replicaTokens"
     try {
       BlobLayout tokenLayout = blobLayoutStrategy.getTokenBlobLayout(partitionPath, tokenFileName);
-      azureBlobDataAccessor.uploadFile(tokenLayout.containerName, tokenLayout.blobFilePath, inputStream);
-    } catch (IOException | BlobStorageException e) {
+      azureBlobDataAccessor.uploadFileAsync(tokenLayout.containerName, tokenLayout.blobFilePath, inputStream).join();
+    } catch (Exception e) {
       azureMetrics.absTokenPersistFailureCount.inc();
-      throw toCloudStorageException("Could not persist token: " + partitionPath, e);
+      throw toCloudStorageException("Could not persist token: " + partitionPath, Utils.extractFutureExceptionCause(e));
     }
   }
 
@@ -439,10 +624,10 @@ class AzureCloudDestination implements CloudDestination {
       throws CloudStorageException {
     try {
       BlobLayout tokenLayout = blobLayoutStrategy.getTokenBlobLayout(partitionPath, tokenFileName);
-      return azureBlobDataAccessor.downloadFile(tokenLayout.containerName, tokenLayout.blobFilePath, outputStream,
-          false);
-    } catch (BlobStorageException e) {
-      throw toCloudStorageException("Could not retrieve token: " + partitionPath, e);
+      return azureBlobDataAccessor.downloadFileAsync(tokenLayout.containerName, tokenLayout.blobFilePath, null,
+          outputStream, false).join();
+    } catch (Exception e) {
+      throw toCloudStorageException("Could not retrieve token: " + partitionPath, Utils.extractFutureExceptionCause(e));
     }
   }
 

@@ -28,16 +28,23 @@ import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.clustermap.Resource;
 import com.github.ambry.config.RouterConfig;
+import com.github.ambry.network.RequestInfo;
+import com.github.ambry.quota.QuotaResource;
 import com.github.ambry.utils.CachedHistogram;
 import com.github.ambry.utils.SystemTime;
 import com.github.ambry.utils.Utils;
+import com.google.common.cache.Cache;
 import java.util.HashMap;
+import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -96,6 +103,9 @@ public class NonBlockingRouterMetrics {
   public final Histogram updateBlobTtlOperationLatencyMs;
   public final Histogram routerRequestLatencyMs;
   public final Histogram responseReceiveToHandleLatencyMs;
+  public final Histogram getDataChunkLatencyMs;
+  public final Histogram getMetadataChunkLatencyMs;
+  public final Histogram getFirstDataChunkLatencyMs;
 
   // Operation error count.
   public final Counter putBlobErrorCount;
@@ -139,6 +149,7 @@ public class NonBlockingRouterMetrics {
   public final Counter requestResponseHandlerUnexpectedErrorCount;
   public final Counter chunkFillerUnexpectedErrorCount;
   public final Counter operationFailureWithUnsetExceptionCount;
+  public final Counter missingDataChunkErrorCount;
 
   // Performance metrics for operation managers.
   public final Histogram putManagerPollTimeMs;
@@ -174,6 +185,8 @@ public class NonBlockingRouterMetrics {
   public final Counter simpleUnencryptedBlobSizeMismatchCount;
   public final Counter compositeBlobSizeMismatchCount;
   public final Counter unknownPartitionClassCount;
+  public final Counter updateOptimizedCount;
+  public final Counter updateUnOptimizedCount;
   // Number of unnecessary blob gets avoided via use of BlobDataType
   public final Counter skippedGetBlobCount;
   public Gauge<Long> chunkFillerThreadRunning;
@@ -208,6 +221,9 @@ public class NonBlockingRouterMetrics {
 
   public final Counter failedOnOriginatingDcNotFoundCount;
   public final Counter failedOnTotalNotFoundCount;
+  public final Counter failedMaybeDueToOriginatingDcOfflineReplicasCount;
+  public final Counter failedMaybeDueToTotalOfflineReplicasCount;
+  public final Counter failedMaybeDueToUnavailableReplicasCount;
 
   // Workload characteristics
   public final AgeAtAccessMetrics ageAtGet;
@@ -218,6 +234,25 @@ public class NonBlockingRouterMetrics {
   // Crypto job metrics
   public final CryptoJobMetrics encryptJobMetrics;
   public final CryptoJobMetrics decryptJobMetrics;
+
+  // Quota handling related metrics
+  public final Meter requestsWithUnknownQuotaResourceRate;
+  public final Meter rejectedRequestRate;
+  public final Meter delayedRequestRate;
+  public final Meter exceedAllowedRequestRate;
+  public final Meter unknownExceptionInChargeableRate;
+  public final Timer totalQuotaQueueingDelay;
+  public final Timer addToQueueTime;
+  public final Timer drainRequestQueueTime;
+  public final Timer pollQuotaCompliantRequestTime;
+  public final Timer pollExceedAllowedRequestTime;
+  public Gauge<Integer> operationControllerReadQueueSize;
+  public Gauge<Integer> operationControllerWriteQueueSize;
+  public Gauge<Integer> operationControllerQueueSize;
+  public Gauge<Integer> readQueuedQuotaResourceCount;
+  public Gauge<Integer> writeQueuedQuotaResourceCount;
+  public Gauge<Integer> delayedQuotaResourcesInQueue;
+  public Gauge<Integer> outOfQuotaResourcesInQueue;
 
   // Resource to latency histogram map. Here resource can be DataNode, Partition, Disk, Replica etc.
   Map<Resource, CachedHistogram> getBlobLocalDcResourceToLatency = new HashMap<>();
@@ -314,6 +349,12 @@ public class NonBlockingRouterMetrics {
         metricRegistry.histogram(MetricRegistry.name(NonBlockingRouter.class, "RouterRequestLatencyMs"));
     responseReceiveToHandleLatencyMs =
         metricRegistry.histogram(MetricRegistry.name(NonBlockingRouter.class, "ResponseReceiveToHandleLatencyMs"));
+    getDataChunkLatencyMs =
+        metricRegistry.histogram(MetricRegistry.name(NonBlockingRouter.class, "GetDataChunkLatencyMs"));
+    getMetadataChunkLatencyMs =
+        metricRegistry.histogram(MetricRegistry.name(NonBlockingRouter.class, "GetMetadataChunkLatencyMs"));
+    getFirstDataChunkLatencyMs =
+        metricRegistry.histogram(MetricRegistry.name(NonBlockingRouter.class, "GetFirstDataChunkLatencyMs"));
 
     // Operation error count.
     putBlobErrorCount = metricRegistry.counter(MetricRegistry.name(PutOperation.class, "PutBlobErrorCount"));
@@ -391,6 +432,8 @@ public class NonBlockingRouterMetrics {
         metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "ChunkFillerUnexpectedErrorCount"));
     operationFailureWithUnsetExceptionCount =
         metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "OperationFailureWithUnsetExceptionCount"));
+    missingDataChunkErrorCount =
+        metricRegistry.counter(MetricRegistry.name(NonBlockingRouter.class, "MissingDataChunkErrorCount"));
 
     // Performance metrics for operation managers.
     putManagerPollTimeMs = metricRegistry.histogram(MetricRegistry.name(PutManager.class, "PutManagerPollTimeMs"));
@@ -438,6 +481,10 @@ public class NonBlockingRouterMetrics {
         metricRegistry.counter(MetricRegistry.name(GetBlobOperation.class, "CompositeBlobSizeMismatchCount"));
     unknownPartitionClassCount =
         metricRegistry.counter(MetricRegistry.name(PutOperation.class, "UnknownPartitionClassCount"));
+    updateOptimizedCount =
+        metricRegistry.counter(MetricRegistry.name(OperationController.class, "UpdateOptimizedCount"));
+    updateUnOptimizedCount =
+        metricRegistry.counter(MetricRegistry.name(OperationController.class, "UpdateUnOptimizedCount"));
 
     // metrics to track blob sizes and chunking.
     putBlobSizeBytes = metricRegistry.histogram(MetricRegistry.name(PutManager.class, "PutBlobSizeBytes"));
@@ -492,6 +539,12 @@ public class NonBlockingRouterMetrics {
         metricRegistry.counter(MetricRegistry.name(SimpleOperationTracker.class, "FailedOnOriginatingDcNotFoundCount"));
     failedOnTotalNotFoundCount =
         metricRegistry.counter(MetricRegistry.name(SimpleOperationTracker.class, "FailedOnTotalNotFoundCount"));
+    failedMaybeDueToTotalOfflineReplicasCount = metricRegistry.counter(
+        MetricRegistry.name(SimpleOperationTracker.class, "FailedMaybeDueToTotalOfflineReplicasCount"));
+    failedMaybeDueToOriginatingDcOfflineReplicasCount = metricRegistry.counter(
+        MetricRegistry.name(SimpleOperationTracker.class, "FailedMaybeDueToOriginatingDcOfflineReplicasCount"));
+    failedMaybeDueToUnavailableReplicasCount = metricRegistry.counter(
+        MetricRegistry.name(SimpleOperationTracker.class, "FailedMaybeDueToUnavailableReplicasCount"));
 
     // Workload
     ageAtGet = new AgeAtAccessMetrics(metricRegistry, "OnGet");
@@ -529,6 +582,26 @@ public class NonBlockingRouterMetrics {
       scheduler.scheduleAtFixedRate(histogramDumper, 0, routerConfig.routerOperationTrackerHistogramDumpPeriod,
           TimeUnit.SECONDS);
     }
+
+    requestsWithUnknownQuotaResourceRate = metricRegistry.meter(
+        MetricRegistry.name(QuotaAwareOperationController.class, "RequestsWithUnknownQuotaResourceRate"));
+    rejectedRequestRate =
+        metricRegistry.meter(MetricRegistry.name(QuotaAwareOperationController.class, "RejectedRequestRate"));
+    delayedRequestRate =
+        metricRegistry.meter(MetricRegistry.name(QuotaAwareOperationController.class, "DelayedRequestRate"));
+    exceedAllowedRequestRate =
+        metricRegistry.meter(MetricRegistry.name(QuotaAwareOperationController.class, "ExceedAllowedRequestRate"));
+    unknownExceptionInChargeableRate = metricRegistry.meter(
+        MetricRegistry.name(QuotaAwareOperationController.class, "UnknownExceptionInChargeableRate"));
+    totalQuotaQueueingDelay =
+        metricRegistry.timer(MetricRegistry.name(QuotaAwareOperationController.class, "TotalQuotaQueueingDelay"));
+    addToQueueTime = metricRegistry.timer(MetricRegistry.name(QuotaAwareOperationController.class, "AddToQueueTime"));
+    drainRequestQueueTime =
+        metricRegistry.timer(MetricRegistry.name(QuotaAwareOperationController.class, "DrainRequestQueueTime"));
+    pollQuotaCompliantRequestTime =
+        metricRegistry.timer(MetricRegistry.name(QuotaAwareOperationController.class, "PollQuotaCompliantRequestTime"));
+    pollExceedAllowedRequestTime =
+        metricRegistry.timer(MetricRegistry.name(QuotaAwareOperationController.class, "PollExceedAllowedRequestTime"));
   }
 
   /**
@@ -646,6 +719,41 @@ public class NonBlockingRouterMetrics {
   }
 
   /**
+   * Initialize metrics related to read and write queue size of {@link QuotaAwareOperationController}.
+   * @param readQueue {@link Map} of {@link LinkedList} of {@link RequestInfo} representing read queue.
+   * @param writeQueue {@link Map} of {@link LinkedList} of {@link RequestInfo} representing write queue.
+   * @param suffix the suffix to associate with the metric names of this OperationController.
+   */
+  public void initializeRequestQueueMetrics(Map<QuotaResource, LinkedList<RequestInfo>> readQueue,
+      Map<QuotaResource, LinkedList<RequestInfo>> writeQueue, String suffix) {
+    Supplier<Integer> readQueueSizeSupplier = () -> readQueue.entrySet()
+        .stream()
+        .flatMap(entry -> Stream.of(entry.getValue()))
+        .map(l -> l.size())
+        .reduce(0, Integer::sum);
+    Supplier<Integer> writeQueueSizeSupplier = () -> writeQueue.entrySet()
+        .stream()
+        .flatMap(entry -> Stream.of(entry.getValue()))
+        .map(l -> l.size())
+        .reduce(0, Integer::sum);
+    operationControllerReadQueueSize = () -> readQueueSizeSupplier.get();
+    operationControllerWriteQueueSize = () -> writeQueueSizeSupplier.get();
+    operationControllerQueueSize = () -> Math.addExact(readQueueSizeSupplier.get(), writeQueueSizeSupplier.get());
+    readQueuedQuotaResourceCount = () -> readQueue.size();
+    writeQueuedQuotaResourceCount = () -> writeQueue.size();
+    metricRegistry.register(MetricRegistry.name(QuotaAwareOperationController.class,
+        String.format("OperationController-%s-ReadQueueSize", suffix)), operationControllerReadQueueSize);
+    metricRegistry.register(MetricRegistry.name(QuotaAwareOperationController.class,
+        String.format("OperationController-%s-WriteQueueSize", suffix)), operationControllerWriteQueueSize);
+    metricRegistry.register(MetricRegistry.name(QuotaAwareOperationController.class,
+        String.format("OperationController-%s-QueueSize", suffix)), operationControllerQueueSize);
+    metricRegistry.register(MetricRegistry.name(QuotaAwareOperationController.class,
+        String.format("OperationController-%s-ReadQueuedQuotaResourceCount", suffix)), readQueuedQuotaResourceCount);
+    metricRegistry.register(MetricRegistry.name(QuotaAwareOperationController.class,
+        String.format("OperationController-%s-WriteQueuedQuotaResourceCount", suffix)), writeQueuedQuotaResourceCount);
+  }
+
+  /**
    * Initializes a {@link Gauge} metric for the status of {@code ChunkFillerThread} of a {@link PutManager}, to
    * indicate if it is running or not.
    * @param chunkFillerThread The {@code ChunkFillerThread} of which the status is to be monitored.
@@ -671,9 +779,37 @@ public class NonBlockingRouterMetrics {
         (Gauge<Integer>) currentOperationsCount::get);
     metricRegistry.register(MetricRegistry.name(NonBlockingRouter.class, "NumActiveBackgroundOperations"),
         (Gauge<Integer>) currentBackgroundOperationsCount::get);
-    metricRegistry.register(
-        MetricRegistry.name(BackgroundDeleter.class, "NumberConcurrentBackgroundDeleteOperations"),
+    metricRegistry.register(MetricRegistry.name(BackgroundDeleter.class, "NumberConcurrentBackgroundDeleteOperations"),
         (Gauge<Integer>) concurrentBackgroundDeleteOperationCount::get);
+  }
+
+  /**
+   * Initializes a {@link Gauge} metric to monitor the cache hit rate for {@link Cache} keeping track of blobs
+   * which known not to be present in Ambry.
+   * @param cache which keeps track of blobs not found recently.
+   */
+  public void initializeNotFoundCacheMetrics(Cache cache) {
+    metricRegistry.register(MetricRegistry.name(NonBlockingRouter.class, "BlobsNotFoundCacheHitRate"),
+        (Gauge<Double>) () -> cache.stats().hitRate());
+  }
+
+  /**
+   * Initialize {@link Gauge} metrics to monitor if any requests are being delayed or are out of quota.
+   * This is relevant only for {@link QuotaAwareOperationController}s because its the only {@link OperationController}
+   * that tracks quota.
+   * @param ocList {@link List} of {@link OperationController} object.
+   */
+  public void initializeQuotaOCMetrics(List<OperationController> ocList) {
+    List<QuotaAwareOperationController> quotaAwareOperationControllers = ocList.stream()
+        .filter(oc -> (oc instanceof QuotaAwareOperationController))
+        .map(oc -> (QuotaAwareOperationController) oc)
+        .collect(Collectors.toList());
+    outOfQuotaResourcesInQueue =
+        metricRegistry.register(MetricRegistry.name(NonBlockingRouter.class, "OutOfQuotaResourcesInQueue"),
+            () -> quotaAwareOperationControllers.stream().mapToInt(oc -> oc.getOutOfQuotaResourcesInQueue()).sum());
+    delayedQuotaResourcesInQueue =
+        metricRegistry.register(MetricRegistry.name(NonBlockingRouter.class, "DelayedQuotaResourcesInQueue"),
+            () -> quotaAwareOperationControllers.stream().mapToInt(oc -> oc.getDelayedQuotaResourcesInQueue()).sum());
   }
 
   /**

@@ -15,6 +15,7 @@ package com.github.ambry.quota;
 
 import com.github.ambry.account.AccountService;
 import com.github.ambry.config.QuotaConfig;
+import com.github.ambry.config.RouterConfig;
 
 
 /**
@@ -26,8 +27,11 @@ public class DummyQuotaSourceFactory implements QuotaSourceFactory {
    * Constructor for {@link DummyQuotaSourceFactory}.
    * @param quotaConfig {@link QuotaConfig} object.
    * @param accountService {@link AccountService} object.
+   * @param quotaMetrics {@link QuotaMetrics} object.
+   * @param routerConfig {@link RouterConfig} object.
    */
-  public DummyQuotaSourceFactory(QuotaConfig quotaConfig, AccountService accountService) {
+  public DummyQuotaSourceFactory(QuotaConfig quotaConfig, AccountService accountService, QuotaMetrics quotaMetrics,
+      RouterConfig routerConfig) {
 
   }
 

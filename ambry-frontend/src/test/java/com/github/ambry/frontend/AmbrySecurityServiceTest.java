@@ -28,6 +28,7 @@ import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobInfo;
 import com.github.ambry.messageformat.BlobProperties;
 import com.github.ambry.quota.AmbryQuotaManager;
+import com.github.ambry.quota.QuotaMetrics;
 import com.github.ambry.quota.SimpleQuotaRecommendationMergePolicy;
 import com.github.ambry.quota.QuotaManager;
 import com.github.ambry.quota.QuotaMode;
@@ -105,7 +106,7 @@ public class AmbrySecurityServiceTest {
       new FrontendTestUrlSigningServiceFactory();
 
   private final SecurityService securityService =
-      new AmbrySecurityService(FRONTEND_CONFIG, new FrontendMetrics(new MetricRegistry()),
+      new AmbrySecurityService(FRONTEND_CONFIG, new FrontendMetrics(new MetricRegistry(), FRONTEND_CONFIG),
           URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(), hostLevelThrottler, QUOTA_MANAGER);
 
   static {
@@ -129,9 +130,9 @@ public class AmbrySecurityServiceTest {
           RestUtils.buildUserMetadata(USER_METADATA), DEFAULT_LIFEVERSION);
       ACCOUNT_SERVICE.updateAccounts(Collections.singletonList(InMemAccountService.UNKNOWN_ACCOUNT));
       QuotaConfig quotaConfig = QuotaTestUtils.createQuotaConfig(Collections.emptyMap(), false, QuotaMode.TRACKING);
-      QUOTA_MANAGER =
-          new AmbryQuotaManager(quotaConfig, new SimpleQuotaRecommendationMergePolicy(quotaConfig), mock(AccountService.class), null,
-              new MetricRegistry());
+      QUOTA_MANAGER = new AmbryQuotaManager(quotaConfig, new SimpleQuotaRecommendationMergePolicy(quotaConfig),
+          mock(AccountService.class), null, new QuotaMetrics(new MetricRegistry()),
+          QuotaTestUtils.getDefaultRouterConfig());
     } catch (Exception e) {
       throw new IllegalStateException(e);
     }
@@ -169,7 +170,7 @@ public class AmbrySecurityServiceTest {
     properties.setProperty("frontend.attach.tracking.info", "false");
     FrontendConfig frontendConfig = new FrontendConfig(new VerifiableProperties(properties));
     SecurityService securityServiceWithTrackingDisabled =
-        new AmbrySecurityService(frontendConfig, new FrontendMetrics(new MetricRegistry()),
+        new AmbrySecurityService(frontendConfig, new FrontendMetrics(new MetricRegistry(), frontendConfig),
             URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(), hostLevelThrottler, QUOTA_MANAGER);
     restRequest = createRestRequest(RestMethod.GET, "/", null);
     securityServiceWithTrackingDisabled.preProcessRequest(restRequest);
@@ -234,10 +235,10 @@ public class AmbrySecurityServiceTest {
   @Test
   public void postProcessQuotaManagerTest() throws Exception {
     HostLevelThrottler quotaManager = Mockito.mock(HostLevelThrottler.class);
+    FrontendConfig frontendConfig = new FrontendConfig(new VerifiableProperties(new Properties()));
     AmbrySecurityService ambrySecurityService =
-        new AmbrySecurityService(new FrontendConfig(new VerifiableProperties(new Properties())),
-            new FrontendMetrics(new MetricRegistry()), URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(), quotaManager,
-            QUOTA_MANAGER);
+        new AmbrySecurityService(frontendConfig, new FrontendMetrics(new MetricRegistry(), frontendConfig),
+            URL_SIGNING_SERVICE_FACTORY.getUrlSigningService(), quotaManager, QUOTA_MANAGER);
     // Everything should be good.
     Mockito.when(quotaManager.shouldThrottle(any())).thenReturn(false);
     for (int i = 0; i < 100; i++) {
@@ -279,13 +280,6 @@ public class AmbrySecurityServiceTest {
     //blob info being null
     TestUtils.assertException(IllegalArgumentException.class,
         () -> securityService.processResponse(restRequest, new MockRestResponseChannel(), null).get(), null);
-
-    // for unsupported methods
-    RestMethod[] methods = {RestMethod.DELETE};
-    for (RestMethod restMethod : methods) {
-      testExceptionCasesProcessResponse(restMethod, new MockRestResponseChannel(), DEFAULT_INFO,
-          RestServiceErrorCode.InternalServerError);
-    }
 
     // OPTIONS (should be no errors)
     securityService.processResponse(createRestRequest(RestMethod.OPTIONS, "/", null), new MockRestResponseChannel(),
@@ -401,7 +395,7 @@ public class AmbrySecurityServiceTest {
 
     // security service closed
     securityService.close();
-    methods = new RestMethod[]{RestMethod.POST, RestMethod.GET, RestMethod.DELETE, RestMethod.HEAD};
+    RestMethod[] methods = new RestMethod[]{RestMethod.POST, RestMethod.GET, RestMethod.DELETE, RestMethod.HEAD};
     for (RestMethod restMethod : methods) {
       testExceptionCasesProcessResponse(restMethod, new MockRestResponseChannel(), blobInfo,
           RestServiceErrorCode.ServiceUnavailable);

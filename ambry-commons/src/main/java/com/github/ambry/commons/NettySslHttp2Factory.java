@@ -71,6 +71,12 @@ public class NettySslHttp2Factory implements SSLFactory {
       sslParams.setEndpointIdentificationAlgorithm(endpointIdentification);
       sslEngine.setSSLParameters(sslParams);
     }
+    if (logger.isTraceEnabled()) {
+      String[] supportedProtocols = sslEngine.getSupportedProtocols();
+      String[] enabledProtocols = sslEngine.getEnabledProtocols();
+      logger.trace("NettySslHttp2Factory creating SSLEngine for {}: supportedProtocols: {}, enabledProtocols: {}",
+          mode.name(), String.join(",", supportedProtocols), String.join(",", enabledProtocols));
+    }
     return sslEngine;
   }
 
@@ -100,8 +106,8 @@ public class NettySslHttp2Factory implements SSLFactory {
     }
     return sslContextBuilder.sslProvider(SslContext.defaultClientProvider())
         .clientAuth(NettySslFactory.getClientAuth(config))
-        /* NOTE: the cipher filter may not include all ciphers required by the HTTP/2 specification.
-         * Please refer to the HTTP/2 specification for cipher requirements. */
+        // NOTE: the cipher filter may not include all ciphers required by the HTTP/2 specification.
+        // Please refer to the HTTP/2 specification for cipher requirements.
         .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
         .applicationProtocolConfig(new ApplicationProtocolConfig(ApplicationProtocolConfig.Protocol.ALPN,
             // NO_ADVERTISE is currently the only mode supported by both OpenSsl and JDK providers.
@@ -134,8 +140,8 @@ public class NettySslHttp2Factory implements SSLFactory {
     }
     return sslContextBuilder.sslProvider(SslContext.defaultClientProvider())
         /* NOTE: the cipher filter may not include all ciphers required by the HTTP/2 specification.
-         * Please refer to the HTTP/2 specification for cipher requirements. */
-        .ciphers(Http2SecurityUtil.CIPHERS, SupportedCipherSuiteFilter.INSTANCE)
+         * Please refer to the HTTP/2 specification for cipher requirements. */.ciphers(Http2SecurityUtil.CIPHERS,
+            SupportedCipherSuiteFilter.INSTANCE)
         .applicationProtocolConfig(new ApplicationProtocolConfig(ApplicationProtocolConfig.Protocol.ALPN,
             // NO_ADVERTISE is currently the only mode supported by both OpenSsl and JDK providers.
             ApplicationProtocolConfig.SelectorFailureBehavior.NO_ADVERTISE,

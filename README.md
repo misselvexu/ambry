@@ -4,7 +4,7 @@
 [![codecov.io](https://codecov.io/github/linkedin/ambry/branch/master/graph/badge.svg)](https://codecov.io/github/linkedin/ambry)
 [![license](https://img.shields.io/github/license/linkedin/ambry.svg)](LICENSE)
 
-Ambry is a distributed object store that supports storage of trillion of small immutable objects (50K -100K) as well as billions of large objects. It was specifically designed to store and serve media objects in web companies. However, it can be used as a general purpose storage system to store DB backups, search indexes or business reports. The system has the following characterisitics: 
+Ambry is a distributed object store that supports storage of trillions of small immutable objects (50K -100K) as well as billions of large objects. It was specifically designed to store and serve media objects in web companies. However, it can be used as a general purpose storage system to store DB backups, search indexes or business reports. The system has the following characterisitics: 
 
 1. Highly available and horizontally scalable
 2. Low latency and high throughput
@@ -33,12 +33,12 @@ To get the latest code and build it, do
     $ mkdir logs
 Ambry uses files that provide information about the cluster to route requests from the frontend to servers and for replication between servers. We will use a simple clustermap that contains a single server with one partition. The partition will use `/tmp` as the mount point.
 ##### Step 2: Deploy a server.
-    $ nohup java -Dlog4j.configuration=file:../config/log4j.properties -jar ambry.jar --serverPropsFilePath ../config/server.properties --hardwareLayoutFilePath ../config/HardwareLayout.json --partitionLayoutFilePath ../config/PartitionLayout.json > logs/server.log &
+    $ nohup java -Dlog4j2.configurationFile=file:../config/log4j2.xml -jar ambry.jar --serverPropsFilePath ../config/server.properties --hardwareLayoutFilePath ../config/HardwareLayout.json --partitionLayoutFilePath ../config/PartitionLayout.json > logs/server.log &
 
 Through this command, we configure the log4j properties, provide the server with configuration options and cluster definitions and redirect output to a log. Note down the process ID returned (`serverProcessID`) because it will be needed for shutdown.  
 The log will be available at `logs/server.log`. Alternately, you can change the log4j properties to write the log messages to a file instead of standard output.
 ##### Step 3: Deploy a frontend.
-    $ nohup java -Dlog4j.configuration=file:../config/log4j.properties -cp "*" com.github.ambry.frontend.AmbryFrontendMain --serverPropsFilePath ../config/frontend.properties --hardwareLayoutFilePath ../config/HardwareLayout.json --partitionLayoutFilePath ../config/PartitionLayout.json > logs/frontend.log &
+    $ nohup java -Dlog4j2.configurationFile=file:../config/log4j2.xml -cp "*" com.github.ambry.frontend.AmbryFrontendMain --serverPropsFilePath ../config/frontend.properties --hardwareLayoutFilePath ../config/HardwareLayout.json --partitionLayoutFilePath ../config/PartitionLayout.json > logs/frontend.log &
 
 Note down the process ID returned (`frontendProcessID`) because it will be needed for shutdown. Make sure that the frontend is ready to receive requests.
 

@@ -17,9 +17,8 @@ import com.azure.core.credential.AccessToken;
 import com.azure.core.http.HttpClient;
 import com.azure.core.util.Configuration;
 import com.azure.storage.blob.BlobServiceAsyncClient;
-import com.azure.storage.blob.BlobServiceClient;
 import com.azure.storage.blob.BlobServiceClientBuilder;
-import com.azure.storage.blob.batch.BlobBatchClient;
+import com.azure.storage.blob.batch.BlobBatchAsyncClient;
 import com.azure.storage.blob.models.BlobStorageException;
 import com.azure.storage.common.policy.RequestRetryOptions;
 import com.github.ambry.config.CloudConfig;
@@ -28,6 +27,7 @@ import com.microsoft.aad.msal4j.ClientCredentialFactory;
 import com.microsoft.aad.msal4j.ClientCredentialParameters;
 import com.microsoft.aad.msal4j.ConfidentialClientApplication;
 import com.microsoft.aad.msal4j.IAuthenticationResult;
+import com.mysql.cj.util.StringUtils;
 import java.net.MalformedURLException;
 import java.time.OffsetDateTime;
 import java.util.Collections;
@@ -38,6 +38,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.http.HttpStatus;
 import reactor.core.publisher.Mono;
+
+import static com.github.ambry.cloud.azure.AzureCloudConfig.*;
 
 
 /**
@@ -58,8 +60,8 @@ public class ADAuthBasedStorageClient extends StorageClient {
    * @param blobLayoutStrategy {@link AzureBlobLayoutStrategy} object.
    */
   public ADAuthBasedStorageClient(CloudConfig cloudConfig, AzureCloudConfig azureCloudConfig, AzureMetrics azureMetrics,
-      AzureBlobLayoutStrategy blobLayoutStrategy) {
-    super(cloudConfig, azureCloudConfig, azureMetrics, blobLayoutStrategy);
+      AzureBlobLayoutStrategy blobLayoutStrategy, AzureCloudConfig.StorageAccountInfo storageAccountInfo) {
+    super(cloudConfig, azureCloudConfig, azureMetrics, blobLayoutStrategy, storageAccountInfo);
     // schedule a task to refresh token and create new storage sync and async clients before it expires.
     scheduledFutureRef.set(tokenRefreshScheduler.schedule(() -> refreshTokenAndStorageClients(),
         (long) ((accessTokenRef.get().getExpiresAt().toEpochSecond() - OffsetDateTime.now().toEpochSecond())
@@ -68,40 +70,18 @@ public class ADAuthBasedStorageClient extends StorageClient {
 
   /**
    * Constructor for {@link ADAuthBasedStorageClient} object for testing.
-   * @param blobServiceClient {@link BlobServiceClient} object.
-   * @param blobBatchClient {@link BlobBatchClient} object.
+   * @param blobServiceAsyncClient {@link BlobServiceAsyncClient} object.
+   * @param blobBatchAsyncClient {@link BlobBatchAsyncClient} object.
    * @param azureMetrics {@link AzureMetrics} object.
    * @param blobLayoutStrategy {@link AzureBlobLayoutStrategy} object.
    * @param azureCloudConfig {@link AzureCloudConfig} object.
+   * @param accessToken {@link AccessToken} object.
    */
-  public ADAuthBasedStorageClient(BlobServiceClient blobServiceClient, BlobBatchClient blobBatchClient,
-      AzureMetrics azureMetrics, AzureBlobLayoutStrategy blobLayoutStrategy, AzureCloudConfig azureCloudConfig) {
-    super(blobServiceClient, blobBatchClient, azureMetrics, blobLayoutStrategy, azureCloudConfig);
-  }
-
-  /**
-   * Note that this method is not thread safe. Its need to be called from a thread safe context.
-   * @param httpClient {@link HttpClient} object.
-   * @param configuration {@link Configuration} object.
-   * @param retryOptions {@link RequestRetryOptions} object.
-   * @param azureCloudConfig {@link AzureCloudConfig} object.
-   * @return BlobServiceClient object.
-   */
-  @Override
-  protected BlobServiceClient buildBlobServiceClient(HttpClient httpClient, Configuration configuration,
-      RequestRetryOptions retryOptions, AzureCloudConfig azureCloudConfig)
-      throws MalformedURLException, ExecutionException, InterruptedException {
-    if (accessTokenRef == null) {
-      // This means the token is not yet created because we are building storage client for the first time from
-      //base class's constructor. Create token before building storage client.
-      refreshToken();
-    }
-    return new BlobServiceClientBuilder().credential(request -> Mono.just(accessTokenRef.get()))
-        .endpoint(azureCloudConfig.azureStorageEndpoint)
-        .httpClient(httpClient)
-        .retryOptions(retryOptions)
-        .configuration(configuration)
-        .buildClient();
+  public ADAuthBasedStorageClient(BlobServiceAsyncClient blobServiceAsyncClient,
+      BlobBatchAsyncClient blobBatchAsyncClient, AzureMetrics azureMetrics, AzureBlobLayoutStrategy blobLayoutStrategy,
+      AzureCloudConfig azureCloudConfig, AccessToken accessToken, AzureCloudConfig.StorageAccountInfo storageAccountInfo) {
+    super(blobServiceAsyncClient, blobBatchAsyncClient, azureMetrics, blobLayoutStrategy, azureCloudConfig, storageAccountInfo);
+    accessTokenRef = new AtomicReference<>(accessToken);
   }
 
   @Override
@@ -114,7 +94,7 @@ public class ADAuthBasedStorageClient extends StorageClient {
       refreshToken();
     }
     return new BlobServiceClientBuilder().credential(request -> Mono.just(accessTokenRef.get()))
-        .endpoint(azureCloudConfig.azureStorageEndpoint)
+        .endpoint(storageAccountInfo() != null ? storageAccountInfo().getStorageEndpoint() : azureCloudConfig.azureStorageEndpoint)
         .httpClient(httpClient)
         .retryOptions(retryOptions)
         .configuration(configuration)
@@ -123,6 +103,18 @@ public class ADAuthBasedStorageClient extends StorageClient {
 
   @Override
   protected void validateABSAuthConfigs(AzureCloudConfig azureCloudConfig) {
+    if (storageAccountInfo() != null) {
+      if (StringUtils.isNullOrEmpty(storageAccountInfo().getStorageScope())) {
+        throw new IllegalArgumentException(String.format("Storage account %s is missing the %s setting",
+            storageAccountInfo().getName(), AZURE_STORAGE_ACCOUNT_INFO_STORAGE_SCOPE));
+      }
+      if (StringUtils.isNullOrEmpty(storageAccountInfo().getStorageEndpoint())) {
+        throw new IllegalArgumentException(
+            String.format("Storage account %s is missing the %s setting", storageAccountInfo().getName(),
+                AZURE_STORAGE_ACCOUNT_INFO_STORAGE_ENDPOINT));
+      }
+      return;
+    }
     if (azureCloudConfig.azureStorageAuthority.isEmpty() || azureCloudConfig.azureStorageClientId.isEmpty()
         || azureCloudConfig.azureStorageSecret.isEmpty() || azureCloudConfig.azureStorageEndpoint.isEmpty()
         || azureCloudConfig.azureStorageScope.isEmpty()) {
@@ -188,14 +180,9 @@ public class ADAuthBasedStorageClient extends StorageClient {
       // Refresh Token
       refreshToken();
 
-      // Create new sync and async storage clients with refreshed token.
-      if (azureCloudConfig.useAsyncAzureAPIs) {
-        BlobServiceAsyncClient blobServiceAsyncClient = createBlobStorageAsyncClient();
-        setAsyncClientReferences(blobServiceAsyncClient);
-      } else {
-        BlobServiceClient blobServiceClient = createBlobStorageClient();
-        setClientReferences(blobServiceClient);
-      }
+      // Create new async storage clients with refreshed token.
+      BlobServiceAsyncClient blobServiceAsyncClient = createBlobStorageAsyncClient();
+      setAsyncClientReferences(blobServiceAsyncClient);
 
       logger.info("Token refresh done.");
 

@@ -13,6 +13,8 @@
  */
 package com.github.ambry.protocol;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.MockClusterMap;
 import com.github.ambry.clustermap.MockPartitionId;
@@ -52,7 +54,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
@@ -813,6 +817,54 @@ public class RequestResponseTest {
     }
   }
 
+  @Test
+  public void adminResponseWithContentTest() throws IOException {
+    int correlationId = 1;
+    String clientId = "ambry-healthchecker";
+
+    // test it with some content
+    Map<String, String> returnedMap = new HashMap<>();
+    returnedMap.put("key1", "value1");
+    returnedMap.put("key2", "value2");
+    ObjectMapper objectMapper = new ObjectMapper();
+    System.out.println(objectMapper.writeValueAsString(returnedMap));
+    byte[] content = objectMapper.writeValueAsBytes(returnedMap);
+    AdminResponseWithContent response =
+        new AdminResponseWithContent(correlationId, clientId, ServerErrorCode.No_Error, content);
+    DataInputStream responseStream = serAndPrepForRead(response, -1, false);
+    AdminResponseWithContent deserializedAdminResponse = AdminResponseWithContent.readFrom(responseStream);
+    Assert.assertEquals(deserializedAdminResponse.getCorrelationId(), correlationId);
+    Assert.assertEquals(deserializedAdminResponse.getClientId(), clientId);
+    Assert.assertEquals(deserializedAdminResponse.getError(), ServerErrorCode.No_Error);
+    Assert.assertNotNull(deserializedAdminResponse.getContent());
+
+    Map<String, String> deserializedMap =
+        objectMapper.readValue(deserializedAdminResponse.getContent(), new TypeReference<Map<String, String>>() {
+        });
+    Assert.assertEquals(returnedMap, deserializedMap);
+    response.release();
+
+    // test it with null content
+    response = new AdminResponseWithContent(correlationId, clientId, ServerErrorCode.No_Error, null);
+    responseStream = serAndPrepForRead(response, -1, false);
+    deserializedAdminResponse = AdminResponseWithContent.readFrom(responseStream);
+    Assert.assertEquals(deserializedAdminResponse.getCorrelationId(), correlationId);
+    Assert.assertEquals(deserializedAdminResponse.getClientId(), clientId);
+    Assert.assertEquals(deserializedAdminResponse.getError(), ServerErrorCode.No_Error);
+    Assert.assertNull(deserializedAdminResponse.getContent());
+    response.release();
+
+    // test it with empty content
+    response = new AdminResponseWithContent(correlationId, clientId, ServerErrorCode.No_Error, new byte[0]);
+    responseStream = serAndPrepForRead(response, -1, false);
+    deserializedAdminResponse = AdminResponseWithContent.readFrom(responseStream);
+    Assert.assertEquals(deserializedAdminResponse.getCorrelationId(), correlationId);
+    Assert.assertEquals(deserializedAdminResponse.getClientId(), clientId);
+    Assert.assertEquals(deserializedAdminResponse.getError(), ServerErrorCode.No_Error);
+    Assert.assertNull(deserializedAdminResponse.getContent());
+    response.release();
+  }
+
   /**
    * Tests the ser/de of {@link RequestControlAdminRequest} and checks for equality of fields with reference data.
    * @throws IOException
@@ -895,6 +947,22 @@ public class RequestResponseTest {
     doReplicationControlAdminRequestTest(Collections.emptyList(), true);
   }
 
+  @Test
+  public void healthCheckAdminRequestTest() throws IOException {
+    MockClusterMap clusterMap = new MockClusterMap();
+    int correlationId = 1;
+    String clientId = "ambry-healthchecker";
+    AdminRequest adminRequest =
+        new AdminRequest(AdminRequestOrResponseType.RequestControl, null, correlationId, clientId);
+    HealthCheckAdminRequest checkRequest = new HealthCheckAdminRequest(adminRequest);
+    DataInputStream requestStream = serAndPrepForRead(checkRequest, -1, true);
+    AdminRequest deserializedAdminRequest =
+        deserAdminRequestAndVerify(requestStream, clusterMap, correlationId, clientId,
+            AdminRequestOrResponseType.HealthCheck, null);
+    HealthCheckAdminRequest.readFrom(requestStream, deserializedAdminRequest);
+    checkRequest.release();
+  }
+
   /**
    * Tests for {@link TtlUpdateRequest} and {@link TtlUpdateResponse}.
    * @throws IOException
@@ -939,6 +1007,62 @@ public class RequestResponseTest {
           deserializedTtlUpdateResponse.getError());
       response.release();
     }
+  }
+
+  /**
+   * Tests for {@link ReplicateBlobRequest} and {@link ReplicateBlobResponse}.
+   * @throws IOException
+   */
+  @Test
+  public void replicateBlobRequestResponseTest() throws IOException {
+    final MockClusterMap clusterMap = new MockClusterMap();
+    final short accountId = Utils.getRandomShort(TestUtils.RANDOM);
+    final short containerId = Utils.getRandomShort(TestUtils.RANDOM);
+    final String clientId = "client";
+    final BlobId id1 = new BlobId(CommonTestUtils.getCurrentBlobIdVersion(), BlobId.BlobIdType.NATIVE,
+        ClusterMap.UNKNOWN_DATACENTER_ID, accountId, containerId,
+        clusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS).get(0), false,
+        BlobId.BlobDataType.DATACHUNK);
+    final String sourceHostName = "datacenter1_host1";
+    final int correlationId = TestUtils.RANDOM.nextInt();
+
+    final ReplicateBlobRequest replicateBlobRequest = new ReplicateBlobRequest(correlationId, clientId, id1, sourceHostName);
+    DataInputStream requestStream = serAndPrepForRead(replicateBlobRequest, -1, true);
+    final ReplicateBlobRequest deserializedReplicateBlobRequest = ReplicateBlobRequest.readFrom(requestStream, clusterMap);
+    verifyReplicateBlobRequest(replicateBlobRequest, deserializedReplicateBlobRequest);
+    replicateBlobRequest.release();
+
+    final ReplicateBlobResponse response = new ReplicateBlobResponse(correlationId, clientId, ServerErrorCode.No_Error);
+    requestStream = serAndPrepForRead(response, -1, false);
+    final ReplicateBlobResponse deserializedReplicateBlobResponse = ReplicateBlobResponse.readFrom(requestStream);
+    verifyReplicateBlobResponse(response, deserializedReplicateBlobResponse);
+    response.release();
+  }
+
+  /**
+   * Verify the two {@link ReplicateBlobRequest} are the same
+   * @param orgReq the original {@link ReplicateBlobRequest}
+   * @param deserializedReq the deserialized {@link ReplicateBlobRequest}
+   */
+  private void verifyReplicateBlobRequest(ReplicateBlobRequest orgReq, ReplicateBlobRequest deserializedReq) {
+    Assert.assertEquals(orgReq.getCorrelationId(), deserializedReq.getCorrelationId());
+    Assert.assertEquals(orgReq.getAccountId(), deserializedReq.getAccountId());
+    Assert.assertEquals(orgReq.getContainerId(), deserializedReq.getContainerId());
+    Assert.assertEquals(orgReq.getClientId(), deserializedReq.getClientId());
+    Assert.assertEquals(orgReq.getBlobId(), deserializedReq.getBlobId());
+    Assert.assertEquals(orgReq.getSourceHostName(), deserializedReq.getSourceHostName());
+  }
+
+  /**
+   * Verify the two {@link ReplicateBlobResponse} are the same
+   * @param orgRes the original {@link ReplicateBlobResponse}
+   * @param deserializedRes the deserialized {@link ReplicateBlobResponse}
+   */
+  private void verifyReplicateBlobResponse(ReplicateBlobResponse orgRes, ReplicateBlobResponse deserializedRes) {
+    Assert.assertEquals(deserializedRes.getCorrelationId(), orgRes.getCorrelationId());
+    Assert.assertEquals(deserializedRes.getClientId(), orgRes.getClientId());
+    Assert.assertEquals(deserializedRes.getRequestType(), RequestOrResponseType.ReplicateBlobResponse);
+    Assert.assertEquals(deserializedRes.getError(), orgRes.getError());
   }
 
   /**

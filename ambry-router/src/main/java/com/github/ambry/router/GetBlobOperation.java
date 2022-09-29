@@ -15,6 +15,7 @@ package com.github.ambry.router;
 
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.ReplicaId;
+import com.github.ambry.commons.AmbryCache;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.BlobIdFactory;
 import com.github.ambry.commons.Callback;
@@ -38,11 +39,9 @@ import com.github.ambry.protocol.GetOption;
 import com.github.ambry.protocol.GetRequest;
 import com.github.ambry.protocol.GetResponse;
 import com.github.ambry.protocol.PartitionResponseInfo;
-import com.github.ambry.quota.Chargeable;
 import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.quota.QuotaException;
-import com.github.ambry.quota.QuotaMethod;
-import com.github.ambry.quota.QuotaResource;
+import com.github.ambry.quota.QuotaUtils;
 import com.github.ambry.rest.RestServiceErrorCode;
 import com.github.ambry.rest.RestServiceException;
 import com.github.ambry.server.ServerErrorCode;
@@ -59,10 +58,11 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
-import java.util.TreeMap;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -125,6 +125,8 @@ class GetBlobOperation extends GetOperation {
   private BlobDataReadableStreamChannel blobDataChannel;
   // the CompositeBlobInfo that will be set if (and when) this blob turns out to be a composite blob.
   private CompositeBlobInfo compositeBlobInfo;
+  // A cache for blob metadata of composite blobs
+  private AmbryCache blobMetadataCache;
 
   /**
    * Construct a GetBlobOperation
@@ -142,18 +144,95 @@ class GetBlobOperation extends GetOperation {
    * @param cryptoJobHandler {@link CryptoJobHandler} to assist in the execution of crypto jobs
    * @param time the Time instance to use.
    * @param isEncrypted if the encrypted bit is set based on the original blobId string of a {@link BlobId}.
+   * @param blobMetadataCache A cache to save blob metadata for composite blobs
    */
   GetBlobOperation(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics, ClusterMap clusterMap,
       ResponseHandler responseHandler, BlobId blobId, GetBlobOptionsInternal options,
-      Callback<GetBlobResultInternal> callback, RouterCallback routerCallback, BlobIdFactory blobIdFactory,
+      Callback<GetBlobResult> callback, RouterCallback routerCallback, BlobIdFactory blobIdFactory,
       KeyManagementService kms, CryptoService cryptoService, CryptoJobHandler cryptoJobHandler, Time time,
-      boolean isEncrypted, QuotaChargeCallback quotaChargeCallback) {
+      boolean isEncrypted, QuotaChargeCallback quotaChargeCallback, AmbryCache blobMetadataCache) {
     super(routerConfig, routerMetrics, clusterMap, responseHandler, blobId, options, callback, kms, cryptoService,
         cryptoJobHandler, time, isEncrypted);
     this.routerCallback = routerCallback;
     this.blobIdFactory = blobIdFactory;
     this.quotaChargeCallback = quotaChargeCallback;
-    firstChunk = new FirstGetChunk();
+    this.blobMetadataCache = blobMetadataCache;
+    BlobMetadata blobMetadata =
+        shouldLookupMetadataCache() ? (BlobMetadata) blobMetadataCache.getObject(blobId.toString()) : null;
+    firstChunk = (blobMetadata == null) ? new FirstGetChunk() : new CachedFirstChunk(blobMetadata);
+  }
+
+  /**
+   * Returns whether the current request is a range request or not.
+   * @return True if range request, else False.
+   */
+  boolean isRangeRequest() {
+    return options.getBlobOptions.getRange() != null;
+  }
+
+  /**
+   * Decides if we should look up the metadata cache during a GET request
+   * @return True if and only if
+   *  - cache exists
+   *  - it is a RANGE request
+   *  - it is not a raw mode request
+   *  - it is not a GET request for a segment
+   *  - the blobID is for a metadata blob (this info is present only in v5 and v6 version of blobID)
+   *  False, otherwise.
+   */
+  boolean shouldLookupMetadataCache() {
+    return (blobMetadataCache != null && isRangeRequest() && options.getBlobOptions.hasBlobSegmentIdx() == false
+        && options.getBlobOptions.isRawMode() == false && blobId.getBlobDataType() == BlobId.BlobDataType.METADATA);
+  }
+
+  /**
+   * This helper decides if metadata must be deleted from cache or not.
+   * This mainly reduces the impact on metadata cache due to a large number of GET requests for
+   * simple blobs that do not exist.
+   * @param abortCause Reason to abort GetBlobOperation
+   * @return True if metadata must be deleted, false otherwise.
+   */
+  boolean shouldDeleteMetadata(Exception abortCause) {
+    if (abortCause != null && abortCause instanceof RouterException) {
+      switch (((RouterException) abortCause).getErrorCode()) {
+        /* If the blob is not found, then delete its metadata from frontend cache. */
+        case BlobDoesNotExist:
+        case BlobDeleted:
+        case BlobExpired:
+          return (blobMetadataCache != null && blobId.getBlobDataType() == BlobId.BlobDataType.METADATA);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Conditionally saves blob metadata for composite blobs
+   * @return True if metadata was saved successfully, else False.
+   */
+  boolean saveMetadata() {
+    boolean putResult = false;
+    if (firstChunk.shouldSaveMetadata()) {
+      BlobMetadata blobMetadata = new BlobMetadata(blobId.toString(), blobInfo, compositeBlobInfo);
+      putResult = blobMetadataCache.putObject(blobMetadata.getBlobId(), blobMetadata);
+      logger.debug("[{}] Issued save-metadata for blobId = {}, result = {}", blobMetadata.getBlobId(), blobId,
+          putResult);
+    }
+    return putResult;
+  }
+
+  /**
+   * Unconditionally deletes blob metadata for composite blobs.
+   * @param reason String describing reason for deletion, useful for triaging.
+   * @return True if metadata was deleted successfully, else False.
+   */
+  boolean deleteMetadata(String reason) {
+    if (blobMetadataCache == null) {
+      return false;
+    }
+    boolean deleteResult = blobMetadataCache.deleteObject(blobId.toString());
+    logger.debug("[{}] Issued delete-metadata for blobId = {}, reason = {}, result = {}",
+        blobMetadataCache.getCacheId(), blobId, reason, deleteResult);
+    return deleteResult;
   }
 
   /**
@@ -203,6 +282,9 @@ class GetBlobOperation extends GetOperation {
         blobDataChannel.completeRead();
       }
     }
+    if (shouldDeleteMetadata(abortCause)) {
+      deleteMetadata(((RouterException) abortCause).getErrorCode().toString());
+    }
     setOperationCompleted();
   }
 
@@ -220,13 +302,18 @@ class GetBlobOperation extends GetOperation {
     Exception e = getOperationException();
     if (chunk == firstChunk) {
       if (operationCallbackInvoked.compareAndSet(false, true)) {
+        if (chunk.chunkBlobId.getBlobDataType() == BlobId.BlobDataType.METADATA) {
+          /* Save metadata on successful completion. Everything is decrypted at this point. */
+          saveMetadata();
+          routerMetrics.getMetadataChunkLatencyMs.update(time.milliseconds() - chunk.initializedTimeMs);
+        }
         if (options.getChunkIdsOnly) {
           // If this is an operation just to get the chunk ids, then these ids will be returned as part of the
           // result callback and no more chunks will be fetched, so mark the operation as complete to let the
           // GetManager remove this operation.
           setOperationCompleted();
           List<StoreKey> chunkIds = e == null && compositeBlobInfo != null ? compositeBlobInfo.getKeys() : null;
-          operationResult = new GetBlobResultInternal(null, chunkIds);
+          operationResult = new GetBlobResult(blobInfo, null, chunkIds);
         } else {
           // Complete the operation from the caller's perspective, so that the caller can start reading from the
           // channel if there is no exception. The operation will not be marked as complete internally as subsequent
@@ -251,7 +338,7 @@ class GetBlobOperation extends GetOperation {
             } else {
               setOperationCompleted();
             }
-            operationResult = new GetBlobResultInternal(new GetBlobResult(blobInfo, blobDataChannel), null);
+            operationResult = new GetBlobResult(blobInfo, blobDataChannel, null);
           } else {
             blobDataChannel = null;
             operationResult = null;
@@ -361,6 +448,10 @@ class GetBlobOperation extends GetOperation {
    */
   OperationTracker getFirstChunkOperationTrackerInUse() {
     return firstChunk.getChunkOperationTrackerInUse();
+  }
+
+  MessageFormatFlags getFirstChunkOperationFlag() {
+    return firstChunk.getOperationFlag();
   }
 
   // ReadableStreamChannel implementation:
@@ -584,9 +675,9 @@ class GetBlobOperation extends GetOperation {
    * to retrieve one data chunk at a time. Once the associated chunk is successfully retrieved, this object can be
    * reinitialized and used to retrieve a subsequent chunk.
    */
-  private class GetChunk implements Chargeable {
+  private class GetChunk {
     // map of correlation id to the request metadata for every request issued for this operation.
-    protected final Map<Integer, GetRequestInfo> correlationIdToGetRequestInfo = new TreeMap<>();
+    protected final Map<Integer, RequestInfo> correlationIdToGetRequestInfo = new LinkedHashMap<>();
     // progress tracker used to track whether the operation is completed or not and whether it succeeded or failed on complete
     protected ProgressTracker progressTracker;
     // DecryptCallBackResultInfo that holds all info about decrypt job callback
@@ -615,9 +706,10 @@ class GetBlobOperation extends GetOperation {
     // size of the chunk
     private long chunkSize;
     // whether the operation on the current chunk has completed.
-    private boolean chunkCompleted;
-    // whether the quota is already charged for this chunk.
-    private boolean isCharged;
+    protected boolean chunkCompleted;
+    // Tracks quota charging for this chunk.
+    private OperationQuotaCharger operationQuotaCharger;
+    protected long initializedTimeMs;
 
     /**
      * Construct a GetChunk
@@ -672,7 +764,9 @@ class GetBlobOperation extends GetOperation {
       decryptJobMetricsTracker = new CryptoJobMetricsTracker(routerMetrics.decryptJobMetrics);
       correlationIdToGetRequestInfo.clear();
       state = ChunkState.Free;
-      isCharged = false;
+      operationQuotaCharger =
+          new OperationQuotaCharger(quotaChargeCallback, GetBlobOperation.class.getSimpleName(), routerMetrics);
+      initializedTimeMs = -1;
     }
 
     /**
@@ -687,9 +781,10 @@ class GetBlobOperation extends GetOperation {
       offset = chunkMetadata.getOffset();
       chunkSize = chunkMetadata.getSize();
       chunkOperationTracker = getOperationTracker(chunkBlobId.getPartition(), chunkBlobId.getDatacenterId(),
-          RouterOperation.GetBlobOperation);
+          RouterOperation.GetBlobOperation, chunkBlobId);
       progressTracker = new ProgressTracker(chunkOperationTracker);
       state = ChunkState.Ready;
+      initializedTimeMs = System.currentTimeMillis();
     }
 
     /**
@@ -734,58 +829,6 @@ class GetBlobOperation extends GetOperation {
       }
     }
 
-    @Override
-    public boolean check() {
-      if (quotaChargeCallback == null || isCharged) {
-        return true;
-      }
-      return quotaChargeCallback.check();
-    }
-
-    @Override
-    public boolean charge() {
-      if (quotaChargeCallback == null || isCharged) {
-        return true;
-      }
-      try {
-        quotaChargeCallback.charge(chunkSize);
-        isCharged = true;
-      } catch (QuotaException quotaException) {
-        logger.warn(String.format("Quota charging failed in GetBlobOperation for blob {} due to {} ", blobId.toString(),
-            quotaException.toString()));
-      }
-      return isCharged;
-    }
-
-    @Override
-    public boolean quotaExceedAllowed() {
-      if(quotaChargeCallback == null) {
-        return true;
-      }
-      return quotaChargeCallback.quotaExceedAllowed();
-    }
-
-    @Override
-    public QuotaResource getQuotaResource() {
-      if(quotaChargeCallback == null) {
-        return null;
-      }
-      try {
-        return quotaChargeCallback.getQuotaResource();
-      } catch (QuotaException quotaException) {
-        logger.error(
-            String.format("Could create QuotaResource object during GetBlobOperation for the chunk {} due to {}. This should never happen.",
-                blobId.toString(), quotaException.toString()));
-      }
-      // A null return means quota resource could not be created for this chunk. The consumer should decide how to handle nulls.
-      return null;
-    }
-
-    @Override
-    public QuotaMethod getQuotaMethod() {
-      return quotaChargeCallback.getQuotaMethod();
-    }
-
     /**
      * Maybe process callbacks if applicable. This is a no-op for blobs that do not need any async processing.
      * As of now, decryption is the only async processing that could happen if applicable.
@@ -801,6 +844,10 @@ class GetBlobOperation extends GetOperation {
           // Nullify result so we know we already passed the bytebuf to chunkIndexToBuf map
           DecryptJob.DecryptJobResult result = decryptCallbackResultInfo.result.getAndSet(null);
           if (result != null) {
+            if (chunkIndex == 0) {
+              routerMetrics.getFirstDataChunkLatencyMs.update(System.currentTimeMillis() - submissionTimeMs);
+            }
+            routerMetrics.getDataChunkLatencyMs.update(System.currentTimeMillis() - initializedTimeMs);
             chunkIndexToBuf.put(chunkIndex, filterChunkToRange(result.getDecryptedBlobContent()));
             numChunksRetrieved.incrementAndGet();
           } else {
@@ -842,25 +889,40 @@ class GetBlobOperation extends GetOperation {
      */
     private void cleanupExpiredInFlightRequests(RequestRegistrationCallback<GetOperation> requestRegistrationCallback) {
       //First, check if any of the existing requests have timed out.
-      Iterator<Map.Entry<Integer, GetRequestInfo>> inFlightRequestsIterator =
+      Iterator<Map.Entry<Integer, RequestInfo>> inFlightRequestsIterator =
           correlationIdToGetRequestInfo.entrySet().iterator();
       while (inFlightRequestsIterator.hasNext()) {
-        Map.Entry<Integer, GetRequestInfo> entry = inFlightRequestsIterator.next();
+        Map.Entry<Integer, RequestInfo> entry = inFlightRequestsIterator.next();
         int correlationId = entry.getKey();
-        GetRequestInfo info = entry.getValue();
-        if (time.milliseconds() - info.startTimeMs > routerConfig.routerRequestTimeoutMs) {
-          logger.trace("GetBlobRequest with correlationId {} in flight has expired for replica {} ", correlationId,
-              info.replicaId.getDataNodeId());
+        RequestInfo requestInfo = entry.getValue();
+        // If request times out due to no response from server or due to being stuck in router itself (due to bandwidth
+        // throttling, etc) for long time, drop the request.
+        long currentTimeInMs = time.milliseconds();
+        RouterUtils.RouterRequestExpiryReason routerRequestExpiryReason =
+            RouterUtils.isRequestExpired(requestInfo, currentTimeInMs);
+        if (routerRequestExpiryReason != RouterUtils.RouterRequestExpiryReason.NO_TIMEOUT) {
+          logger.trace("GetBlobRequest with correlationId {} in flight has expired for replica {} due to {} ",
+              correlationId, requestInfo.getReplicaId().getDataNodeId(), routerRequestExpiryReason.name());
           // Do not notify this as a failure to the response handler, as this timeout could simply be due to
           // connection unavailability. If there is indeed a network error, the NetworkClient will provide an error
           // response and the response handler will be notified accordingly.
-          onErrorResponse(info.replicaId,
-              RouterUtils.buildTimeoutException(correlationId, info.replicaId.getDataNodeId(), chunkBlobId));
+          onErrorResponse(requestInfo.getReplicaId(),
+              RouterUtils.buildTimeoutException(correlationId, requestInfo.getReplicaId().getDataNodeId(),
+                  chunkBlobId));
           requestRegistrationCallback.registerRequestToDrop(correlationId);
           inFlightRequestsIterator.remove();
         } else {
-          // the entries are ordered by correlation id and time. Break on the first request that has not timed out.
-          break;
+          // Note: Even though the requests are ordered by correlation id and their creation time, we cannot break out of
+          // the while loop here. This is because time outs for all requests may not be equal now.
+
+          // For example, request 1 in the map may have been assigned high time out since it might be sent at a
+          // time when the load is high and request 2 may have been assigned lower time out value since the load might have
+          // decreased by the time it is sent out. In this case, we should continue iterating the loop and clean up
+          // request 2 in the map.
+
+          // The cost of iterating all entries should be okay since the map contains outstanding requests whose number
+          // should be small. The maximum outstanding requests possible would be equal to the operation parallelism value
+          // and may be few more if adaptive operation tracker is used.
         }
       }
     }
@@ -876,11 +938,13 @@ class GetBlobOperation extends GetOperation {
         String hostname = replicaId.getDataNodeId().getHostname();
         Port port = RouterUtils.getPortToConnectTo(replicaId, routerConfig.routerEnableHttp2NetworkClient);
         GetRequest getRequest = createGetRequest(chunkBlobId, getOperationFlag(), getGetOption());
-        RequestInfo request = new RequestInfo(hostname, port, getRequest, replicaId, this);
+        RequestInfo requestInfo =
+            new RequestInfo(hostname, port, getRequest, replicaId, prepareQuotaCharger(), time.milliseconds(),
+                routerConfig.routerRequestNetworkTimeoutMs, routerConfig.routerRequestTimeoutMs);
         int correlationId = getRequest.getCorrelationId();
-        correlationIdToGetRequestInfo.put(correlationId, new GetRequestInfo(replicaId, time.milliseconds()));
+        correlationIdToGetRequestInfo.put(correlationId, requestInfo);
         correlationIdToGetChunk.put(correlationId, this);
-        requestRegistrationCallback.registerRequestToSend(GetBlobOperation.this, request);
+        requestRegistrationCallback.registerRequestToSend(GetBlobOperation.this, requestInfo);
         if (RouterUtils.isRemoteReplica(routerConfig, replicaId)) {
           logger.trace("Making request with correlationId {} to a remote replica {} in {} ", correlationId,
               replicaId.getDataNodeId(), replicaId.getDataNodeId().getDatacenterName());
@@ -909,14 +973,14 @@ class GetBlobOperation extends GetOperation {
         chunkCompleted = true;
       }
       if (chunkCompleted) {
-        if (state != ChunkState.Complete && quotaChargeCallback != null && chunkException == null) {
+        if (state != ChunkState.Complete && QuotaUtils.postProcessCharge(quotaChargeCallback)
+            && chunkException == null) {
           try {
             if (chunkSize != -1) {
-              quotaChargeCallback.charge(chunkSize);
+              quotaChargeCallback.checkAndCharge(false, true, chunkSize);
             } else {
-              if (this instanceof FirstGetChunk && ((FirstGetChunk) this).blobType == BlobType.DataBlob
-                  && blobInfo != null) {
-                quotaChargeCallback.charge(blobInfo.getBlobProperties().getBlobSize());
+              if (this instanceof FirstGetChunk && ((FirstGetChunk) this).blobType == BlobType.DataBlob) {
+                quotaChargeCallback.checkAndCharge(false, true, totalSize);
               }
               // other cases mean that either this was a metadata blob, or there was an error.
             }
@@ -951,6 +1015,10 @@ class GetBlobOperation extends GetOperation {
           boolean launchedJob = maybeLaunchCryptoJob(chunkBuf, null, encryptionKey, chunkBlobId);
           if (!launchedJob) {
             chunkBuf = filterChunkToRange(chunkBuf);
+            if (chunkIndex == 0) {
+              routerMetrics.getFirstDataChunkLatencyMs.update(System.currentTimeMillis() - submissionTimeMs);
+            }
+            routerMetrics.getDataChunkLatencyMs.update(System.currentTimeMillis() - initializedTimeMs);
             chunkIndexToBuf.put(chunkIndex, chunkBuf.retainedDuplicate());
             numChunksRetrieved.incrementAndGet();
           }
@@ -976,30 +1044,35 @@ class GetBlobOperation extends GetOperation {
     void handleResponse(ResponseInfo responseInfo, GetResponse getResponse) {
       int correlationId = responseInfo.getRequestInfo().getRequest().getCorrelationId();
       // Get the GetOperation that generated the request.
-      GetRequestInfo getRequestInfo = correlationIdToGetRequestInfo.remove(correlationId);
+      RequestInfo getRequestInfo = correlationIdToGetRequestInfo.remove(correlationId);
       if (getRequestInfo == null) {
         // Ignore right away. This associated operation has completed.
         return;
       }
-      long requestLatencyMs = time.milliseconds() - getRequestInfo.startTimeMs;
+      if (responseInfo.isQuotaRejected()) {
+        processQuotaRejectedResponse(correlationId, getRequestInfo.getReplicaId());
+        return;
+      }
+      // Track the over all time taken for the response since the creation of the request.
+      long requestLatencyMs = time.milliseconds() - getRequestInfo.getRequestCreateTime();
       routerMetrics.routerRequestLatencyMs.update(requestLatencyMs);
-      routerMetrics.getDataNodeBasedMetrics(getRequestInfo.replicaId.getDataNodeId()).getRequestLatencyMs.update(
+      routerMetrics.getDataNodeBasedMetrics(getRequestInfo.getReplicaId().getDataNodeId()).getRequestLatencyMs.update(
           requestLatencyMs);
       if (responseInfo.getError() != null) {
         // responseInfo.getError() returns NetworkClientErrorCode. If error is not null, it probably means (1) connection
         // checkout timed out; (2) pending connection timed out; (3) established connection timed out. In all these cases,
         // the latency histogram in adaptive operation tracker should not be updated.
         logger.trace("GetBlobRequest with response correlationId {} timed out for replica {} ", correlationId,
-            getRequestInfo.replicaId.getDataNodeId());
-        onErrorResponse(getRequestInfo.replicaId, buildChunkException(
+            getRequestInfo.getReplicaId().getDataNodeId());
+        onErrorResponse(getRequestInfo.getReplicaId(), buildChunkException(
             "Operation timed out because of " + responseInfo.getError() + " at DataNode " + responseInfo.getDataNode(),
             RouterErrorCode.OperationTimedOut));
       } else {
         if (getResponse == null) {
           logger.trace(
               "GetBlobRequest with response correlationId {} received an unexpected error on response deserialization from replica {} ",
-              correlationId, getRequestInfo.replicaId.getDataNodeId());
-          onErrorResponse(getRequestInfo.replicaId,
+              correlationId, getRequestInfo.getReplicaId().getDataNodeId());
+          onErrorResponse(getRequestInfo.getReplicaId(),
               buildChunkException("Response deserialization received an unexpected error",
                   RouterErrorCode.UnexpectedInternalError));
         } else {
@@ -1009,9 +1082,9 @@ class GetBlobOperation extends GetOperation {
             // sent over it. The check here ensures that is indeed the case. If not, log an error and fail this request.
             // There is no other way to handle it.
             logger.trace("GetBlobRequest with response correlationId {} mismatch from response {} for replica {} ",
-                correlationId, getResponse.getCorrelationId(), getRequestInfo.replicaId.getDataNodeId());
+                correlationId, getResponse.getCorrelationId(), getRequestInfo.getReplicaId().getDataNodeId());
             routerMetrics.unknownReplicaResponseError.inc();
-            onErrorResponse(getRequestInfo.replicaId, buildChunkException(
+            onErrorResponse(getRequestInfo.getReplicaId(), buildChunkException(
                 "The correlation id in the GetResponse " + getResponse.getCorrelationId()
                     + " is not the same as the correlation id in the associated GetRequest: " + correlationId,
                 RouterErrorCode.UnexpectedInternalError));
@@ -1024,9 +1097,9 @@ class GetBlobOperation extends GetOperation {
               // detection.
               logger.trace(
                   "GetBlobRequest with response correlationId {} response deserialization failed for replica {} ",
-                  correlationId, getRequestInfo.replicaId.getDataNodeId());
+                  correlationId, getRequestInfo.getReplicaId().getDataNodeId());
               routerMetrics.responseDeserializationErrorCount.inc();
-              onErrorResponse(getRequestInfo.replicaId,
+              onErrorResponse(getRequestInfo.getReplicaId(),
                   buildChunkException("Response deserialization received an unexpected error", e,
                       RouterErrorCode.UnexpectedInternalError));
             }
@@ -1094,14 +1167,14 @@ class GetBlobOperation extends GetOperation {
      * @throws IOException if there is an error during deserialization of the GetResponse.
      * @throws MessageFormatException if there is an error during deserialization of the GetResponse.
      */
-    private void processGetBlobResponse(GetRequestInfo getRequestInfo, GetResponse getResponse)
+    private void processGetBlobResponse(RequestInfo getRequestInfo, GetResponse getResponse)
         throws IOException, MessageFormatException {
       ServerErrorCode getError = getResponse.getError();
       if (getError == ServerErrorCode.No_Error) {
         int partitionsInResponse = getResponse.getPartitionResponseInfoList().size();
         // Each get request issued by the router is for a single blob.
         if (partitionsInResponse != 1) {
-          onErrorResponse(getRequestInfo.replicaId, buildChunkException(
+          onErrorResponse(getRequestInfo.getReplicaId(), buildChunkException(
               "Unexpected number of partition responses, expected: 1, " + "received: " + partitionsInResponse,
               RouterErrorCode.UnexpectedInternalError));
         } else {
@@ -1110,29 +1183,34 @@ class GetBlobOperation extends GetOperation {
             PartitionResponseInfo partitionResponseInfo = getResponse.getPartitionResponseInfoList().get(0);
             int objectsInPartitionResponse = partitionResponseInfo.getMessageInfoList().size();
             if (objectsInPartitionResponse != 1) {
-              onErrorResponse(getRequestInfo.replicaId, buildChunkException(
+              onErrorResponse(getRequestInfo.getReplicaId(), buildChunkException(
                   "Unexpected number of messages in a partition response, expected: 1, " + "received: "
                       + objectsInPartitionResponse, RouterErrorCode.UnexpectedInternalError));
             } else {
               MessageMetadata messageMetadata = partitionResponseInfo.getMessageMetadataList().get(0);
               MessageInfo messageInfo = partitionResponseInfo.getMessageInfoList().get(0);
               handleBody(getResponse.getInputStream(), messageMetadata, messageInfo);
-              chunkOperationTracker.onResponse(getRequestInfo.replicaId, TrackedRequestFinalState.SUCCESS);
-              if (RouterUtils.isRemoteReplica(routerConfig, getRequestInfo.replicaId)) {
+              chunkOperationTracker.onResponse(getRequestInfo.getReplicaId(), TrackedRequestFinalState.SUCCESS);
+              if (RouterUtils.isRemoteReplica(routerConfig, getRequestInfo.getReplicaId())) {
                 logger.trace("Cross colo request successful for remote replica in {} ",
-                    getRequestInfo.replicaId.getDataNodeId().getDatacenterName());
+                    getRequestInfo.getReplicaId().getDataNodeId().getDatacenterName());
                 routerMetrics.crossColoSuccessCount.inc();
               }
             }
           } else {
+            if (chunkBlobId.getBlobDataType() == BlobId.BlobDataType.DATACHUNK
+                && getError == ServerErrorCode.Blob_Not_Found) {
+              // Missing a data chunk
+              routerMetrics.missingDataChunkErrorCount.inc();
+            }
             // process and set the most relevant exception.
             RouterErrorCode routerErrorCode = processServerError(getError);
             if (getError == ServerErrorCode.Disk_Unavailable) {
-              chunkOperationTracker.onResponse(getRequestInfo.replicaId, TrackedRequestFinalState.DISK_DOWN);
+              chunkOperationTracker.onResponse(getRequestInfo.getReplicaId(), TrackedRequestFinalState.DISK_DOWN);
               setChunkException(buildChunkException("Server returned: " + getError, routerErrorCode));
               routerMetrics.routerRequestErrorCount.inc();
               routerMetrics.getDataNodeBasedMetrics(
-                  getRequestInfo.replicaId.getDataNodeId()).getRequestErrorCount.inc();
+                  getRequestInfo.getReplicaId().getDataNodeId()).getRequestErrorCount.inc();
             } else {
               if (getError == ServerErrorCode.Blob_Deleted || getError == ServerErrorCode.Blob_Expired
                   || getError == ServerErrorCode.Blob_Authorization_Failure) {
@@ -1143,17 +1221,29 @@ class GetBlobOperation extends GetOperation {
               }
               // any server error code that is not equal to ServerErrorCode.No_Error, the onErrorResponse should be invoked
               // because the operation itself doesn't succeed although the response in some cases is successful (i.e. Blob_Deleted)
-              onErrorResponse(getRequestInfo.replicaId,
+              onErrorResponse(getRequestInfo.getReplicaId(),
                   buildChunkException("Server returned: " + getError, routerErrorCode));
             }
           }
         }
       } else {
         logger.trace("Replica {} returned an error {} for a GetBlobRequest with response correlationId : {} ",
-            getRequestInfo.replicaId.getDataNodeId(), getError, getResponse.getCorrelationId());
+            getRequestInfo.getReplicaId().getDataNodeId(), getError, getResponse.getCorrelationId());
         // process and set the most relevant exception.
-        onErrorResponse(getRequestInfo.replicaId, buildChunkException("Server returned", processServerError(getError)));
+        onErrorResponse(getRequestInfo.getReplicaId(),
+            buildChunkException("Server returned", processServerError(getError)));
       }
+    }
+
+    /**
+     * Process response if it was rejected due to quota compliance.
+     * @param correlationId correlation id of the request.
+     * @param replicaId {@link ReplicaId} of the request.
+     */
+    private void processQuotaRejectedResponse(int correlationId, ReplicaId replicaId) {
+      logger.trace("GetBlobRequest with response correlationId {} rejected because it exceeded quota", correlationId);
+      onErrorResponse(replicaId, new RouterException("QuotaExceeded", RouterErrorCode.TooManyRequests), false);
+      checkAndMaybeComplete();
     }
 
     /**
@@ -1162,11 +1252,23 @@ class GetBlobOperation extends GetOperation {
      * @param exception the {@link RouterException} associated with the failed response.
      */
     private void onErrorResponse(ReplicaId replicaId, RouterException exception) {
+      onErrorResponse(replicaId, exception, true);
+    }
+
+    /**
+     * Perform the necessary actions when a request to a replica fails.
+     * @param replicaId the {@link ReplicaId} associated with the failed response.
+     * @param exception the {@link RouterException} associated with the failed response.
+     * @param updateDataNodeMetrics {@code true} if data node metrics should be updated. {@code false} otherwise.
+     */
+    private void onErrorResponse(ReplicaId replicaId, RouterException exception, boolean updateDataNodeMetrics) {
       chunkOperationTracker.onResponse(replicaId,
           TrackedRequestFinalState.fromRouterErrorCodeToFinalState(exception.getErrorCode()));
       setChunkException(exception);
       routerMetrics.routerRequestErrorCount.inc();
-      routerMetrics.getDataNodeBasedMetrics(replicaId.getDataNodeId()).getRequestErrorCount.inc();
+      if (updateDataNodeMetrics) {
+        routerMetrics.getDataNodeBasedMetrics(replicaId.getDataNodeId()).getRequestErrorCount.inc();
+      }
     }
 
     /**
@@ -1258,6 +1360,18 @@ class GetBlobOperation extends GetOperation {
     private RouterException buildChunkException(String message, RouterErrorCode errorCode) {
       return new RouterException(message + ". Chunk ID: " + chunkBlobId, errorCode);
     }
+
+    /**
+     * Set the blobId and chunkSize in the operationQuotaCharger, and return the {@link OperationQuotaCharger} object.
+     * Note that this method might set the blobId and chunkSize for the same chunk multiple times. This is ok because
+     * these are idempotent operation for the same chunk.
+     * @return OperationQuotaCharger object.
+     */
+    private OperationQuotaCharger prepareQuotaCharger() {
+      operationQuotaCharger.setBlobId(chunkBlobId);
+      operationQuotaCharger.setChunkSize(chunkSize);
+      return operationQuotaCharger;
+    }
   }
 
   /**
@@ -1268,16 +1382,37 @@ class GetBlobOperation extends GetOperation {
   private class FirstGetChunk extends GetChunk {
 
     // refers to the blob type.
-    private BlobType blobType;
-    private List<CompositeBlobInfo.ChunkMetadata> chunkMetadataList;
-    private BlobProperties serverBlobProperties;
-    private short lifeVersion;
+    protected BlobType blobType;
+    protected List<CompositeBlobInfo.ChunkMetadata> chunkMetadataList;
+    protected BlobProperties serverBlobProperties;
+    protected short lifeVersion;
 
     /**
      * Construct a FirstGetChunk and initialize it with the {@link BlobId} of the overall operation.
      */
     FirstGetChunk() {
       super(-1, new CompositeBlobInfo.ChunkMetadata(blobId, 0L, -1L));
+    }
+
+    /**
+     * Decides if we should cache metadata during a GET request
+     * This method should be called after decryption is complete.
+     * @return True if and only if
+     *  - cache exists
+     *  - it's a RANGE request
+     *  - it's not a GET request for a segment
+     *  - it is not a raw mode request
+     *  - the blobID is for a metadata blob (this info is present only in v5 and v6 version of blobID)
+     *  - the blob type is metadata blob
+     *  - firstChunk is complete
+     *  - there are no exceptions
+     *  False, otherwise.
+     */
+    protected boolean shouldSaveMetadata() {
+      return (blobMetadataCache != null && isRangeRequest() && options.getBlobOptions.hasBlobSegmentIdx() == false
+          && options.getBlobOptions.isRawMode() == false && blobId.getBlobDataType() == BlobId.BlobDataType.METADATA
+          && blobType == BlobType.MetadataBlob && totalSize >= routerConfig.routerSmallestBlobForMetadataCache
+          && isComplete() && getChunkException() == null && getOperationException() == null);
     }
 
     /**
@@ -1341,6 +1476,8 @@ class GetBlobOperation extends GetOperation {
               ByteBuf decryptedBlobContent = result.getDecryptedBlobContent();
               totalSize = decryptedBlobContent.readableBytes();
               if (!resolveRange(totalSize)) {
+                routerMetrics.getFirstDataChunkLatencyMs.update(System.currentTimeMillis() - submissionTimeMs);
+                routerMetrics.getDataChunkLatencyMs.update(System.currentTimeMillis() - initializedTimeMs);
                 chunkIndexToBuf.put(0, filterChunkToRange(decryptedBlobContent));
                 numChunksRetrieved.set(1);
                 progressTracker.setCryptoJobSuccess();
@@ -1396,9 +1533,15 @@ class GetBlobOperation extends GetOperation {
           getOptions().ageAtAccessTracker.trackAgeAtAccess(serverBlobInfo.getBlobProperties().getCreationTimeInMs());
           blobData = blobAll.getBlobData();
           encryptionKey = blobAll.getBlobEncryptionKey();
-          if (encryptionKey == null) {
-            // set blobInfo only if decryption is not required. If not, maybeProcessCallbackAndComplete() will set appropriate
-            // value
+          if (Objects.isNull(encryptionKey) || options.getChunkIdsOnly) {
+            // set blobInfo iff:
+            //   1. blob is not encrypted OR,
+            //   2. getChunkIdsOnly is set.
+            // If the blob is encrypted, then the user metadata is encrypted too. So in that case,
+            // maybeProcessCallbackAndComplete() will set the appropriate value for blobInfo after decryption.
+            // In the case of getChunkIdsOnly call, we don't need the user metadata but still need blob
+            // properties to evaluate if the metadata chunk is already updated for update requests. So we allow blobInfo
+            // to be set here.
             blobInfo = serverBlobInfo;
             blobInfo.setLifeVersion(messageInfo.getLifeVersion());
           } else {
@@ -1561,7 +1704,7 @@ class GetBlobOperation extends GetOperation {
     /**
      * Initialize data chunks and few other cast for metadata chunk
      */
-    private void initializeDataChunks() {
+    protected void initializeDataChunks() {
       if (options.getChunkIdsOnly
           || options.getBlobOptions.getOperationType() == GetBlobOptions.OperationType.BlobInfo) {
         chunkIdIterator = null;
@@ -1605,6 +1748,8 @@ class GetBlobOperation extends GetOperation {
             boolean launchedJob = maybeLaunchCryptoJob(chunkBuf, userMetadata, encryptionKey, blobId);
             if (!launchedJob) {
               chunkBuf = filterChunkToRange(chunkBuf);
+              routerMetrics.getFirstDataChunkLatencyMs.update(System.currentTimeMillis() - submissionTimeMs);
+              routerMetrics.getDataChunkLatencyMs.update(System.currentTimeMillis() - initializedTimeMs);
               chunkIndexToBuf.put(0, chunkBuf.retainedDuplicate());
               numChunksRetrieved.set(1);
             }
@@ -1635,6 +1780,19 @@ class GetBlobOperation extends GetOperation {
     }
 
     /**
+     * Wrapper over resolveRange
+     * @param rangeTotalSize byte range to be used for range resolution
+     * @return {@code true} if range resolution succeeded or no range resolution was done. {@code false} otherwise
+     */
+    protected boolean resolveRangeProper(long rangeTotalSize) {
+      /*
+       * resolveRange is a weird function that returns false on success and true on failure !
+       * Hence, this wrapper to make code readable !
+       */
+      return !resolveRange(rangeTotalSize);
+    }
+
+    /**
      * On an invalid range, set a {@link RouterErrorCode#RangeNotSatisfiable} exception for this chunk, mark the chunk
      * as unconditionally completed, and set the chunk counters such that the operation will be completed.
      * @param exception the reason that the range was invalid.
@@ -1647,6 +1805,116 @@ class GetBlobOperation extends GetOperation {
       dataChunks = null;
       numChunksTotal = 0;
       numChunksRetrieved.set(0);
+    }
+  }
+
+  private class CachedFirstChunk extends FirstGetChunk {
+
+    /**
+     * Construct a CachedFirstChunk and initialize it with the {@link BlobMetadata} of the overall operation.
+     * @param blobMetadata Cached blob metadata for composite blobs
+     */
+    CachedFirstChunk(BlobMetadata blobMetadata) {
+      super();
+      /*
+       * If cache hit, extract all relevant metadata and save in appropriate variables.
+       * If the entry gets evicted later, we are still safe as we have saved all the metadata.
+       */
+      blobType = BlobType.MetadataBlob;
+      compositeBlobInfo = blobMetadata.getCompositeBlobInfo();
+      totalSize = compositeBlobInfo.getTotalSize();
+      chunkMetadataList = compositeBlobInfo.getChunkMetadataList();
+      blobInfo = blobMetadata.getBlobInfo();
+      lifeVersion = blobInfo.getLifeVersion();
+      serverBlobProperties = blobInfo.getBlobProperties();
+      chunkIndexToBuf = new ConcurrentHashMap<>();
+      chunkIndexToBufWaitingForRelease = new ConcurrentHashMap<>();
+      successfullyDeserialized = true;
+    }
+
+    /**
+     * Return {@link MessageFormatFlags} to associate with cached first chunk.
+     * For a cached metadata chunk, we just need to get blobInfo to validate it.
+     * We don't have to fetch the entire metadata chunk again.
+     * @return {@link MessageFormatFlags#BlobInfo}
+     */
+    @Override
+    MessageFormatFlags getOperationFlag() {
+      return MessageFormatFlags.BlobInfo;
+    }
+
+    /**
+     * Decides if we should save metadata or not.
+     * @return False for cached first chunk. There is nothing to cache.
+     */
+    @Override
+    protected boolean shouldSaveMetadata() {
+      return false;
+    }
+
+    /**
+     * On an invalid cache entry, set a {@link RouterErrorCode} exception for first chunk, mark the chunk
+     * as completed, and set the chunk counters such that the operation will be completed.
+     * @param routerException Exception due to which cache entry was invalid.
+     */
+    protected void onInvalidCacheEntry(RouterException routerException) {
+      setChunkException(routerException);
+      chunkCompleted = true;
+      retainChunkExceptionOnSuccess = true;
+      chunkIdIterator = null;
+      dataChunks = null;
+      numChunksTotal = 0;
+      numChunksRetrieved.set(0);
+    }
+
+    /**
+     * Validate cached metadata chunk and proceed to request data chunks
+     * @param payload Bytes received from backend
+     * @param messageMetadata  Metadata associated with messages sent out
+     * @param messageInfo Message info class that contains basic info about a message
+     * @throws IOException
+     * @throws MessageFormatException
+     */
+    @Override
+    void handleBody(InputStream payload, MessageMetadata messageMetadata, MessageInfo messageInfo)
+        throws IOException, MessageFormatException {
+      /* If we find blob metadata in frontend cache, validate it and use it. */
+      BlobProperties receivedBlobProperties = MessageFormatRecord.deserializeBlobProperties(payload);
+      updateTtlIfRequired(receivedBlobProperties, messageInfo);
+      /*
+       * Some cached variables are mutable.
+       * Update them and then compare if other immutable variables are same or not.
+       */
+      updateTtlIfRequired(serverBlobProperties, messageInfo);
+      lifeVersion = messageInfo.getLifeVersion();
+      blobInfo.setLifeVersion(lifeVersion);
+      if (!serverBlobProperties.equals(receivedBlobProperties)) {
+        /*
+         * This is a rare error case.
+         * If we find blob properties is in our frontend cache, we request just blobInfo from backend to validate
+         * the cache entry. If cached blob properties does not match received blob properties, due to a random bit flip for eg.,
+         * we must delete the cache entry and throw a retriable exception to the user.
+         * The next request will re-fill the cache with a valid entry if the blob stills exists.
+         * We do not need to decrypt anything at this point.
+         */
+        String reason = "Cached blob property does not match received blob property";
+        logger.error("[{}] {} for blobId = {}, cached blob property = {}, received blob property = {}",
+            blobMetadataCache.getCacheId(), reason, blobId, serverBlobProperties, receivedBlobProperties);
+        deleteMetadata(reason);
+        onInvalidCacheEntry(new RouterException(reason, RouterErrorCode.UnexpectedInternalError));
+        return;
+      }
+      getOptions().ageAtAccessTracker.trackAgeAtAccess(serverBlobProperties.getCreationTimeInMs());
+
+      /*
+       * If we reach here, then the cached metadata is valid and already decrypted from a previous GET/RANGE request.
+       * Just use it directly and initiate fetching data chunks.
+       */
+      if (isRangeRequest() && resolveRangeProper(totalSize)) {
+        chunkMetadataList = compositeBlobInfo.getStoreKeysInByteRange(resolvedByteRange.getStartOffset(),
+            resolvedByteRange.getEndOffset());
+        initializeDataChunks();
+      }
     }
   }
 }

@@ -13,6 +13,15 @@
  */
 package com.github.ambry.cloud.azure;
 
+import com.azure.cosmos.CosmosAsyncClient;
+import com.azure.cosmos.CosmosAsyncContainer;
+import com.azure.cosmos.CosmosAsyncDatabase;
+import com.azure.cosmos.CosmosException;
+import com.azure.cosmos.models.CosmosChangeFeedRequestOptions;
+import com.azure.cosmos.models.CosmosItemResponse;
+import com.azure.cosmos.models.FeedResponse;
+import com.azure.cosmos.models.SqlQuerySpec;
+import com.azure.cosmos.util.CosmosPagedFlux;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.cloud.CloudBlobMetadata;
 import com.github.ambry.cloud.VcrMetrics;
@@ -20,26 +29,18 @@ import com.github.ambry.clustermap.MockPartitionId;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.utils.Utils;
-import com.microsoft.azure.cosmosdb.ChangeFeedOptions;
-import com.microsoft.azure.cosmosdb.Document;
-import com.microsoft.azure.cosmosdb.DocumentClientException;
-import com.microsoft.azure.cosmosdb.FeedOptions;
-import com.microsoft.azure.cosmosdb.FeedResponse;
-import com.microsoft.azure.cosmosdb.RequestOptions;
-import com.microsoft.azure.cosmosdb.ResourceResponse;
-import com.microsoft.azure.cosmosdb.SqlQuerySpec;
-import com.microsoft.azure.cosmosdb.internal.HttpConstants;
-import com.microsoft.azure.cosmosdb.rx.AsyncDocumentClient;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletionException;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.junit.MockitoJUnitRunner;
-import rx.Observable;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
-import static com.github.ambry.cloud.azure.AzureTestUtils.*;
+import static com.azure.cosmos.implementation.HttpConstants.StatusCodes.*;
 import static com.github.ambry.commons.BlobId.*;
 import static org.junit.Assert.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -51,15 +52,19 @@ import static org.mockito.Mockito.*;
 public class CosmosDataAccessorTest {
 
   private CosmosDataAccessor cosmosAccessor;
-  private AsyncDocumentClient mockumentClient;
+  private CosmosAsyncClient mockCosmosAsyncClient;
+  private CosmosAsyncDatabase mockCosmosAsyncDatabase;
+  private CosmosAsyncContainer mockCosmosAsyncContainer;
   private AzureMetrics azureMetrics;
   private BlobId blobId;
-  private int blobSize = 1024;
+  private final int blobSize = 1024;
   private CloudBlobMetadata blobMetadata;
 
   @Before
   public void setup() {
-    mockumentClient = mock(AsyncDocumentClient.class);
+    mockCosmosAsyncClient = mock(CosmosAsyncClient.class);
+    mockCosmosAsyncDatabase = mock(CosmosAsyncDatabase.class);
+    mockCosmosAsyncContainer = mock(CosmosAsyncContainer.class);
     byte dataCenterId = 66;
     short accountId = 101;
     short containerId = 5;
@@ -70,47 +75,65 @@ public class CosmosDataAccessorTest {
         CloudBlobMetadata.EncryptionOrigin.NONE);
     azureMetrics = new AzureMetrics(new MetricRegistry());
     VcrMetrics vcrMetrics = new VcrMetrics(new MetricRegistry());
-    cosmosAccessor = new CosmosDataAccessor(mockumentClient, "ambry/metadata", "ambry/deletedContainer", vcrMetrics, azureMetrics);
+
+    when(mockCosmosAsyncDatabase.getContainer(anyString())).thenReturn(mockCosmosAsyncContainer);
+    // Mock read, upsert, replacing of items.
+    CosmosItemResponse cosmosItemResponse = mock(CosmosItemResponse.class);
+    when(cosmosItemResponse.getItem()).thenReturn(blobMetadata);
+    when(mockCosmosAsyncContainer.readItem(anyString(), any(), any())).thenReturn(Mono.just(cosmosItemResponse));
+    when(mockCosmosAsyncContainer.upsertItem(any(), any(), any())).thenReturn(Mono.just(cosmosItemResponse));
+    when(mockCosmosAsyncContainer.replaceItem(any(), anyString(), any(), any())).thenReturn(
+        Mono.just(cosmosItemResponse));
+
+    // Mock querying items
+    FeedResponse feedResponse = mock(FeedResponse.class);
+    when(feedResponse.getResults()).thenReturn(Collections.singletonList(blobMetadata));
+    CosmosPagedFlux cosmosPagedFlux = mock(CosmosPagedFlux.class);
+    when(cosmosPagedFlux.byPage()).thenReturn(Flux.just(feedResponse));
+    when(mockCosmosAsyncContainer.queryItems((SqlQuerySpec) any(), any(), any())).thenReturn(cosmosPagedFlux);
+
+    // Mock querying change feed
+    when(mockCosmosAsyncContainer.queryChangeFeed(any(), any())).thenReturn(cosmosPagedFlux);
+
+    cosmosAccessor =
+        new CosmosDataAccessor(mockCosmosAsyncClient, mockCosmosAsyncDatabase, mockCosmosAsyncContainer, "ambry",
+            "metadata", "deletedContainer", vcrMetrics, azureMetrics);
   }
 
   /**
    * Test normal upsert.
-   * @throws Exception
    */
   @Test
-  public void testUpsertNormal() throws Exception {
-    Observable<ResourceResponse<Document>> mockResponse = getMockedObservableForSingleResource(blobMetadata);
-    when(mockumentClient.upsertDocument(anyString(), any(), any(RequestOptions.class), anyBoolean())).thenReturn(
-        mockResponse);
-    cosmosAccessor.upsertMetadata(blobMetadata);
+  public void testUpsertNormal() {
+    cosmosAccessor.upsertMetadataAsync(blobMetadata).join();
     assertEquals(1, azureMetrics.documentCreateTime.getCount());
   }
 
   /** Test update. */
   @Test
-  public void testUpdateNormal() throws Exception {
-    Observable<ResourceResponse<Document>> mockResponse = getMockedObservableForSingleResource(blobMetadata);
-    when(mockumentClient.readDocument(anyString(), any(RequestOptions.class))).thenReturn(mockResponse);
-    when(mockumentClient.replaceDocument(any(), any())).thenReturn(mockResponse);
-    cosmosAccessor.updateMetadata(blobId,
-        Collections.singletonMap(CloudBlobMetadata.FIELD_DELETION_TIME, Long.toString(System.currentTimeMillis())));
+  public void testUpdateNormal() {
+    cosmosAccessor.updateMetadataAsync(blobId,
+        Collections.singletonMap(CloudBlobMetadata.FIELD_DELETION_TIME, Long.toString(System.currentTimeMillis())))
+        .join();
     assertEquals(1, azureMetrics.documentReadTime.getCount());
     assertEquals(1, azureMetrics.documentUpdateTime.getCount());
   }
 
   /** Test update with conflict. */
   @Test
-  public void testUpdateConflict() throws Exception {
-    Observable<ResourceResponse<Document>> mockResponse = getMockedObservableForSingleResource(blobMetadata);
-    when(mockumentClient.readDocument(anyString(), any(RequestOptions.class))).thenReturn(mockResponse);
-    when(mockumentClient.replaceDocument(any(), any())).thenThrow(
-        new RuntimeException(new DocumentClientException(HttpConstants.StatusCodes.PRECONDITION_FAILED)));
+  public void testUpdateConflict() {
+    CosmosException cosmosException = mock(CosmosException.class);
+    when(cosmosException.getStatusCode()).thenReturn(PRECONDITION_FAILED);
+    when(mockCosmosAsyncContainer.replaceItem(any(), anyString(), any(), any())).thenReturn(
+        Mono.error(cosmosException));
     try {
-      cosmosAccessor.updateMetadata(blobId,
-          Collections.singletonMap(CloudBlobMetadata.FIELD_DELETION_TIME, Long.toString(System.currentTimeMillis())));
+      cosmosAccessor.updateMetadataAsync(blobId,
+          Collections.singletonMap(CloudBlobMetadata.FIELD_DELETION_TIME, Long.toString(System.currentTimeMillis())))
+          .join();
       fail("Expected exception");
-    } catch (DocumentClientException ex) {
+    } catch (CompletionException ex) {
       // expected
+      assertTrue(ex.getCause() instanceof CosmosException);
     }
     assertEquals(1, azureMetrics.documentReadTime.getCount());
     assertEquals(1, azureMetrics.documentUpdateTime.getCount());
@@ -119,13 +142,7 @@ public class CosmosDataAccessorTest {
 
   /** Test query metadata. */
   @Test
-  public void testQueryNormal() throws Exception {
-    Observable<FeedResponse<Document>> mockResponse = mock(Observable.class);
-    List<Document> docList =
-        Collections.singletonList(AzureTestUtils.createDocumentFromCloudBlobMetadata(blobMetadata));
-    mockObservableForQuery(docList, mockResponse);
-    when(mockumentClient.queryDocuments(anyString(), any(SqlQuerySpec.class), any(FeedOptions.class))).thenReturn(
-        mockResponse);
+  public void testQueryNormal() {
     List<CloudBlobMetadata> metadataList = doQueryMetadata();
     assertEquals("Expected single entry", 1, metadataList.size());
     CloudBlobMetadata outputMetadata = metadataList.get(0);
@@ -134,52 +151,42 @@ public class CosmosDataAccessorTest {
     assertEquals(1, azureMetrics.missingKeysQueryTime.getCount());
   }
 
-  /** Test change feed query. */
+  /** Test change feed query. Ignoring for now since {@link CosmosChangeFeedRequestOptions} instance needed for change
+   * feed query might also need to be mocked in some way before executing the query */
   @Test
-  public void testQueryChangeFeedNormal() throws Exception {
-    Observable<FeedResponse<Document>> mockResponse = mock(Observable.class);
-    List<Document> docList =
-        Collections.singletonList(AzureTestUtils.createDocumentFromCloudBlobMetadata(blobMetadata));
-    mockObservableForChangeFeedQuery(docList, mockResponse);
-    when(mockumentClient.queryDocumentChangeFeed(anyString(), any(ChangeFeedOptions.class))).thenReturn(mockResponse);
-    // test with non null requestContinuationToken
-    List<CloudBlobMetadata> metadataList = doQueryChangeFeed("test");
+  public void testQueryChangeFeedNormal() {
+    List<CloudBlobMetadata> metadataList = doQueryChangeFeed();
     assertEquals("Expected single entry", 1, metadataList.size());
     CloudBlobMetadata outputMetadata = metadataList.get(0);
     assertEquals("Returned metadata does not match original", blobMetadata, outputMetadata);
     assertEquals(1, azureMetrics.changeFeedQueryCount.getCount());
     assertEquals(0, azureMetrics.changeFeedQueryFailureCount.getCount());
 
-    // test with a null continuation token
-    metadataList = doQueryChangeFeed(null);
-    assertEquals("Expected single entry", 1, metadataList.size());
-    outputMetadata = metadataList.get(0);
-    assertEquals("Returned metadata does not match original", blobMetadata, outputMetadata);
-    assertEquals(2, azureMetrics.changeFeedQueryCount.getCount());
-    assertEquals(0, azureMetrics.changeFeedQueryFailureCount.getCount());
-
     // test when queryChangeFeed throws exception
-    when(mockumentClient.queryDocumentChangeFeed(anyString(), any(ChangeFeedOptions.class))).thenThrow(
-        new RuntimeException("mock exception", new DocumentClientException(404)));
+    CosmosPagedFlux mockCosmosPagedFlux = mock(CosmosPagedFlux.class);
+    when(mockCosmosPagedFlux.byPage()).thenReturn(Flux.error(mock(CosmosException.class)));
+    when(mockCosmosAsyncContainer.queryChangeFeed(any(), any())).thenReturn(mockCosmosPagedFlux);
+
     try {
-      doQueryChangeFeed(null);
-    } catch (DocumentClientException e) {
+      doQueryChangeFeed();
+    } catch (CompletionException e) {
+      assertTrue(e.getCause() instanceof CosmosException);
     }
-    assertEquals(3, azureMetrics.changeFeedQueryCount.getCount());
+    assertEquals(2, azureMetrics.changeFeedQueryCount.getCount());
     assertEquals(1, azureMetrics.changeFeedQueryFailureCount.getCount());
   }
 
   /** Utility method to run metadata query with default parameters. */
-  private List<CloudBlobMetadata> doQueryMetadata() throws Exception {
-    return cosmosAccessor.queryMetadata(blobId.getPartition().toPathString(), "select * from c",
-        azureMetrics.missingKeysQueryTime);
+  private List<CloudBlobMetadata> doQueryMetadata() {
+    return cosmosAccessor.queryMetadataAsync(blobId.getPartition().toPathString(), "select * from c",
+        azureMetrics.missingKeysQueryTime).join();
   }
 
   /** Utility method to run metadata query with default parameters. */
-  private List<CloudBlobMetadata> doQueryChangeFeed(String continuationToken) throws Exception {
+  private List<CloudBlobMetadata> doQueryChangeFeed() {
     List<CloudBlobMetadata> changeFeed = new ArrayList<>();
-    cosmosAccessor.queryChangeFeed(continuationToken, 1000, changeFeed, blobId.getPartition().toPathString(),
-        azureMetrics.changeFeedQueryTime);
+    CosmosChangeFeedRequestOptions mockFeedRequestOptions = mock(CosmosChangeFeedRequestOptions.class);
+    cosmosAccessor.queryChangeFeedAsync(mockFeedRequestOptions, changeFeed, azureMetrics.changeFeedQueryTime).join();
     return changeFeed;
   }
 }

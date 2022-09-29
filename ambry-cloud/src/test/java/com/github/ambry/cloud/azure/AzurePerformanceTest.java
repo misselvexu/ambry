@@ -13,7 +13,6 @@
  */
 package com.github.ambry.cloud.azure;
 
-import com.azure.storage.blob.models.BlobStorageException;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.config.CloudConfig;
 import com.github.ambry.config.VerifiableProperties;
@@ -56,7 +55,7 @@ public class AzurePerformanceTest {
     }
     props.setProperty(AzureCloudConfig.AZURE_STORAGE_CONNECTION_STRING, connectionString);
     String[] requiredCosmosProperties =
-        {AzureCloudConfig.COSMOS_ENDPOINT, AzureCloudConfig.COSMOS_COLLECTION_LINK, AzureCloudConfig.COSMOS_KEY};
+        {AzureCloudConfig.COSMOS_ENDPOINT, AzureCloudConfig.COSMOS_COLLECTION, AzureCloudConfig.COSMOS_KEY};
     for (String cosmosProperty : requiredCosmosProperties) {
       props.setProperty(cosmosProperty, "something");
     }
@@ -77,7 +76,7 @@ public class AzurePerformanceTest {
     }
   }
 
-  public static void testPerformance() throws IOException, BlobStorageException {
+  public static void testPerformance() throws Exception {
     // create container with this class name
     String containerName = commandName.toLowerCase();
 
@@ -87,7 +86,7 @@ public class AzurePerformanceTest {
     for (int j = 0; j < 10; j++) {
       String blobName = String.format("Warmup-%d", j);
       InputStream inputStream = new ByteArrayInputStream(buffer);
-      blobDataAccessor.uploadFile(containerName, blobName, inputStream);
+      blobDataAccessor.uploadFileAsync(containerName, blobName, inputStream).join();
     }
 
     int testCount = 100;
@@ -104,7 +103,7 @@ public class AzurePerformanceTest {
         String blobName = String.format("Test-%s-%d", label, j);
         InputStream inputStream = new ByteArrayInputStream(buffer);
         long startTime = System.currentTimeMillis();
-        blobDataAccessor.uploadFile(containerName, blobName, inputStream);
+        blobDataAccessor.uploadFileAsync(containerName, blobName, inputStream).join();
         long uploadTime = System.currentTimeMillis() - startTime;
         totalTime += uploadTime;
         maxTime = Math.max(maxTime, uploadTime);
@@ -122,7 +121,7 @@ public class AzurePerformanceTest {
         String blobName = String.format("Test-%s-%d", label, j);
         OutputStream outputStream = new ByteArrayOutputStream(blobSizes[sizeIndex]);
         long startTime = System.currentTimeMillis();
-        blobDataAccessor.downloadFile(containerName, blobName, outputStream, true);
+        blobDataAccessor.downloadFileAsync(containerName, blobName, null, outputStream, true).join();
         long downloadTime = System.currentTimeMillis() - startTime;
         totalTime += downloadTime;
         maxTime = Math.max(maxTime, downloadTime);

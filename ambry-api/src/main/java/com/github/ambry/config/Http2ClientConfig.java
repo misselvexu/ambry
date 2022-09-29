@@ -37,6 +37,9 @@ public class Http2ClientConfig {
   public static final String HTTP2_BLOCKING_CHANNEL_POOL_SHUTDOWN_TIMEOUT_MS =
       "http2.blocking.channel.pool.shutdown.timeout.ms";
   public static final String HTTP2_PEER_CERTIFICATE_SAN_REGEX = "http2.peer.certificate.san.regex";
+  public static final String HTTP2_TIMEOUT_AS_NETWORK_ERROR = "http.timeout.as.network.error";
+  public static final String HTTP2_REQUEST_ADDITIONAL_TIMEOUT_MS = "http2.request.additional.timeout.ms";
+  public static final String HTTP2_REQUEST_COUNT_FOR_SCALING_TIMEOUT = "http2.request.count.for.scaling.timeout";
 
   /**
    * HTTP/2 connection idle time before we close it. -1 means no idle close.
@@ -158,6 +161,30 @@ public class Http2ClientConfig {
   @Default("")
   public final String http2PeerCertificateSanRegex;
 
+  /**
+   * If true, treat timeout in http2 network client as network error. This would make servers that
+   * can't respond to frontend in time be marked as down by frontend.
+   */
+  @Config(HTTP2_TIMEOUT_AS_NETWORK_ERROR)
+  @Default("false")
+  public final boolean http2TimeoutAsNetworkError;
+
+  /**
+   * Denotes how much extra time should be given for requests to receive response under heavy load.
+   */
+  @Config(HTTP2_REQUEST_ADDITIONAL_TIMEOUT_MS)
+  @Default("2500")
+  public final int http2RequestAdditionalTimeoutMs;
+
+  /**
+   * Denotes the number of requests to consider when increasing the network time out. For example, if
+   * {@link this#http2RequestAdditionalTimeoutMs} is 2500 and this value is 100000, it means that we will
+   * increment network timeout by 2.5 seconds for every 100K requests.
+   */
+  @Config(HTTP2_REQUEST_COUNT_FOR_SCALING_TIMEOUT)
+  @Default("100000")
+  public final int http2RequestCountForScalingTimeout;
+
   public Http2ClientConfig(VerifiableProperties verifiableProperties) {
     idleConnectionTimeoutMs = verifiableProperties.getLong(HTTP2_IDLE_CONNECTION_TIMEOUT_MS, -1);
     http2MinConnectionPerPort =
@@ -180,7 +207,9 @@ public class Http2ClientConfig {
     http2BlockingChannelReceiveTimeoutMs = verifiableProperties.getInt(HTTP2_BLOCKING_CHANNEL_RECEIVE_TIMEOUT_MS, 5000);
     http2BlockingChannelPoolShutdownTimeoutMs =
         verifiableProperties.getInt(HTTP2_BLOCKING_CHANNEL_POOL_SHUTDOWN_TIMEOUT_MS, 3000);
-    http2PeerCertificateSanRegex =
-        verifiableProperties.getString(HTTP2_PEER_CERTIFICATE_SAN_REGEX, "");
+    http2PeerCertificateSanRegex = verifiableProperties.getString(HTTP2_PEER_CERTIFICATE_SAN_REGEX, "");
+    http2TimeoutAsNetworkError = verifiableProperties.getBoolean(HTTP2_TIMEOUT_AS_NETWORK_ERROR, false);
+    http2RequestAdditionalTimeoutMs = verifiableProperties.getInt(HTTP2_REQUEST_ADDITIONAL_TIMEOUT_MS, 2500);
+    http2RequestCountForScalingTimeout = verifiableProperties.getInt(HTTP2_REQUEST_COUNT_FOR_SCALING_TIMEOUT, 100000);
   }
 }

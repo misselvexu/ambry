@@ -32,6 +32,12 @@ public class RouterConfig {
   public static final String DEFAULT_CRYPTO_SERVICE_FACTORY = "com.github.ambry.router.GCMCryptoServiceFactory";
   public static final double DEFAULT_LATENCY_TOLERANCE_QUANTILE = 0.9;
   public static final long DEFAULT_OPERATION_TRACKER_HISTOGRAM_CACHE_TIMEOUT_MS = 1000L;
+  public static final long ROUTER_NOT_FOUND_CACHE_MAX_TTL_IN_MS = 24 * 60 * 1000L;
+  public static final int MAX_NETWORK_TIMEOUT_VALUE_FOR_A_REQUEST_IN_MS = 60 * 1000;
+  public static final long DEFAULT_ROUTER_UPDATE_OP_METADATA_RELIANCE_TIMESTAMP_IN_MS = Long.MAX_VALUE;
+  // This is a theoretical maximum value. Configured value may be much smaller since we might need to respond back to
+  // client with either success or failure much sooner.
+  public static final int MAX_OVERALL_TIMEOUT_VALUE_FOR_A_REQUEST_IN_MS = 60 * 60 * 1000;
 
   // config keys
   public static final String ROUTER_SCALING_UNIT_COUNT = "router.scaling.unit.count";
@@ -48,6 +54,7 @@ public class RouterConfig {
   public static final String ROUTER_CONNECTIONS_WARM_UP_TIMEOUT_MS = "router.connections.warm.up.timeout.ms";
   public static final String ROUTER_CONNECTION_CHECKOUT_TIMEOUT_MS = "router.connection.checkout.timeout.ms";
   public static final String ROUTER_REQUEST_TIMEOUT_MS = "router.request.timeout.ms";
+  public static final String ROUTER_REQUEST_NETWORK_TIMEOUT_MS = "router.request.network.timeout.ms";
   public static final String ROUTER_DROP_REQUEST_ON_TIMEOUT = "router.drop.request.on.timeout";
   public static final String ROUTER_MAX_PUT_CHUNK_SIZE_BYTES = "router.max.put.chunk.size.bytes";
   public static final String ROUTER_PUT_REQUEST_PARALLELISM = "router.put.request.parallelism";
@@ -111,6 +118,12 @@ public class RouterConfig {
   public static final String OPERATION_CONTROLLER = "router.operation.controller";
   public static final String ROUTER_REQUEST_HANDLER_NUM_OF_THREADS = "router.request.handler.num.of.threads";
   public static final String ROUTER_STORE_KEY_CONVERTER_FACTORY = "router.store.key.converter.factory";
+  public static final String ROUTER_UNAVAILABLE_DUE_TO_OFFLINE_REPLICAS = "router.unavailable.due.to.offline.replicas";
+  public static final String ROUTER_NOT_FOUND_CACHE_TTL_IN_MS = "router.not.found.cache.ttl.in.ms";
+  public static final String ROUTER_UPDATE_OP_METADATA_RELIANCE_TIMESTAMP_IN_MS =
+      "router.update.op.metadata.reliance.timestamp.in.ms";
+  public static final String ROUTER_UNAVAILABLE_DUE_TO_SUCCESS_COUNT_IS_NON_ZERO_FOR_DELETE =
+      "router.unavailable.due.to.success.count.is.non.zero.for.delete";
 
   /**
    * Number of independent scaling units for the router.
@@ -179,11 +192,18 @@ public class RouterConfig {
   public final int routerConnectionCheckoutTimeoutMs;
 
   /**
-   * Timeout for requests issued by the router to the network layer.
+   * Timeout for requests waiting at the router layer.
    */
   @Config(ROUTER_REQUEST_TIMEOUT_MS)
-  @Default("2000")
+  @Default("20000")
   public final int routerRequestTimeoutMs;
+
+  /**
+   * Timeout for requests waiting at the network layer.
+   */
+  @Config(ROUTER_REQUEST_NETWORK_TIMEOUT_MS)
+  @Default("10000")
+  public final int routerRequestNetworkTimeoutMs;
 
   /**
    * {@code true} if the router should tell the network layer about requests that have timed out. The network client
@@ -553,10 +573,85 @@ public class RouterConfig {
   public final int routerRequestHandlerNumOfThreads;
 
   /**
+   * If {@code true} the router will check if offline replicas could be the cause of failure before throwing not found
+   * error. If offline replicas could be the cause of failure, then router should return unavailable error.
+   */
+  @Config(ROUTER_UNAVAILABLE_DUE_TO_OFFLINE_REPLICAS)
+  @Default("false")
+  public final boolean routerUnavailableDueToOfflineReplicas;
+
+  /**
+   * If true the simple operation tracker will check if there's one replica return success, router will return unavailable error.
+   */
+  @Config(ROUTER_UNAVAILABLE_DUE_TO_SUCCESS_COUNT_IS_NON_ZERO_FOR_DELETE)
+  @Default("true")
+  public final boolean routerUnavailableDueToSuccessCountIsNonZeroForDelete;
+
+  /**
+   * Expiration time for Blob IDs stored in not-found cache. Default value is 15 seconds.
+   * Setting it to 0 would disable the cache and avoid storing any blob IDs.
+   * TODO: With PR https://github.com/linkedin/ambry/pull/2072, when operation tracker fails due to blob-not-found and
+   *  some of eligible replicas are offline during the time of operation, we differentiate it with unavailable error and
+   *  and return 503 to client instead of 404. But we seem to do it only for 'ttl_update' & 'delete' but not for 'Get'.
+   *  When this cache is introduced, it is possible that blobs are cached for not-found on 'Get' and that could interfere
+   *  with above logic for 'TTL_Update' and 'Delete' as we would return 404 instead of 503. We might need to keep this
+   *  cache disabled (by setting it to 0 in configs) until we fix to return 503 for 'Get' calls as well when replicas are
+   *  offline.
+   */
+  @Config(ROUTER_NOT_FOUND_CACHE_TTL_IN_MS)
+  @Default("15*1000")
+  public final long routerNotFoundCacheTtlInMs;
+
+  public static final String ROUTER_BLOB_METADATA_CACHE_ID = "router.blob.metadata.cache.id";
+  @Config(ROUTER_BLOB_METADATA_CACHE_ID)
+  public final String routerBlobMetadataCacheId;
+
+  public static final String ROUTER_BLOB_METADATA_CACHE_ENABLED = "router.blob.metadata.cache.enabled";
+  @Config(ROUTER_BLOB_METADATA_CACHE_ENABLED)
+  public final boolean routerBlobMetadataCacheEnabled;
+
+  public static final String ROUTER_BLOB_METADATA_CACHE_MAX_SIZE_BYTES = "router.blob.metadata.cache.max.size.bytes";
+  @Config(ROUTER_BLOB_METADATA_CACHE_MAX_SIZE_BYTES)
+  public final long routerBlobMetadataCacheMaxSizeBytes;
+  public static final long NUM_BYTES_IN_ONE_MB = (long) Math.pow(1024, 2);
+
+  public static final String ROUTER_SMALLEST_BLOB_FOR_METADATA_CACHE = "router.smallest.blob.for.metadata.cache";
+  @Config(ROUTER_SMALLEST_BLOB_FOR_METADATA_CACHE)
+  public final long routerSmallestBlobForMetadataCache;
+  public static final long NUM_BYTES_IN_ONE_TB = (long) Math.pow(1024, 4);
+
+  public static final String ROUTER_MAX_NUM_METADATA_CACHE_ENTRIES = "router.max.num.metadata.cache.entries";
+  @Config(ROUTER_MAX_NUM_METADATA_CACHE_ENTRIES)
+  public final int routerMaxNumMetadataCacheEntries;
+  public static final int MAX_NUM_METADATA_CACHE_ENTRIES_DEFAULT = 10;
+
+  /**
+   * Blobs created after this timestamp can rely on metadata chunk to get the overall status of update operations
+   * (ttl update, undelete) on the blob.
+   * This config is expected to be a temporary stop gap to improve the resiliency of update operations on a blob, until
+   * the server version changes are deployed to identify update operations that can rely on metadata chunk for the
+   * update status of the entire blob.
+   * The value of this config will be an upper bound of the timestamp when the frontend code version that updates
+   * metadata chunk last has been deployed to all frontend hosts on a cluster.
+   * A value of LONG.MAX_VALUE for this config would mean that this config is effectively disabled.
+   */
+  @Config(ROUTER_UPDATE_OP_METADATA_RELIANCE_TIMESTAMP_IN_MS)
+  public final long routerUpdateOpMetadataRelianceTimestampInMs;
+
+  /**
    * Create a RouterConfig instance.
    * @param verifiableProperties the properties map to refer to.
    */
   public RouterConfig(VerifiableProperties verifiableProperties) {
+    routerBlobMetadataCacheId =
+        verifiableProperties.getString(ROUTER_BLOB_METADATA_CACHE_ID, "routerBlobMetadataCache");
+    routerMaxNumMetadataCacheEntries =
+        verifiableProperties.getInt(ROUTER_MAX_NUM_METADATA_CACHE_ENTRIES, MAX_NUM_METADATA_CACHE_ENTRIES_DEFAULT);
+    routerBlobMetadataCacheEnabled = verifiableProperties.getBoolean(ROUTER_BLOB_METADATA_CACHE_ENABLED, false);
+    routerBlobMetadataCacheMaxSizeBytes =
+        verifiableProperties.getLong(ROUTER_BLOB_METADATA_CACHE_MAX_SIZE_BYTES, 64 * NUM_BYTES_IN_ONE_MB);
+    routerSmallestBlobForMetadataCache =
+        verifiableProperties.getLong(ROUTER_SMALLEST_BLOB_FOR_METADATA_CACHE, NUM_BYTES_IN_ONE_TB);
     routerScalingUnitCount = verifiableProperties.getIntInRange(ROUTER_SCALING_UNIT_COUNT, 1, 1, Integer.MAX_VALUE);
     routerHostname = verifiableProperties.getString(ROUTER_HOSTNAME);
     routerDatacenterName = verifiableProperties.getString(ROUTER_DATACENTER_NAME);
@@ -572,7 +667,10 @@ public class RouterConfig {
         verifiableProperties.getIntInRange(ROUTER_CONNECTIONS_WARM_UP_TIMEOUT_MS, 5000, 0, Integer.MAX_VALUE);
     routerConnectionCheckoutTimeoutMs =
         verifiableProperties.getIntInRange(ROUTER_CONNECTION_CHECKOUT_TIMEOUT_MS, 1000, 1, 5000);
-    routerRequestTimeoutMs = verifiableProperties.getIntInRange(ROUTER_REQUEST_TIMEOUT_MS, 2000, 1, 10000);
+    routerRequestTimeoutMs = verifiableProperties.getIntInRange(ROUTER_REQUEST_TIMEOUT_MS, 4000, 1,
+        MAX_OVERALL_TIMEOUT_VALUE_FOR_A_REQUEST_IN_MS);
+    routerRequestNetworkTimeoutMs = verifiableProperties.getIntInRange(ROUTER_REQUEST_NETWORK_TIMEOUT_MS, 2000, 1,
+        MAX_NETWORK_TIMEOUT_VALUE_FOR_A_REQUEST_IN_MS);
     routerDropRequestOnTimeout = verifiableProperties.getBoolean(ROUTER_DROP_REQUEST_ON_TIMEOUT, false);
     routerMaxPutChunkSizeBytes =
         verifiableProperties.getIntInRange(ROUTER_MAX_PUT_CHUNK_SIZE_BYTES, 4 * 1024 * 1024, 1, Integer.MAX_VALUE);
@@ -671,5 +769,13 @@ public class RouterConfig {
     routerRequestHandlerNumOfThreads = verifiableProperties.getInt(ROUTER_REQUEST_HANDLER_NUM_OF_THREADS, 7);
     routerStoreKeyConverterFactory = verifiableProperties.getString(ROUTER_STORE_KEY_CONVERTER_FACTORY,
         "com.github.ambry.store.StoreKeyConverterFactoryImpl");
+    routerUnavailableDueToOfflineReplicas =
+        verifiableProperties.getBoolean(ROUTER_UNAVAILABLE_DUE_TO_OFFLINE_REPLICAS, false);
+    routerUnavailableDueToSuccessCountIsNonZeroForDelete =
+        verifiableProperties.getBoolean(ROUTER_UNAVAILABLE_DUE_TO_SUCCESS_COUNT_IS_NON_ZERO_FOR_DELETE, true);
+    routerNotFoundCacheTtlInMs = verifiableProperties.getLongInRange(ROUTER_NOT_FOUND_CACHE_TTL_IN_MS, 15 * 1000L, 0,
+        ROUTER_NOT_FOUND_CACHE_MAX_TTL_IN_MS);
+    routerUpdateOpMetadataRelianceTimestampInMs = verifiableProperties.getLong(
+        ROUTER_UPDATE_OP_METADATA_RELIANCE_TIMESTAMP_IN_MS, DEFAULT_ROUTER_UPDATE_OP_METADATA_RELIANCE_TIMESTAMP_IN_MS);
   }
 }

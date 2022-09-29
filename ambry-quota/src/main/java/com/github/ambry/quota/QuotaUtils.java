@@ -15,15 +15,12 @@ package com.github.ambry.quota;
 
 import com.github.ambry.account.Account;
 import com.github.ambry.frontend.Operations;
-import com.github.ambry.messageformat.BlobInfo;
 import com.github.ambry.rest.RequestPath;
 import com.github.ambry.rest.RestMethod;
 import com.github.ambry.rest.RestRequest;
 import com.github.ambry.rest.RestUtils;
-import io.netty.handler.codec.http.HttpResponseStatus;
 import java.util.Collection;
 import java.util.HashSet;
-import java.util.Objects;
 import java.util.Set;
 
 import static com.github.ambry.rest.RestUtils.InternalKeys.*;
@@ -60,16 +57,6 @@ public class QuotaUtils {
   }
 
   /**
-   * Returns recommended {@link HttpResponseStatus} by quota manager based on throttling recommendation.
-   * @param shouldThrottle throttling recommendation.
-   * @return ThrottlePolicy.THROTTLE_HTTP_STATUS if shouldThrottle is {@code true}. ThrottlePolicy.ACCEPT_HTTP_STATUS otherwise.
-   */
-  public static HttpResponseStatus quotaRecommendedHttpResponse(boolean shouldThrottle) {
-    return shouldThrottle ? QuotaRecommendationMergePolicy.THROTTLE_HTTP_STATUS
-        : QuotaRecommendationMergePolicy.ACCEPT_HTTP_STATUS;
-  }
-
-  /**
    * @return {@code true} if the request is a read request. {@code false} otherwise.
    */
   private static boolean isReadRequest(RestRequest restRequest) {
@@ -87,16 +74,27 @@ public class QuotaUtils {
    * Build {@link QuotaChargeCallback} to handle quota compliance of requests.
    * @param restRequest {@link RestRequest} for which quota is being charged.
    * @param quotaManager {@link QuotaManager} object responsible for charging the quota.
-   * @param shouldThrottle flag indicating if request should be throttled after charging. Requests like updatettl, delete etc need not be throttled.
+   * @param isQuotaEnforcedOnRequest flag indicating if request quota should be enforced after charging. Requests like
+   *                                 updatettl, delete etc are charged, but quota is not enforced on them.
    * @return QuotaChargeCallback object.
    */
   public static QuotaChargeCallback buildQuotaChargeCallback(RestRequest restRequest, QuotaManager quotaManager,
-      boolean shouldThrottle) {
+      boolean isQuotaEnforcedOnRequest) {
     if (!quotaManager.getQuotaConfig().bandwidthThrottlingFeatureEnabled) {
-      return new RejectingQuotaChargeCallback(quotaManager, restRequest, shouldThrottle);
+      return new PostProcessQuotaChargeCallback(quotaManager, restRequest, isQuotaEnforcedOnRequest);
     } else {
-      throw new UnsupportedOperationException("Not implemented yet.");
+      return new PreProcessQuotaChargeCallback(quotaManager, restRequest);
     }
+  }
+
+  /**
+   * @param quotaChargeCallback {@link QuotaChargeCallback} object.
+   * @return {@code true} if the charge needs to happen AFTER a request is processed. {@code false} otherwise.
+   */
+  public static boolean postProcessCharge(QuotaChargeCallback quotaChargeCallback) {
+    // Bandwidth throttling based implementation of quota enforcement will need ensure quota compliance BEFORE sending
+    // the chunk request to server. Hence return false if bandwidth throttling feature is enabled.
+    return quotaChargeCallback != null && !quotaChargeCallback.getQuotaConfig().bandwidthThrottlingFeatureEnabled;
   }
 
   /*
@@ -143,5 +141,14 @@ public class QuotaUtils {
       }
     });
     return quotaResources;
+  }
+
+  /**
+   * Returns {@code true} if request should be throttled. {@code false} otherwise.
+   * @param quotaAction {@link QuotaAction} specifying the action to take for quota compliance.
+   * @return {@code true} if request should be throttled. {@code false} otherwise.
+   */
+  public static boolean shouldThrottle(QuotaAction quotaAction) {
+    return quotaAction != QuotaAction.ALLOW;
   }
 }

@@ -24,6 +24,7 @@ import com.github.ambry.commons.ByteBufferReadableStreamChannel;
 import com.github.ambry.config.FrontendConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.messageformat.BlobProperties;
+import com.github.ambry.quota.QuotaMethod;
 import com.github.ambry.quota.QuotaTestUtils;
 import com.github.ambry.rest.MockRestRequest;
 import com.github.ambry.rest.MockRestResponseChannel;
@@ -84,8 +85,8 @@ public class UndeleteHandlerTest {
   private String blobId;
 
   public UndeleteHandlerTest() {
-    FrontendMetrics metrics = new FrontendMetrics(new MetricRegistry());
     FrontendConfig config = new FrontendConfig(new VerifiableProperties(new Properties()));
+    FrontendMetrics metrics = new FrontendMetrics(new MetricRegistry(), config);
     AccountAndContainerInjector accountAndContainerInjector =
         new AccountAndContainerInjector(ACCOUNT_SERVICE, metrics, config);
     undeleteHandler =
@@ -102,7 +103,8 @@ public class UndeleteHandlerTest {
     blobId = router.putBlob(BLOB_PROPERTIES, new byte[0], channel, new PutBlobOptionsBuilder().build())
         .get(1, TimeUnit.SECONDS);
     idConverterFactory.translation = blobId;
-    router.deleteBlob(blobId, SERVICE_ID).get(1, TimeUnit.SECONDS);
+    router.deleteBlob(blobId, SERVICE_ID, null, QuotaTestUtils.createTestQuotaChargeCallback(QuotaMethod.WRITE))
+        .get(1, TimeUnit.SECONDS);
   }
 
   /**

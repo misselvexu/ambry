@@ -54,6 +54,7 @@ import java.util.Properties;
 import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
@@ -77,6 +78,7 @@ public class NonBlockingRouterTestBase {
   protected static final int MAX_PORTS_SSL = 3;
   protected static final int CHECKOUT_TIMEOUT_MS = 1000;
   protected static final int REQUEST_TIMEOUT_MS = 1000;
+  protected static final int NETWORK_TIMEOUT_MS = 500;
   protected static final int PUT_REQUEST_PARALLELISM = 3;
   protected static final int PUT_SUCCESS_TARGET = 2;
   protected static final int GET_REQUEST_PARALLELISM = 2;
@@ -85,6 +87,7 @@ public class NonBlockingRouterTestBase {
   protected static final int DELETE_SUCCESS_TARGET = 2;
   protected static final int PUT_CONTENT_SIZE = 1000;
   protected static final int USER_METADATA_SIZE = 10;
+  protected static final int NOT_FOUND_CACHE_TTL_MS = 1000;
   protected final AtomicReference<MockSelectorState> mockSelectorState = new AtomicReference<>(MockSelectorState.Good);
   protected final MockTime mockTime;
   protected final MockKeyManagementService kms;
@@ -179,6 +182,7 @@ public class NonBlockingRouterTestBase {
     properties.setProperty("router.delete.success.target", Integer.toString(DELETE_SUCCESS_TARGET));
     properties.setProperty("router.connection.checkout.timeout.ms", Integer.toString(CHECKOUT_TIMEOUT_MS));
     properties.setProperty("router.request.timeout.ms", Integer.toString(REQUEST_TIMEOUT_MS));
+    properties.setProperty("router.request.network.timeout.ms", Integer.toString(NETWORK_TIMEOUT_MS));
     properties.setProperty("router.connections.local.dc.warm.up.percentage", Integer.toString(67));
     properties.setProperty("router.connections.remote.dc.warm.up.percentage", Integer.toString(34));
     properties.setProperty("clustermap.cluster.name", "test");
@@ -186,6 +190,7 @@ public class NonBlockingRouterTestBase {
     properties.setProperty("clustermap.host.name", "localhost");
     properties.setProperty("kms.default.container.key", TestUtils.getRandomKey(128));
     properties.setProperty("router.metadata.content.version", String.valueOf(metadataContentVersion));
+    properties.setProperty("router.not.found.cache.ttl.in.ms", String.valueOf(NOT_FOUND_CACHE_TTL_MS));
     return properties;
   }
 
@@ -211,7 +216,20 @@ public class NonBlockingRouterTestBase {
     router = new NonBlockingRouter(routerConfig, routerMetrics,
         new MockNetworkClientFactory(verifiableProperties, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, serverLayout, mockTime), notificationSystem, mockClusterMap, kms, cryptoService,
-        cryptoJobHandler, accountService, mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
+        cryptoJobHandler, accountService, mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS, null);
+  }
+
+  protected void setRouterWithMetadataCache(Properties props, AmbryCacheStats ambryCacheStats)
+      throws Exception {
+    VerifiableProperties verifiableProperties = new VerifiableProperties((props));
+    routerConfig = new RouterConfig(verifiableProperties);
+    routerMetrics = new NonBlockingRouterMetrics(mockClusterMap, routerConfig);
+    AmbryCacheWithStats ambryCacheWithStats = new AmbryCacheWithStats("AmbryCacheWithStats",
+        true, routerConfig.routerMaxNumMetadataCacheEntries, routerMetrics.getMetricRegistry(), ambryCacheStats);
+    router = new NonBlockingRouter(routerConfig, routerMetrics,
+        new MockNetworkClientFactory(verifiableProperties, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
+            CHECKOUT_TIMEOUT_MS, mockServerLayout, mockTime), new LoggingNotificationSystem(), mockClusterMap, kms, cryptoService,
+        cryptoJobHandler, accountService, mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS, ambryCacheWithStats);
   }
 
   /**
@@ -222,14 +240,24 @@ public class NonBlockingRouterTestBase {
   }
 
   /**
+   * Setup test suite to perform a {@link Router#putBlob} call using random account and container ids.
+   */
+  protected void setOperationParams(int putContentSize, long ttlSecs) {
+    setOperationParams(putContentSize, ttlSecs, Utils.getRandomShort(TestUtils.RANDOM),
+        Utils.getRandomShort(TestUtils.RANDOM));
+  }
+
+  /**
    * Setup test suite to perform a {@link Router#putBlob} call.
    * @param putContentSize the size of the content to put
    * @param ttlSecs the TTL in seconds for the blob.
+   * @param accountId account id for the blob.
+   * @param containerId container id for the blob.
    */
-  protected void setOperationParams(int putContentSize, long ttlSecs) {
-    putBlobProperties = new BlobProperties(-1, "serviceId", "memberId", "contentType", false, ttlSecs,
-        Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), testEncryption, null, null,
-        null);
+  protected void setOperationParams(int putContentSize, long ttlSecs, short accountId, short containerId) {
+    putBlobProperties =
+        new BlobProperties(-1, "serviceId", "memberId", "contentType", false, ttlSecs, accountId, containerId,
+            testEncryption, null, null, null);
     putUserMetadata = new byte[USER_METADATA_SIZE];
     random.nextBytes(putUserMetadata);
     putContent = new byte[putContentSize];
@@ -528,8 +556,13 @@ public class NonBlockingRouterTestBase {
     Future<String> future =
         router.putBlob(putBlobProperties, putUserMetadata, putChannel, new PutBlobOptionsBuilder().build());
     Assert.assertTrue(future.isDone());
-    RouterException e = (RouterException) ((FutureResult<String>) future).error();
-    Assert.assertEquals(e.getErrorCode(), RouterErrorCode.RouterClosed);
+    try {
+      ((CompletableFuture<?>) future).join();
+      Assert.fail("Excepting failure");
+    } catch (Exception e) {
+      RouterException routerException = (RouterException) Utils.extractFutureExceptionCause(e);
+      Assert.assertEquals(routerException.getErrorCode(), RouterErrorCode.RouterClosed);
+    }
   }
 
   /**
@@ -563,10 +596,15 @@ public class NonBlockingRouterTestBase {
     }
     router.close();
     // check that ttl update won't work after router close
-    Future<Void> future = router.updateBlobTtl(blobId, updateServiceId, Utils.Infinite_Time);
+    CompletableFuture<Void> future = router.updateBlobTtl(blobId, updateServiceId, Utils.Infinite_Time);
     Assert.assertTrue(future.isDone());
-    RouterException e = (RouterException) ((FutureResult<Void>) future).error();
-    Assert.assertEquals(e.getErrorCode(), RouterErrorCode.RouterClosed);
+    try {
+      future.join();
+      Assert.fail("Expecting a failure");
+    } catch (Exception e) {
+      RouterException routerException = (RouterException) Utils.extractFutureExceptionCause(e);
+      Assert.assertEquals(routerException.getErrorCode(), RouterErrorCode.RouterClosed);
+    }
   }
 
   /**
@@ -618,7 +656,7 @@ public class NonBlockingRouterTestBase {
               futureResult, null, null);
           break;
         case GET:
-          final FutureResult<GetBlobResultInternal> getFutureResult = new FutureResult<>();
+          final FutureResult<GetBlobResult> getFutureResult = new FutureResult<>();
           getManager.submitGetBlobOperation(blobId.getID(), new GetBlobOptionsInternal(
               new GetBlobOptionsBuilder().operationType(GetBlobOptions.OperationType.BlobInfo).build(), false,
               routerMetrics.ageAtGet), getFutureResult::done, null);

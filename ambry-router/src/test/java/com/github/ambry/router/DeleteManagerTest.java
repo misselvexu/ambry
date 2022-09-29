@@ -13,6 +13,7 @@
  */
 package com.github.ambry.router;
 
+import com.github.ambry.account.AccountService;
 import com.github.ambry.account.InMemAccountService;
 import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.clustermap.MockClusterMap;
@@ -20,12 +21,16 @@ import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.Callback;
 import com.github.ambry.commons.LoggingNotificationSystem;
+import com.github.ambry.commons.ResponseHandler;
 import com.github.ambry.config.RouterConfig;
 import com.github.ambry.config.VerifiableProperties;
+import com.github.ambry.network.RequestInfo;
+import com.github.ambry.network.ResponseInfo;
 import com.github.ambry.network.SocketNetworkClient;
+import com.github.ambry.protocol.RequestOrResponse;
+import com.github.ambry.protocol.RequestOrResponseType;
 import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.quota.QuotaTestUtils;
-import com.github.ambry.router.RouterTestHelpers.*;
 import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.MockTime;
 import com.github.ambry.utils.SystemTime;
@@ -36,10 +41,12 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
@@ -60,6 +67,7 @@ import static org.junit.Assert.*;
 
 public class DeleteManagerTest {
   private static final int AWAIT_TIMEOUT_SECONDS = 10;
+  private static final String LOCAL_DC = "DC1";
   private Time mockTime;
   private AtomicReference<MockSelectorState> mockSelectorState;
   private MockClusterMap clusterMap;
@@ -69,7 +77,12 @@ public class DeleteManagerTest {
   private String blobIdString;
   private PartitionId partition;
   private Future<Void> future;
-  private final QuotaChargeCallback quotaChargeCallback = QuotaTestUtils.createDummyQuotaChargeEventListener();
+  private DeleteManager deleteManager;
+  private SocketNetworkClient networkClient;
+  private NonBlockingRouterMetrics routerMetrics;
+  private final AccountService accountService = new InMemAccountService(true, false);
+  private final LoggingNotificationSystem notificationSystem = new LoggingNotificationSystem();
+  private final QuotaChargeCallback quotaChargeCallback = QuotaTestUtils.createTestQuotaChargeCallback();
 
   /**
    * A checker that either asserts that a delete operation succeeds or returns the specified error code.
@@ -100,14 +113,15 @@ public class DeleteManagerTest {
   public void init() throws Exception {
     VerifiableProperties vProps = new VerifiableProperties(getNonBlockingRouterProperties());
     mockTime = new MockTime();
-    mockSelectorState = new AtomicReference<MockSelectorState>(MockSelectorState.Good);
+    mockSelectorState = new AtomicReference<>(MockSelectorState.Good);
     clusterMap = new MockClusterMap();
     serverLayout = new MockServerLayout(clusterMap);
     RouterConfig routerConfig = new RouterConfig(vProps);
-    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(clusterMap, routerConfig),
+    routerMetrics = new NonBlockingRouterMetrics(clusterMap, routerConfig);
+    router = new NonBlockingRouter(routerConfig, routerMetrics,
         new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, serverLayout, mockTime), new LoggingNotificationSystem(), clusterMap, null, null, null,
-        new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
+        new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS, null);
     List<PartitionId> mockPartitions = clusterMap.getWritablePartitionIds(MockClusterMap.DEFAULT_PARTITION_CLASS);
     partition = mockPartitions.get(ThreadLocalRandom.current().nextInt(mockPartitions.size()));
     blobId =
@@ -115,6 +129,13 @@ public class DeleteManagerTest {
             Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), partition, false,
             BlobId.BlobDataType.DATACHUNK);
     blobIdString = blobId.getID();
+    deleteManager =
+        new DeleteManager(clusterMap, new ResponseHandler(clusterMap), accountService, notificationSystem,
+            routerConfig, routerMetrics, new RouterCallback(null, new ArrayList<>()), mockTime);
+    MockNetworkClientFactory networkClientFactory =
+        new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
+            CHECKOUT_TIMEOUT_MS, serverLayout, mockTime);
+    networkClient = networkClientFactory.getNetworkClient();
   }
 
   /**
@@ -204,6 +225,25 @@ public class DeleteManagerTest {
   }
 
   /**
+   * Test for the case when delete operation fails due to quota compliance.
+   */
+  @Test
+  public void testQuotaRejected() throws Exception {
+    // Create a router with QuotaRejectionOperationController for this test.
+    router.close();
+    Properties properties = getNonBlockingRouterProperties();
+    properties.setProperty(RouterConfig.OPERATION_CONTROLLER,
+        QuotaRejectingOperationController.class.getCanonicalName());
+    VerifiableProperties vProps = new VerifiableProperties(properties);
+    RouterConfig routerConfig = new RouterConfig(vProps);
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(clusterMap, routerConfig),
+        new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
+            CHECKOUT_TIMEOUT_MS, serverLayout, mockTime), new LoggingNotificationSystem(), clusterMap, null, null, null,
+        new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS, null);
+    testWithQuotaRejection(deleteErrorCodeChecker);
+  }
+
+  /**
    * Test the case when one server store responds with {@code Blob_Authorization_Failure}, and other servers
    * respond with {@code Blob_Not_Found}. The delete operation should be able to resolve the
    * router error code as {@code Blob_Authorization_Failure}. The order of received responses is the same as
@@ -244,7 +284,7 @@ public class DeleteManagerTest {
    * @throws Exception
    */
   @Test
-  public void routerErrorCodeResolutionTest() throws Exception {
+  public void routerErrorCodeResolutionFirstSetTest() throws Exception {
     LinkedHashMap<ServerErrorCode, RouterErrorCode> codesToSetAndTest = new LinkedHashMap<>();
     // test 4 codes
     codesToSetAndTest.put(ServerErrorCode.Blob_Authorization_Failure, RouterErrorCode.BlobAuthorizationFailure);
@@ -252,9 +292,15 @@ public class DeleteManagerTest {
     codesToSetAndTest.put(ServerErrorCode.Disk_Unavailable, RouterErrorCode.AmbryUnavailable);
     codesToSetAndTest.put(ServerErrorCode.IO_Error, RouterErrorCode.UnexpectedInternalError);
     doRouterErrorCodeResolutionTest(codesToSetAndTest);
+  }
 
-    // test another 4 codes
-    codesToSetAndTest.clear();
+  /**
+   * Tests to ensure that {@link RouterErrorCode}s are properly resolved based on precedence
+   * @throws Exception
+   */
+  @Test
+  public void routerErrorCodeResolutionSecondSetTest() throws Exception {
+    LinkedHashMap<ServerErrorCode, RouterErrorCode> codesToSetAndTest = new LinkedHashMap<>();
     codesToSetAndTest.put(ServerErrorCode.Blob_Authorization_Failure, RouterErrorCode.BlobAuthorizationFailure);
     codesToSetAndTest.put(ServerErrorCode.Disk_Unavailable, RouterErrorCode.AmbryUnavailable);
     codesToSetAndTest.put(ServerErrorCode.Replica_Unavailable, RouterErrorCode.AmbryUnavailable);
@@ -280,6 +326,8 @@ public class DeleteManagerTest {
       }
     }
     for (Map.Entry<ServerErrorCode, RouterErrorCode> entity : map.entrySet()) {
+      // Reset not-found cache after each test since we are using same blob ID for all error codes
+      router.getNotFoundCache().invalidateAll();
       testWithErrorCodes(Collections.singletonMap(entity.getKey(), 9), serverLayout, entity.getValue(),
           deleteErrorCodeChecker);
     }
@@ -298,6 +346,112 @@ public class DeleteManagerTest {
     serverErrorCodes[8] = ServerErrorCode.IO_Error;
     testWithErrorCodes(serverErrorCodes, partition, serverLayout, RouterErrorCode.BlobDoesNotExist,
         deleteErrorCodeChecker);
+  }
+
+  @Test
+  public void testBlobNotFoundReturnedWhenAllReplicasReturnNotFound() throws Exception {
+    int serverCount = serverLayout.getMockServers().size();
+    List<ServerErrorCode> serverErrorCodes = Collections.nCopies(serverCount, ServerErrorCode.Blob_Not_Found);
+    setServerErrorCodes(serverErrorCodes, serverLayout);
+    RouterErrorCode expectedErrorCode = RouterErrorCode.BlobDoesNotExist;
+    FutureResult<Void> future = new FutureResult<>();
+    TestCallback<Void> callback = new TestCallback<>();
+    deleteManager.submitDeleteBlobOperation(blobIdString, LOCAL_DC, future, callback,
+        quotaChargeCallback);
+
+    router.incrementOperationsCount(1);
+    sendRequestsGetResponses(future, deleteManager);
+    assertFailureAndCheckErrorCode(future, expectedErrorCode);
+    assertEquals("There should be an Blob Not Found error", routerMetrics.blobDoesNotExistErrorCount.getCount(), 1);
+  }
+
+  /**
+   * Test the case when routerUnavailableDueToSuccessCountIsNonZero enabled, if success count is larger than zero,
+   * we should return AmbryUnavailable.
+   * if routerUnavailableDueToSuccessCountIsNonZero has been disabled, if success count is larger than zero,
+   * we should return BlobDoesNotExist.
+   * @throws Exception
+   */
+  @Test
+  public void testDeleteBlobWhenOneReplicaReturnSucceed() throws Exception {
+    deleteBlobWhenOneReplicaReturnSucceed(true);
+    deleteBlobWhenOneReplicaReturnSucceed(false);
+  }
+
+  private void deleteBlobWhenOneReplicaReturnSucceed(boolean routerUnavailableDueToSuccessCountIsNonZero)
+      throws Exception {
+    router.close();
+    Properties properties = getNonBlockingRouterProperties();
+    properties.setProperty(RouterConfig.ROUTER_UNAVAILABLE_DUE_TO_SUCCESS_COUNT_IS_NON_ZERO_FOR_DELETE,
+        Boolean.toString(routerUnavailableDueToSuccessCountIsNonZero));
+    VerifiableProperties vProps = new VerifiableProperties(properties);
+    RouterConfig routerConfig = new RouterConfig(vProps);
+    router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(clusterMap, routerConfig),
+        new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
+            CHECKOUT_TIMEOUT_MS, serverLayout, mockTime), new LoggingNotificationSystem(), clusterMap, null, null, null,
+        new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS, null);
+    deleteManager =
+        new DeleteManager(clusterMap, new ResponseHandler(clusterMap), accountService, notificationSystem, routerConfig,
+            routerMetrics, new RouterCallback(null, new ArrayList<>()), mockTime);
+    List<MockServer> serversInLocalDc = new ArrayList<>();
+    serverLayout.getMockServers().forEach(mockServer -> {
+      if (mockServer.getDataCenter().equals(LOCAL_DC)) {
+        serversInLocalDc.add(mockServer);
+      }
+    });
+    int serverCount = serverLayout.getMockServers().size();
+    List<ServerErrorCode> serverErrorCodes = Collections.nCopies(serverCount, ServerErrorCode.Blob_Not_Found);
+    setServerErrorCodes(serverErrorCodes, serverLayout);
+    for (int i = 0; i < 2; i++) {
+      serversInLocalDc.get(i).setServerErrorForAllRequests(ServerErrorCode.Disk_Unavailable);
+    }
+    serversInLocalDc.get(2).setServerErrorForAllRequests(ServerErrorCode.No_Error);
+    RouterErrorCode expectedErrorCode;
+    if (routerUnavailableDueToSuccessCountIsNonZero) {
+      expectedErrorCode = RouterErrorCode.AmbryUnavailable;
+    } else {
+      expectedErrorCode = RouterErrorCode.BlobDoesNotExist;
+    }
+    FutureResult<Void> future = new FutureResult<>();
+    TestCallback<Void> callback = new TestCallback<>();
+    deleteManager.submitDeleteBlobOperation(blobIdString, LOCAL_DC, future, callback, quotaChargeCallback);
+
+    router.incrementOperationsCount(1);
+    sendRequestsGetResponses(future, deleteManager);
+    assertFailureAndCheckErrorCode(future, expectedErrorCode);
+  }
+
+  /**
+   * Sends all the requests that the {@code manager} may have ready
+   * @param futureResult the {@link FutureResult} that tracks the operation
+   * @param manager the {@link DeleteManager} to poll for requests
+   */
+  private void sendRequestsGetResponses(FutureResult<Void> futureResult, DeleteManager manager) {
+    List<RequestInfo> requestInfoList = new ArrayList<>();
+    Set<Integer> requestsToDrop = new HashSet<>();
+    Set<RequestInfo> requestAcks = new HashSet<>();
+    while (!futureResult.isDone()) {
+      manager.poll(requestInfoList, requestsToDrop);
+      List<ResponseInfo> responseInfoList;
+      responseInfoList = networkClient.sendAndPoll(requestInfoList, requestsToDrop, AWAIT_TIMEOUT_MS);
+      for (ResponseInfo responseInfo : responseInfoList) {
+        RequestInfo requestInfo = responseInfo.getRequestInfo();
+        assertNotNull("RequestInfo is null", requestInfo);
+        if (requestAcks.contains(requestInfo)) {
+          throw new IllegalStateException("Received response more than once for a request");
+        }
+        requestAcks.add(requestInfo);
+        RequestInfo routerRequestInfo = responseInfo.getRequestInfo();
+        RequestOrResponseType type = ((RequestOrResponse) routerRequestInfo.getRequest()).getRequestType();
+        if (type == RequestOrResponseType.DeleteRequest) {
+          manager.handleResponse(responseInfo);
+        } else {
+          throw new IllegalStateException("Unrecognized request type: " + type);
+        }
+      }
+      responseInfoList.forEach(ResponseInfo::release);
+      requestInfoList.clear();
+    }
   }
 
   /**
@@ -369,7 +523,7 @@ public class DeleteManagerTest {
     router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(clusterMap, routerConfig),
         new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, serverLayout, mockTime), new LoggingNotificationSystem(), clusterMap, null, null, null,
-        new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
+        new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS, null);
     ServerErrorCode[] serverErrorCodes = new ServerErrorCode[9];
     serverErrorCodes[0] = ServerErrorCode.Blob_Not_Found;
     serverErrorCodes[1] = ServerErrorCode.Data_Corrupt;
@@ -398,8 +552,8 @@ public class DeleteManagerTest {
           @Override
           public void testAndAssert(RouterErrorCode expectedError) throws Exception {
             CountDownLatch operationCompleteLatch = new CountDownLatch(1);
-            future = router.deleteBlob(blobIdString, null, new ClientCallback(operationCompleteLatch),
-                quotaChargeCallback);
+            future =
+                router.deleteBlob(blobIdString, null, new ClientCallback(operationCompleteLatch), quotaChargeCallback);
             do {
               // increment mock time
               mockTime.sleep(1000);
@@ -472,7 +626,7 @@ public class DeleteManagerTest {
     router = new NonBlockingRouter(routerConfig, new NonBlockingRouterMetrics(clusterMap, routerConfig),
         new MockNetworkClientFactory(vProps, mockSelectorState, MAX_PORTS_PLAIN_TEXT, MAX_PORTS_SSL,
             CHECKOUT_TIMEOUT_MS, serverLayout, mockTime), new LoggingNotificationSystem(), clusterMap, null, null, null,
-        new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS);
+        new InMemAccountService(false, true), mockTime, MockClusterMap.DEFAULT_PARTITION_CLASS, null);
     blobId = new BlobId(routerConfig.routerBlobidCurrentVersion, BlobId.BlobIdType.NATIVE, (byte) 0,
         Utils.getRandomShort(TestUtils.RANDOM), Utils.getRandomShort(TestUtils.RANDOM), partition, false,
         BlobId.BlobDataType.DATACHUNK);
@@ -481,7 +635,6 @@ public class DeleteManagerTest {
     Arrays.fill(serverErrorCodes, ServerErrorCode.No_Error);
     serverErrorCodes[0] = ServerErrorCode.Blob_Not_Found;
     serverErrorCodes[1] = ServerErrorCode.Blob_Not_Found;
-    serverErrorCodes[2] = ServerErrorCode.Blob_Not_Found;
     // The first two responses are blob not found and they are from the local dc and originating dc.
     // So even if the rest of servers returns No_Error, router will not send any requests to them.
     testWithErrorCodes(serverErrorCodes, partition, serverLayout, RouterErrorCode.BlobDoesNotExist,
@@ -539,7 +692,7 @@ public class DeleteManagerTest {
   private Properties getNonBlockingRouterProperties() {
     Properties properties = new Properties();
     properties.setProperty("router.hostname", "localhost");
-    properties.setProperty("router.datacenter.name", "DC1");
+    properties.setProperty("router.datacenter.name", LOCAL_DC);
     properties.setProperty("router.delete.request.parallelism", DELETE_PARALLELISM);
     return properties;
   }

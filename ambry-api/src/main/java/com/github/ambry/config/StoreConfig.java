@@ -429,6 +429,12 @@ public class StoreConfig {
   @Default("false")
   public final boolean storeEnableCurrentInvalidSizeMetric;
 
+  @Config(storeEnableIndexDirectMemoryUsageMetricName)
+  @Default("false")
+  public final boolean storeEnableIndexDirectMemoryUsageMetric;
+  public static final String storeEnableIndexDirectMemoryUsageMetricName =
+      "store.enable.index.direct.memory.usage.metric";
+
   @Config(storeAlwaysEnableTargetIndexDuplicateCheckingName)
   @Default("false")
   public final boolean storeAlwaysEnableTargetIndexDuplicateChecking;
@@ -463,6 +469,26 @@ public class StoreConfig {
   @Config("store.disk.io.reservoir.time.window.ms")
   @Default("200")
   public final int storeDiskIoReservoirTimeWindowMs;
+
+  /**
+   * True to enable batch mode in findMissingKeys
+   */
+  @Config(storeEnableFindMissingKeysInBatchModeName)
+  @Default("false")
+  public final boolean storeEnableFindMissingKeysInBatchMode;
+  public static final String storeEnableFindMissingKeysInBatchModeName = "store.enable.find.missing.keys.in.batch.mode";
+
+  @Config(storeCacheSizeForFindMissingKeysInBatchModeName)
+  @Default("3")
+  public final int storeCacheSizeForFindMissingKeysInBatchMode;
+  public static final String storeCacheSizeForFindMissingKeysInBatchModeName =
+      "store.cache.size.for.find.missing.keys.in.batch.mode";
+
+  @Config(storeNumOfCacheMissForFindMissingKeysInBatchModeName)
+  @Default("5")
+  public final int storeNumOfCacheMissForFindMissingKeysInBatchMode;
+  public static final String storeNumOfCacheMissForFindMissingKeysInBatchModeName =
+      "store.num.of.cache.miss.for.find.missing.keys.in.batch.mode";
 
   public StoreConfig(VerifiableProperties verifiableProperties) {
 
@@ -541,8 +567,10 @@ public class StoreConfig {
         verifiableProperties.getIntInRange("store.io.error.count.to.trigger.shutdown", Integer.MAX_VALUE, 1,
             Integer.MAX_VALUE);
     storeSetFilePermissionEnabled = verifiableProperties.getBoolean("store.set.file.permission.enabled", false);
-    storeAutoCloseLastLogSegmentEnabled = verifiableProperties.getBoolean(storeAutoCloseLastLogSegmentEnabledName, false);
-    storeUnsealReplicaMinimumLagBytes = verifiableProperties.getLongInRange(storeUnsealReplicaMinimumLagBytesName, 0, 0, Long.MAX_VALUE);
+    storeAutoCloseLastLogSegmentEnabled =
+        verifiableProperties.getBoolean(storeAutoCloseLastLogSegmentEnabledName, false);
+    storeUnsealReplicaMinimumLagBytes =
+        verifiableProperties.getLongInRange(storeUnsealReplicaMinimumLagBytesName, 0, 0, Long.MAX_VALUE);
     String storeDataFilePermissionStr = verifiableProperties.getString("store.data.file.permission", "rw-rw----");
     storeDataFilePermission = PosixFilePermissions.fromString(storeDataFilePermissionStr);
     String storeOperationFilePermissionStr =
@@ -560,6 +588,8 @@ public class StoreConfig {
         verifiableProperties.getBoolean("store.enable.bucket.for.log.segment.reports", false);
     storeEnableCurrentInvalidSizeMetric =
         verifiableProperties.getBoolean("store.enable.current.invalid.size.metric", false);
+    storeEnableIndexDirectMemoryUsageMetric =
+        verifiableProperties.getBoolean(storeEnableIndexDirectMemoryUsageMetricName, false);
     storeAlwaysEnableTargetIndexDuplicateChecking =
         verifiableProperties.getBoolean(storeAlwaysEnableTargetIndexDuplicateCheckingName, false);
     storeRebuildTokenBasedOnResetKey = verifiableProperties.getBoolean("store.rebuild.token.based.on.reset.key", false);
@@ -573,5 +603,11 @@ public class StoreConfig {
             Integer.MAX_VALUE);
     storeDiskIoReservoirTimeWindowMs =
         verifiableProperties.getIntInRange("store.disk.io.reservoir.time.window.ms", 200, 0, Integer.MAX_VALUE);
+    storeEnableFindMissingKeysInBatchMode =
+        verifiableProperties.getBoolean(storeEnableFindMissingKeysInBatchModeName, false);
+    storeCacheSizeForFindMissingKeysInBatchMode =
+        verifiableProperties.getIntInRange(storeCacheSizeForFindMissingKeysInBatchModeName, 3, 1, 100);
+    storeNumOfCacheMissForFindMissingKeysInBatchMode =
+        verifiableProperties.getIntInRange(storeNumOfCacheMissForFindMissingKeysInBatchModeName, 5, 3, 100);
   }
 }

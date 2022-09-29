@@ -54,6 +54,15 @@ interface OperationTracker {
   boolean hasSucceeded();
 
   /**
+   * Return {@code true} if the blob is not found in available replicas, and there are offline replicas where blob might
+   * have existed.
+   *
+   * @return {@code true} if the operation failed because of eligible replicas' {@link TrackedRequestFinalState#NOT_FOUND} and
+   * some replicas being offline.
+   */
+  boolean maybeFailedDueToOfflineReplicas();
+
+  /**
    * Return {@code true} only if the number of NOT_FOUND responses from originating DC passes the threshold.
    * It also means hasSucceeded would return {@code false}.
    *
@@ -86,4 +95,10 @@ interface OperationTracker {
    * @return An iterator that iterates all possible and valid replicas.
    */
   Iterator<ReplicaId> getReplicaIterator();
+
+  /**
+   * Return the count of successful responses from replicates
+   * @return an {@code int} that represent the number of successful responses from replicates
+   */
+  int getSuccessCount();
 }

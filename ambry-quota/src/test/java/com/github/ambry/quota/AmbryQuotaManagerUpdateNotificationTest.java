@@ -21,7 +21,7 @@ import com.github.ambry.commons.Notifier;
 import com.github.ambry.config.AccountServiceConfig;
 import com.github.ambry.config.QuotaConfig;
 import com.github.ambry.config.VerifiableProperties;
-import com.github.ambry.quota.capacityunit.UnlimitedQuotaSource;
+import com.github.ambry.quota.capacityunit.AmbryCUQuotaSource;
 import com.github.ambry.utils.AccountTestUtils;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -53,9 +53,10 @@ public class AmbryQuotaManagerUpdateNotificationTest {
         new AccountServiceForConsumerTest(new AccountServiceConfig(verifiableProperties),
             new AccountServiceMetrics(metricRegistry), null);
     AmbryQuotaManager ambryQuotaManager =
-        new AmbryQuotaManager(quotaConfig, quotaRecommendationMergePolicy, accountService, null, metricRegistry);
-    UnlimitedQuotaSource quotaSource = (UnlimitedQuotaSource) getQuotaSourceMember(ambryQuotaManager);
-    assertTrue("updated accounts should be empty", quotaSource.getQuotaResourceList().isEmpty());
+        new AmbryQuotaManager(quotaConfig, quotaRecommendationMergePolicy, accountService, null,
+            new QuotaMetrics(metricRegistry), QuotaTestUtils.getDefaultRouterConfig());
+    AmbryCUQuotaSource quotaSource = (AmbryCUQuotaSource) getQuotaSourceMember(ambryQuotaManager);
+    assertTrue("updated accounts should be empty", quotaSource.getAllQuota().isEmpty());
 
     Set<Short> accountIdSet = new HashSet<>();
     accountIdSet.add((short) 1);
@@ -63,7 +64,7 @@ public class AmbryQuotaManagerUpdateNotificationTest {
     Map<Short, Account> idToRefAccountMap = new HashMap<>();
     AccountTestUtils.generateRefAccounts(idToRefAccountMap, new HashMap<>(), accountIdSet, 2, 3);
     accountService.notifyAccountUpdateConsumers(idToRefAccountMap.values());
-    assertEquals("Invalid size of updated accounts", quotaSource.getQuotaResourceList().size(), 2);
+    assertEquals("Invalid size of updated accounts", quotaSource.getAllQuota().size(), 2);
   }
 
   /**
@@ -73,7 +74,7 @@ public class AmbryQuotaManagerUpdateNotificationTest {
    * @throws Exception
    */
   private QuotaSource getQuotaSourceMember(AmbryQuotaManager ambryQuotaManager) throws Exception {
-    Field field = ambryQuotaManager.getClass().getDeclaredField("requestQuotaEnforcers");
+    Field field = ambryQuotaManager.getClass().getDeclaredField("quotaEnforcers");
     field.setAccessible(true);
     return new ArrayList<>((Set<QuotaEnforcer>) field.get(ambryQuotaManager)).get(0).getQuotaSource();
   }

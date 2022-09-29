@@ -15,7 +15,6 @@ package com.github.ambry.router;
 
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.PartitionId;
-import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.Callback;
 import com.github.ambry.commons.ResponseHandler;
@@ -45,7 +44,7 @@ abstract class GetOperation {
   protected final NonBlockingRouterMetrics routerMetrics;
   protected final ClusterMap clusterMap;
   protected final ResponseHandler responseHandler;
-  protected final Callback<GetBlobResultInternal> getOperationCallback;
+  protected final Callback<GetBlobResult> getOperationCallback;
   protected final BlobId blobId;
   protected final GetBlobOptionsInternal options;
   protected final KeyManagementService kms;
@@ -54,7 +53,7 @@ abstract class GetOperation {
   protected final Time time;
   protected volatile boolean operationCompleted = false;
   protected final AtomicReference<Exception> operationException = new AtomicReference<>();
-  protected GetBlobResultInternal operationResult;
+  protected GetBlobResult operationResult;
   protected final long submissionTimeMs;
   protected final boolean isEncrypted;
 
@@ -77,7 +76,7 @@ abstract class GetOperation {
    */
   GetOperation(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics, ClusterMap clusterMap,
       ResponseHandler responseHandler, BlobId blobId, GetBlobOptionsInternal options,
-      Callback<GetBlobResultInternal> getOperationCallback, KeyManagementService kms, CryptoService cryptoService,
+      Callback<GetBlobResult> getOperationCallback, KeyManagementService kms, CryptoService cryptoService,
       CryptoJobHandler cryptoJobHandler, Time time, boolean isEncrypted) {
     this.routerConfig = routerConfig;
     this.routerMetrics = routerMetrics;
@@ -99,7 +98,7 @@ abstract class GetOperation {
    * Return the {@link Callback} associated with this operation.
    * @return the {@link Callback} associated with this operation.
    */
-  Callback<GetBlobResultInternal> getCallback() {
+  Callback<GetBlobResult> getCallback() {
     return getOperationCallback;
   }
 
@@ -115,7 +114,7 @@ abstract class GetOperation {
    * Return the result of the operation.
    * @return the operation result.
    */
-  GetBlobResultInternal getOperationResult() {
+  GetBlobResult getOperationResult() {
     return operationResult;
   }
 
@@ -195,14 +194,16 @@ abstract class GetOperation {
         return 3;
       case RangeNotSatisfiable:
         return 4;
-      case AmbryUnavailable:
+      case TooManyRequests:
         return 5;
-      case UnexpectedInternalError:
+      case AmbryUnavailable:
         return 6;
-      case OperationTimedOut:
+      case UnexpectedInternalError:
         return 7;
-      case BlobDoesNotExist:
+      case OperationTimedOut:
         return 8;
+      case BlobDoesNotExist:
+        return 9;
       default:
         return Integer.MIN_VALUE;
     }
@@ -228,20 +229,21 @@ abstract class GetOperation {
    * @param partitionId the {@link PartitionId} for which a tracker is required.
    * @param datacenterId the id of datacenter in which the blob originated.
    * @param routerOperation The type of router operation used by tracker.
+   * @param blobId the {@link BlobId} for which a tracker is required.
    * @return an {@link OperationTracker} based on the config and {@code partitionId}.
    */
   protected OperationTracker getOperationTracker(PartitionId partitionId, byte datacenterId,
-      RouterOperation routerOperation) {
+      RouterOperation routerOperation, BlobId blobId) {
     OperationTracker operationTracker;
     String trackerType = routerConfig.routerGetOperationTrackerType;
     String originatingDcName = clusterMap.getDatacenterName(datacenterId);
     if (trackerType.equals(SimpleOperationTracker.class.getSimpleName())) {
       operationTracker = new SimpleOperationTracker(routerConfig, routerOperation, partitionId, originatingDcName, true,
-          routerMetrics);
+          routerMetrics, blobId);
     } else if (trackerType.equals(AdaptiveOperationTracker.class.getSimpleName())) {
       operationTracker =
           new AdaptiveOperationTracker(routerConfig, routerMetrics, routerOperation, partitionId, originatingDcName,
-              time);
+              time, blobId);
     } else {
       throw new IllegalArgumentException("Unrecognized tracker type: " + trackerType);
     }
@@ -270,24 +272,6 @@ abstract class GetOperation {
         AdaptiveOperationTracker.class.getSimpleName())) {
       throw new IllegalArgumentException("Unrecognized tracker type: " + trackerType);
     }
-  }
-}
-
-/**
- * A class that holds information about the get requests sent out.
- */
-class GetRequestInfo {
-  final ReplicaId replicaId;
-  final long startTimeMs;
-
-  /**
-   * Construct a GetRequestInfo
-   * @param replicaId the replica to which this request is being sent.
-   * @param startTimeMs the time at which this request was created.
-   */
-  GetRequestInfo(ReplicaId replicaId, long startTimeMs) {
-    this.replicaId = replicaId;
-    this.startTimeMs = startTimeMs;
   }
 }
 

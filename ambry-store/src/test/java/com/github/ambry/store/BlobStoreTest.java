@@ -75,6 +75,8 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.mockito.Mockito;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 
 import static com.github.ambry.clustermap.ClusterMapUtils.*;
 import static com.github.ambry.clustermap.ReplicaState.*;
@@ -556,6 +558,36 @@ public class BlobStoreTest {
     file.deleteOnExit();
     blobStore = createBlobStore(getMockReplicaId(file.getAbsolutePath()));
     verifyStartupFailure(blobStore, StoreErrorCodes.Initialization_Error);
+  }
+
+  @Test
+  public void storeStartupTests2() throws IOException, StoreException {
+    if (!isLogSegmented) {
+      verifyStartupFailure(store, StoreErrorCodes.Store_Already_Started);
+      return;
+    }
+
+    // Test the LogSegment null pointer issue caused by matching index segment file with wrong log segment file due to same prefix
+    // copy and generate:
+    //    0_49_18_bloom
+    //    0_49_18_index
+    //    0_49_log_temp
+    // Rename 0_0_log and related index bloom to
+    //    0_4_log
+    //    0_4_18_index
+    //    0_4_18_bloom
+    // At this moment, we have 0_4_xxx_index and also 0_49_xxx_index
+    // But only have 0_4_log. 0_49_log_temp is under compaction.
+    Files.copy(Paths.get(tempDir+"/0_0_log"), Paths.get(tempDir+"/0_49_log_temp"));
+    Files.move(Paths.get(tempDir+"/0_0_log"), Paths.get(tempDir+"/0_4_log"));
+
+    Files.copy(Paths.get(tempDir+"/0_0_18_index"), Paths.get(tempDir+"/0_49_18_index"));
+    Files.move(Paths.get(tempDir+"/0_0_18_index"), Paths.get(tempDir+"/0_4_18_index"));
+
+    Files.copy(Paths.get(tempDir+"/0_0_18_bloom"), Paths.get(tempDir+"/0_49_18_bloom"));
+    Files.move(Paths.get(tempDir+"/0_0_18_bloom"), Paths.get(tempDir+"/0_4_18_bloom"));
+
+    reloadStore();
   }
 
   /**
@@ -1812,7 +1844,13 @@ public class BlobStoreTest {
     Mockito.reset(mockStoreKeyFactory);
     StoreInfo storeInfo = testStore2.get(Collections.singletonList(id2), EnumSet.noneOf(StoreGetOptions.class));
     assertNotNull(storeInfo);
-    assertEquals("Error count should be reset", 0, testStore2.getErrorCount().get());
+    assertEquals("Error count should not be reset before reading bytes", 2, testStore2.getErrorCount().get());
+    try {
+      storeInfo.getMessageReadSet().doPrefetch(0, 0, 53);
+    } catch (IOException e) {
+      fail("Fail to read bytes from message read set");
+    }
+    assertEquals("Error count should be reset after reading bytes", 0, testStore2.getErrorCount().get());
 
     doThrow(new IOException(StoreException.IO_ERROR_STR)).when(mockStoreKeyFactory)
         .getStoreKey(any(DataInputStream.class));

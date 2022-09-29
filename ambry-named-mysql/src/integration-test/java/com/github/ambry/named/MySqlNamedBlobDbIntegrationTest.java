@@ -24,6 +24,7 @@ import com.github.ambry.commons.BlobId;
 import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.frontend.Page;
+import com.github.ambry.protocol.GetOption;
 import com.github.ambry.rest.RestServiceErrorCode;
 import com.github.ambry.rest.RestServiceException;
 import com.github.ambry.utils.TestUtils;
@@ -33,6 +34,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
@@ -131,6 +133,13 @@ public class MySqlNamedBlobDbIntegrationTest {
       assertFalse("Unexpected alreadyDeleted value", deleteResult.isAlreadyDeleted());
       checkErrorCode(() -> namedBlobDb.get(record.getAccountName(), record.getContainerName(), record.getBlobName()),
           RestServiceErrorCode.Deleted);
+      NamedBlobRecord recordFromStore =
+          namedBlobDb.get(record.getAccountName(), record.getContainerName(), record.getBlobName(),
+              GetOption.Include_Deleted_Blobs).get();
+      checkRecordsEqual(record, recordFromStore);
+      recordFromStore = namedBlobDb.get(record.getAccountName(), record.getContainerName(), record.getBlobName(),
+          GetOption.Include_All).get();
+      checkRecordsEqual(record, recordFromStore);
     }
 
     // deletes should be idempotent and additional delete calls should succeed
@@ -178,7 +187,7 @@ public class MySqlNamedBlobDbIntegrationTest {
 
     String blobId = getBlobId(account, container);
     String blobName = "name";
-    long expirationTime = System.currentTimeMillis();
+    long expirationTime = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(24);
     NamedBlobRecord record =
         new NamedBlobRecord(account.getName(), container.getName(), blobName, blobId, expirationTime);
     namedBlobDb.put(record).get();
@@ -186,6 +195,12 @@ public class MySqlNamedBlobDbIntegrationTest {
     Thread.sleep(100);
     checkErrorCode(() -> namedBlobDb.get(account.getName(), container.getName(), blobName),
         RestServiceErrorCode.Deleted);
+    NamedBlobRecord recordFromStore =
+        namedBlobDb.get(account.getName(), container.getName(), blobName, GetOption.Include_All).get();
+    assertEquals("Record does not match expectations.", record, recordFromStore);
+    recordFromStore =
+        namedBlobDb.get(account.getName(), container.getName(), blobName, GetOption.Include_Expired_Blobs).get();
+    assertEquals("Record does not match expectations.", record, recordFromStore);
 
     // replacement should succeed
     blobId = getBlobId(account, container);
@@ -229,5 +244,12 @@ public class MySqlNamedBlobDbIntegrationTest {
         }
       }
     }
+  }
+
+  private void checkRecordsEqual(NamedBlobRecord record1, NamedBlobRecord record2) {
+    assertEquals("AccountName mismatch", record1.getAccountName(), record2.getAccountName());
+    assertEquals("ContainerName mismatch", record1.getContainerName(), record2.getContainerName());
+    assertEquals("BlobName mismatch", record1.getBlobName(), record2.getBlobName());
+    assertEquals("BlobId mismatch", record1.getBlobId(), record2.getBlobId());
   }
 }

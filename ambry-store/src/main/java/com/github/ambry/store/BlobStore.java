@@ -15,6 +15,7 @@ package com.github.ambry.store;
 
 import com.codahale.metrics.Timer;
 import com.github.ambry.account.AccountService;
+import com.github.ambry.clustermap.DataNodeId;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.clustermap.ReplicaState;
 import com.github.ambry.clustermap.ReplicaStatusDelegate;
@@ -256,10 +257,10 @@ public class BlobStore implements Store {
                   metrics);
         }
         metrics.initializeIndexGauges(storeId, index, capacityInBytes, blobStoreStats,
-            config.storeEnableCurrentInvalidSizeMetric);
+            config.storeEnableCurrentInvalidSizeMetric, config.storeEnableIndexDirectMemoryUsageMetric);
         checkCapacityAndUpdateReplicaStatusDelegate();
         logger.trace("The store {} is successfully started", storeId);
-        onSuccess();
+        onSuccess("START");
         isDisabled.set(false);
         started = true;
         resolveStoreInitialState();
@@ -309,14 +310,30 @@ public class BlobStore implements Store {
         }
       }
 
-      MessageReadSet readSet = new StoreMessageReadSet(readOptions);
+      // We call onSuccess and onError in the MessageReadSet IOPHandler instead of at the end of this method call like
+      // other write methods because we are not really reading any bytes from disks in the get method, we are only
+      // returning an object that triggers the reads when in different thread.
+      // Thus we have to to call onSuccess and onError when we actually read bytes from disk in MessageReadSet.
+      MessageReadSet readSet = new StoreMessageReadSet(readOptions, new StoreMessageReadSet.IOPHandler() {
+        @Override
+        public void onSuccess() {
+          BlobStore.this.onSuccess("GET");
+        }
+
+        @Override
+        public void onError() {
+          try {
+            BlobStore.this.onError();
+          } catch (Exception e) {
+          }
+        }
+      });
       // We ensure that the metadata list is ordered with the order of the message read set view that the
       // log provides. This ensures ordering of all messages across the log and metadata from the index.
       List<MessageInfo> messageInfoList = new ArrayList<MessageInfo>(readSet.count());
       for (int i = 0; i < readSet.count(); i++) {
         messageInfoList.add(indexMessages.get(readSet.getKeyAt(i)));
       }
-      onSuccess();
       return new StoreInfo(readSet, messageInfoList);
     } catch (StoreException e) {
       if (e.getErrorCode() == StoreErrorCodes.IOError) {
@@ -520,7 +537,7 @@ public class BlobStore implements Store {
           logger.trace("All entries were absent, and were written to the store successfully");
           break;
       }
-      onSuccess();
+      onSuccess("PUT");
     } catch (StoreException e) {
       if (e.getErrorCode() == StoreErrorCodes.IOError) {
         onError();
@@ -660,7 +677,7 @@ public class BlobStore implements Store {
         }
         logger.trace("Store : {} delete has been marked in the index ", dataDir);
       }
-      onSuccess();
+      onSuccess("DELETE");
     } catch (StoreException e) {
       if (e.getErrorCode() == StoreErrorCodes.IOError) {
         onError();
@@ -776,7 +793,7 @@ public class BlobStore implements Store {
         }
         logger.trace("Store : {} ttl update has been marked in the index ", dataDir);
       }
-      onSuccess();
+      onSuccess("TTL_UPDATE");
     } catch (StoreException e) {
       if (e.getErrorCode() == StoreErrorCodes.IOError) {
         onError();
@@ -862,7 +879,7 @@ public class BlobStore implements Store {
             lifeVersionFromMessageInfo);
         blobStoreStats.handleNewUndeleteEntry(info.getStoreKey(), newUndelete, originalPut, latestValue);
       }
-      onSuccess();
+      onSuccess("UNDELETE");
       return revisedLifeVersion;
     } catch (StoreException e) {
       if (e.getErrorCode() == StoreErrorCodes.IOError) {
@@ -888,7 +905,8 @@ public class BlobStore implements Store {
         remoteTokenTracker.updateTokenFromPeerReplica(token, hostname, remoteReplicaPath);
       }
       FindInfo findInfo = index.findEntriesSince(token, maxTotalSizeOfEntries);
-      onSuccess();
+      // We don't call onSuccess here because findEntries only involves reading index entries from the index
+      // files, which have already been loaded to memory, thus there is no disk operations.
       return findInfo;
     } catch (StoreException e) {
       if (e.getErrorCode() == StoreErrorCodes.IOError) {
@@ -901,12 +919,13 @@ public class BlobStore implements Store {
   }
 
   @Override
-  public Set<StoreKey> findMissingKeys(List<StoreKey> keys) throws StoreException {
+  public Set<StoreKey> findMissingKeys(List<StoreKey> keys, DataNodeId sourceDataNodeId) throws StoreException {
     checkStarted();
     final Timer.Context context = metrics.findMissingKeysResponse.time();
     try {
-      Set<StoreKey> missingKeys = index.findMissingKeys(keys);
-      onSuccess();
+      Set<StoreKey> missingKeys =
+          config.storeEnableFindMissingKeysInBatchMode && sourceDataNodeId != null ? index.findMissingKeysInBatch(keys,
+              sourceDataNodeId.toString()) : index.findMissingKeys(keys);
       return missingKeys;
     } catch (StoreException e) {
       if (e.getErrorCode() == StoreErrorCodes.IOError) {
@@ -1146,8 +1165,10 @@ public class BlobStore implements Store {
   /**
    * If store restarted successfully or at least one operation succeeded, reset the error count.
    */
-  private void onSuccess() {
-    errorCount.getAndSet(0);
+  private void onSuccess(String method) {
+    if (errorCount.getAndSet(0) != 0) {
+      logger.info("Store {}: method {} set error count back to 0", storeId, method);
+    }
   }
 
   /**

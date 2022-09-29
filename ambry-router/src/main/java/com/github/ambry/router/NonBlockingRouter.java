@@ -15,6 +15,7 @@ package com.github.ambry.router;
 
 import com.github.ambry.account.AccountService;
 import com.github.ambry.clustermap.ClusterMap;
+import com.github.ambry.commons.AmbryCache;
 import com.github.ambry.commons.BlobId;
 import com.github.ambry.commons.Callback;
 import com.github.ambry.commons.ResponseHandler;
@@ -29,12 +30,15 @@ import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.store.StoreKey;
 import com.github.ambry.utils.Time;
 import com.github.ambry.utils.Utils;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
@@ -54,12 +58,17 @@ class NonBlockingRouter implements Router {
   private final BackgroundDeleter backgroundDeleter;
   private final int ocCount;
   // Shared with the operation managers.
+  private final RouterConfig routerConfig;
   private final NonBlockingRouterMetrics routerMetrics;
   private final KeyManagementService kms;
   private final CryptoJobHandler cryptoJobHandler;
   // Resources that need to be shut down when the router does.
   private final List<Closeable> resourcesToClose;
   private final AtomicInteger currentBackgroundOperationsCount = new AtomicInteger(0);
+  private static final int cacheMaxLimit = 1000;
+  // Cache to store blob IDs which were not found in servers recently.
+  private final Cache<String, Boolean> notFoundCache;
+  private final AmbryCache blobMetadataCache;
 
   /**
    * Constructs a NonBlockingRouter.
@@ -83,12 +92,18 @@ class NonBlockingRouter implements Router {
   NonBlockingRouter(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics,
       NetworkClientFactory networkClientFactory, NotificationSystem notificationSystem, ClusterMap clusterMap,
       KeyManagementService kms, CryptoService cryptoService, CryptoJobHandler cryptoJobHandler,
-      AccountService accountService, Time time, String defaultPartitionClass)
+      AccountService accountService, Time time, String defaultPartitionClass, AmbryCache blobMetadataCache)
       throws IOException, ReflectiveOperationException {
+    this.routerConfig = routerConfig;
     this.routerMetrics = routerMetrics;
     ResponseHandler responseHandler = new ResponseHandler(clusterMap);
     this.kms = kms;
     this.cryptoJobHandler = cryptoJobHandler;
+    /*
+     * Initialize blobMetadata cache before the operation controllers
+     * as it will be passed further down.
+     */
+    this.blobMetadataCache = blobMetadataCache;
     ocCount = routerConfig.routerScalingUnitCount;
     ocList = new ArrayList<>();
     for (int i = 0; i < ocCount; i++) {
@@ -105,6 +120,30 @@ class NonBlockingRouter implements Router {
     routerMetrics.initializeNumActiveOperationsMetrics(currentOperationsCount, currentBackgroundOperationsCount,
         backgroundDeleter.getConcurrentBackgroundDeleteOperationCount());
     resourcesToClose = new ArrayList<>();
+    // Store the blob IDs which were not found in server nodes. This would avoid querying servers again and help in reducing the load.
+    // Set the expiration time (routerConfig.routerNotFoundCacheTtlInMs) to 0 to disable the notFoundCache.
+    notFoundCache = CacheBuilder.newBuilder()
+        .maximumSize(cacheMaxLimit)
+        .expireAfterWrite(routerConfig.routerNotFoundCacheTtlInMs, TimeUnit.MILLISECONDS)
+        .recordStats()
+        .build();
+    routerMetrics.initializeNotFoundCacheMetrics(notFoundCache);
+    routerMetrics.initializeQuotaOCMetrics(ocList);
+  }
+
+  /**
+   * @return cache used to store IDs of blobs recently not found in server. Used only in tests.
+   */
+  Cache<String, Boolean> getNotFoundCache() {
+    return notFoundCache;
+  }
+
+  /**
+   * Returns an instance of blob metadata cache.
+   * @return Returns an instance of blobMetadata cache
+   */
+  public AmbryCache getBlobMetadataCache() {
+    return blobMetadataCache;
   }
 
   /**
@@ -198,17 +237,33 @@ class NonBlockingRouter implements Router {
     }
     currentOperationsCount.incrementAndGet();
     final FutureResult<GetBlobResult> futureResult = new FutureResult<>();
-    GetBlobOptionsInternal internalOptions = new GetBlobOptionsInternal(options, false, routerMetrics.ageAtGet);
+    GetBlobOptionsInternal internalOptions =
+        new GetBlobOptionsInternal(options, options.getOperationType() == GetBlobOptions.OperationType.BlobChunkIds,
+            routerMetrics.ageAtGet);
     routerMetrics.operationQueuingRate.mark();
     try {
       if (isOpen.get()) {
-        getOperationController().getBlob(blobIdStr, internalOptions, (internalResult, exception) -> {
-          GetBlobResult getBlobResult = internalResult == null ? null : internalResult.getBlobResult;
-          futureResult.done(getBlobResult, exception);
-          if (callback != null) {
-            callback.onCompletion(getBlobResult, exception);
+        if (notFoundCache.getIfPresent(blobIdStr) != null) {
+          // If we know that blob doesn't exist, complete the operation.
+          logger.info("Blob {} is known to be missing in servers", blobIdStr);
+          RouterException routerException;
+          if (options.getOperationType() == GetBlobOptions.OperationType.BlobInfo) {
+            routerException = new RouterException("GetBlobInfoOperation failed because of BlobNotFound",
+                RouterErrorCode.BlobDoesNotExist);
+          } else {
+            routerException = new RouterException("GetBlobOperation failed because of BlobNotFound",
+                RouterErrorCode.BlobDoesNotExist);
           }
-        }, quotaChargeCallback);
+          completeOperation(futureResult, callback, null, routerException);
+        } else {
+          getOperationController().getBlob(blobIdStr, internalOptions,
+              new BlobOperationCallbackWrapper<>(blobIdStr, (getBlobResult, exception) -> {
+                futureResult.done(getBlobResult, exception);
+                if (callback != null) {
+                  callback.onCompletion(getBlobResult, exception);
+                }
+              }), quotaChargeCallback);
+        }
       } else {
         boolean isEncrypted = false;
         try {
@@ -314,12 +369,20 @@ class NonBlockingRouter implements Router {
     routerMetrics.operationQueuingRate.mark();
     FutureResult<Void> futureResult = new FutureResult<>();
     if (isOpen.get()) {
-      // Can skip attemptChunkDeletes if we can determine this is not a metadata blob
-      boolean attemptChunkDeletes = isMaybeMetadataBlob(blobId);
-      getOperationController().deleteBlob(blobId, serviceId, futureResult, callback, attemptChunkDeletes,
-          quotaChargeCallback);
-      if (!attemptChunkDeletes) {
-        routerMetrics.skippedGetBlobCount.inc();
+      if (notFoundCache.getIfPresent(blobId) != null) {
+        // If we know that blob doesn't exist, complete the operation
+        logger.info("Blob {} is known to be missing in servers", blobId);
+        RouterException routerException =
+            new RouterException("DeleteOperation failed because of BlobNotFound", RouterErrorCode.BlobDoesNotExist);
+        completeOperation(futureResult, callback, null, routerException);
+      } else {
+        // Can skip attemptChunkDeletes if we can determine this is not a metadata blob
+        boolean attemptChunkDeletes = isMaybeMetadataBlob(blobId);
+        getOperationController().deleteBlob(blobId, serviceId, futureResult,
+            new BlobOperationCallbackWrapper<>(blobId, callback), attemptChunkDeletes, quotaChargeCallback);
+        if (!attemptChunkDeletes) {
+          routerMetrics.skippedGetBlobCount.inc();
+        }
       }
     } else {
       RouterException routerException =
@@ -349,7 +412,16 @@ class NonBlockingRouter implements Router {
     routerMetrics.operationQueuingRate.mark();
     FutureResult<Void> futureResult = new FutureResult<>();
     if (isOpen.get()) {
-      getOperationController().undeleteBlob(blobId, serviceId, futureResult, callback, quotaChargeCallback);
+      if (notFoundCache.getIfPresent(blobId) != null) {
+        // If we know that blob doesn't exist, complete the operation.
+        logger.info("Blob {} is known to be missing in servers", blobId);
+        RouterException routerException =
+            new RouterException("UndeleteOperation failed because of BlobNotFound", RouterErrorCode.BlobDoesNotExist);
+        completeOperation(futureResult, callback, null, routerException);
+      } else {
+        getOperationController().undeleteBlob(blobId, serviceId, futureResult,
+            new BlobOperationCallbackWrapper<>(blobId, callback), quotaChargeCallback);
+      }
     } else {
       RouterException routerException =
           new RouterException("Cannot accept operation because Router is closed", RouterErrorCode.RouterClosed);
@@ -381,8 +453,16 @@ class NonBlockingRouter implements Router {
     routerMetrics.operationQueuingRate.mark();
     FutureResult<Void> futureResult = new FutureResult<>();
     if (isOpen.get()) {
-      getOperationController().updateBlobTtl(blobId, serviceId, expiresAtMs, futureResult, callback,
-          quotaChargeCallback);
+      if (notFoundCache.getIfPresent(blobId) != null) {
+        // If we know that blob doesn't exist, complete the operation.
+        logger.info("Blob {} is known to be missing in servers", blobId);
+        RouterException routerException =
+            new RouterException("TtlUpdateOperation failed because of BlobNotFound", RouterErrorCode.BlobDoesNotExist);
+        completeOperation(futureResult, callback, null, routerException);
+      } else {
+        getOperationController().updateBlobTtl(blobId, serviceId, expiresAtMs, futureResult,
+            new BlobOperationCallbackWrapper<>(blobId, callback), quotaChargeCallback);
+      }
     } else {
       RouterException routerException =
           new RouterException("Cannot accept operation because Router is closed", RouterErrorCode.RouterClosed);
@@ -405,7 +485,7 @@ class NonBlockingRouter implements Router {
               logger.error("Background delete operation failed with exception", exception);
             }
             currentBackgroundOperationsCount.decrementAndGet();
-          }, false, null);
+          }, false, deleteRequest.getQuotaChargeCallback());
     }
   }
 
@@ -414,24 +494,33 @@ class NonBlockingRouter implements Router {
    * blob. Note that this causes the rate of gets to increase at the servers.
    * @param blobIdStr the original string of a {@link BlobId} which associated with the possibly composite blob.
    * @param serviceId the service ID associated with the original delete request.
+   * @param quotaChargeCallback {@link QuotaChargeCallback} object for performing quota compliance checks.
    */
-  void initiateChunkDeletesIfAny(final String blobIdStr, final String serviceId) throws RouterException {
-    Callback<GetBlobResultInternal> callback = (GetBlobResultInternal result, Exception exception) -> {
+  void initiateChunkDeletesIfAny(final String blobIdStr, final String serviceId,
+      final QuotaChargeCallback quotaChargeCallback) throws RouterException {
+    Callback<GetBlobResult> callback = (GetBlobResult result, Exception exception) -> {
       if (exception != null) {
         // It is expected that these requests will not always succeed. For example, this may have been triggered by a
         // duplicate delete and the blob could have already been hard deleted, so the deserialization can fail, or the
         // blob could have been garbage collected and not found at all and so on.
         logger.trace("Encountered exception when attempting to get chunks of a possibly composite deleted blob {} ",
             blobIdStr, exception);
-      } else if (result.getBlobResult != null) {
+      } else if (result.getBlobDataChannel() != null) {
         logger.error("Unexpected result returned by background get operation to fetch chunk ids.");
-      } else if (result.storeKeys != null) {
-        List<BackgroundDeleteRequest> deleteRequests = new ArrayList<>(result.storeKeys.size());
-        for (StoreKey storeKey : result.storeKeys) {
+      } else if (result.getBlobChunkIds() != null) {
+        List<StoreKey> blobChunkIds = result.getBlobChunkIds();
+        List<BackgroundDeleteRequest> deleteRequests = new ArrayList<>(blobChunkIds.size());
+        for (StoreKey storeKey : blobChunkIds) {
           logger.trace("Initiating delete of chunk blob: {}", storeKey);
-          deleteRequests.add(new BackgroundDeleteRequest(storeKey, serviceId));
+          deleteRequests.add(new BackgroundDeleteRequest(storeKey, serviceId, quotaChargeCallback));
         }
         initiateBackgroundDeletes(deleteRequests);
+        if (blobMetadataCache != null) {
+          boolean deleteResult = blobMetadataCache.deleteObject(blobIdStr);
+          logger.debug("[{}] Issued delete-metadata for blobId = {}, reason = Background delete operation, result = {}", blobMetadataCache.getCacheId(),
+              blobIdStr, deleteResult);
+
+        }
       }
       currentBackgroundOperationsCount.decrementAndGet();
     };
@@ -441,7 +530,7 @@ class NonBlockingRouter implements Router {
         .getOption(GetOption.Include_All)
         .build();
     GetBlobOptionsInternal optionsInternal = new GetBlobOptionsInternal(options, true, routerMetrics.ageAtDelete);
-    backgroundDeleter.getBlob(blobIdStr, optionsInternal, callback, null);
+    backgroundDeleter.getBlob(blobIdStr, optionsInternal, callback, quotaChargeCallback);
   }
 
   /**
@@ -578,6 +667,39 @@ class NonBlockingRouter implements Router {
    */
   int getBackgroundOperationsCount() {
     return currentBackgroundOperationsCount.get();
+  }
+
+  /**
+   * Wrapper for callbacks provided to router operations to intercept the responses and do operations such as keeping
+   * track of errors, etc. Currently, it caches the blob IDs which were not found in the servers to avoid querying them
+   * again for a configurable duration.
+   */
+  protected class BlobOperationCallbackWrapper<T> implements Callback<T> {
+
+    private final String blobId;
+    private final Callback<T> callback;
+
+    /**
+     * Creates an instance of BlobOperationCallbackWrapper with the given {@code callback}.
+     * @param blobId Blob Id on which operation is requested.
+     * @param callback the {@link Callback} to invoke on operation completion.
+     */
+    public BlobOperationCallbackWrapper(String blobId, Callback<T> callback) {
+      this.blobId = blobId;
+      this.callback = callback;
+    }
+
+    @Override
+    public void onCompletion(T result, Exception exception) {
+      // If blob doesn't exist, add it to notFoundCache to avoid querying server nodes again.
+      if (exception instanceof RouterException && ((RouterException) exception).getErrorCode()
+          .equals(RouterErrorCode.BlobDoesNotExist)) {
+        notFoundCache.put(blobId, true);
+      }
+      if (callback != null) {
+        callback.onCompletion(result, exception);
+      }
+    }
   }
 }
 

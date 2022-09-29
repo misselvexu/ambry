@@ -20,6 +20,7 @@ import com.github.ambry.clustermap.DiskId;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.clustermap.Resource;
+import com.github.ambry.commons.BlobId;
 import com.github.ambry.config.RouterConfig;
 import com.github.ambry.utils.CachedHistogram;
 import com.github.ambry.utils.Pair;
@@ -70,7 +71,21 @@ class AdaptiveOperationTracker extends SimpleOperationTracker {
    */
   AdaptiveOperationTracker(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics,
       RouterOperation routerOperation, PartitionId partitionId, String originatingDcName, Time time) {
-    super(routerConfig, routerOperation, partitionId, originatingDcName, true, routerMetrics);
+    this(routerConfig, routerMetrics, routerOperation, partitionId, originatingDcName, time, null);
+  }
+  /**
+   * Constructs an {@link AdaptiveOperationTracker}
+   * @param routerConfig The {@link RouterConfig} containing the configs for operation tracker.
+   * @param routerMetrics The {@link NonBlockingRouterMetrics} that contains histograms used by this operation tracker.
+   * @param routerOperation The {@link RouterOperation} which {@link AdaptiveOperationTracker} is associated with.
+   * @param partitionId The partition on which the operation is performed.
+   * @param originatingDcName name of originating DC whose replicas should be tried first.
+   * @param blobId {@link BlobId}, if available, for the operation.
+   * @param time the {@link Time} instance to use.
+   */
+  AdaptiveOperationTracker(RouterConfig routerConfig, NonBlockingRouterMetrics routerMetrics,
+      RouterOperation routerOperation, PartitionId partitionId, String originatingDcName, Time time, BlobId blobId) {
+    super(routerConfig, routerOperation, partitionId, originatingDcName, true, routerMetrics, blobId);
     this.routerConfig = routerConfig;
     this.time = time;
     this.localDcHistogram = getWholeDcTracker(routerOperation, true);
@@ -81,21 +96,19 @@ class AdaptiveOperationTracker extends SimpleOperationTracker {
       localDcResourceToHistogram = getResourceToLatencyMap(routerOperation, true);
       crossDcResourceToHistogram = getResourceToLatencyMap(routerOperation, false);
     }
-    if (diskReplicaParallelism > routerConfig.routerOperationTrackerMaxInflightRequests) {
+    if (replicaParallelism > routerConfig.routerOperationTrackerMaxInflightRequests) {
       throw new IllegalArgumentException(String.format(
-          "Operation tracker disk replica parallelism (%s) is larger than adaptive tracker max inflight number (%s)",
-          diskReplicaParallelism, routerConfig.routerOperationTrackerMaxInflightRequests));
-    }
-    if (cloudReplicaParallelism > routerConfig.routerOperationTrackerMaxInflightRequests) {
-      throw new IllegalArgumentException(String.format(
-          "Operation tracker cloud replica parallelism (%s) is larger than adaptive tracker max inflight number (%s)",
-          diskReplicaParallelism, routerConfig.routerOperationTrackerMaxInflightRequests));
+          "Operation tracker replica parallelism (%s) is larger than adaptive tracker max inflight number (%s)",
+          replicaParallelism, routerConfig.routerOperationTrackerMaxInflightRequests));
     }
   }
 
   @Override
   public void onResponse(ReplicaId replicaId, TrackedRequestFinalState trackedRequestFinalState) {
     super.onResponse(replicaId, trackedRequestFinalState);
+    if (trackedRequestFinalState == TrackedRequestFinalState.QUOTA_REJECTED) {
+      return;
+    }
     long elapsedTime;
     if (unexpiredRequestSendTimes.containsKey(replicaId)) {
       elapsedTime = time.milliseconds() - unexpiredRequestSendTimes.remove(replicaId).getSecond();
@@ -107,8 +120,8 @@ class AdaptiveOperationTracker extends SimpleOperationTracker {
       getLatencyHistogram(replicaId).update(elapsedTime);
       if (routerConfig.routerOperationTrackerMetricScope != OperationTrackerScope.Datacenter) {
         // This is only used to report whole datacenter histogram for monitoring purpose
-        Histogram histogram =
-            replicaId.getDataNodeId().getDatacenterName().equals(datacenterName) ? localDcHistogram : crossDcHistogram;
+        Histogram histogram = replicaId.getDataNodeId().getDatacenterName().equals(datacenterName) ? localDcHistogram
+            : crossDcHistogram;
         histogram.update(elapsedTime);
       }
     }
@@ -283,7 +296,6 @@ class AdaptiveOperationTracker extends SimpleOperationTracker {
         }
       }
       unexpiredRequestSendTimes.put(lastReturnedByIterator, new Pair<>(false, time.milliseconds()));
-      inFlightReplicaType = lastReturnedByIterator.getReplicaType();
       inflightCount++;
     }
 
@@ -303,7 +315,7 @@ class AdaptiveOperationTracker extends SimpleOperationTracker {
       if (routerConfig.routerAdaptiveOperationTrackerWaitingForResponse) {
         int parallelism = getCurrentParallelism();
         int successCount = getSuccessCount();
-        int successTarget = getSuccessTarget(inFlightReplicaType);
+        int successTarget = getSuccessTarget();
         return inflightCount < parallelism && successCount + inflightCount < successTarget;
       } else {
         return inflightCount < getCurrentParallelism();

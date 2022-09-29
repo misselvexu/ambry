@@ -13,10 +13,10 @@
  */
 package com.github.ambry.tools.admin;
 
-import com.azure.storage.blob.BlobServiceClient;
+import com.azure.storage.blob.BlobServiceAsyncClient;
 import com.azure.storage.blob.models.BlobStorageException;
 import com.azure.storage.blob.models.ListBlobContainersOptions;
-import com.azure.storage.blob.specialized.BlockBlobClient;
+import com.azure.storage.blob.specialized.BlockBlobAsyncClient;
 import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.cloud.azure.AzureBlobDataAccessor;
 import com.github.ambry.cloud.azure.AzureBlobLayoutStrategy;
@@ -27,6 +27,7 @@ import com.github.ambry.config.ClusterMapConfig;
 import com.github.ambry.config.ReplicationConfig;
 import com.github.ambry.config.VerifiableProperties;
 import com.github.ambry.tools.util.ToolUtils;
+import com.github.ambry.utils.Utils;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -37,7 +38,7 @@ import org.slf4j.LoggerFactory;
  * Very dangerous tool.  Please know what you're doing and wear a hard hat at all times.
  * Required properties:
  *  - "azure.storage.connection.string" for the storage account.
- *  - "cosmos.endpoint", "cosmos.collection.link", "cosmos.key" (set to any nonempty value)
+ *  - "cosmos.endpoint", "cosmos.database", "cosmos.collection" , "cosmos.key" (set to any nonempty value)
  *  - "clustermap.cluster.name" used to restrict blob container name search (e.g. "main-123")
  * Optional properties:
  *  - "vcr.proxy.host" name of the proxy host to tunnel through.
@@ -46,7 +47,7 @@ import org.slf4j.LoggerFactory;
 public class AzureTokenResetTool {
 
   private static final Logger logger = LoggerFactory.getLogger(AzureTokenResetTool.class);
-  private static BlobServiceClient storageClient;
+  private static BlobServiceAsyncClient storageAsyncClient;
 
   public static void main(String[] args) {
     String commandName = AzureTokenResetTool.class.getSimpleName();
@@ -59,7 +60,7 @@ public class AzureTokenResetTool {
       AzureBlobLayoutStrategy blobLayoutStrategy = new AzureBlobLayoutStrategy(clusterName, azureCloudConfig);
       AzureBlobDataAccessor dataAccessor =
           new AzureBlobDataAccessor(cloudConfig, azureCloudConfig, blobLayoutStrategy, azureMetrics);
-      storageClient = dataAccessor.getStorageClient();
+      storageAsyncClient = dataAccessor.getStorageClient();
 
       int tokensDeleted = resetTokens(clusterName);
       logger.info("Deleted tokens for {} partitions", tokensDeleted);
@@ -79,18 +80,20 @@ public class AzureTokenResetTool {
   public static int resetTokens(String containerPrefix) throws BlobStorageException {
     AtomicInteger tokensDeleted = new AtomicInteger(0);
     ListBlobContainersOptions listOptions = new ListBlobContainersOptions().setPrefix(containerPrefix);
-    storageClient.listBlobContainers(listOptions, null).iterator().forEachRemaining(blobContainer -> {
-      BlockBlobClient blobClient = storageClient.getBlobContainerClient(blobContainer.getName())
-          .getBlobClient(ReplicationConfig.REPLICA_TOKEN_FILE_NAME)
-          .getBlockBlobClient();
+    storageAsyncClient.listBlobContainers(listOptions).toIterable().forEach(blobContainerItem -> {
+      BlockBlobAsyncClient blockBlobAsyncClient =
+          storageAsyncClient.getBlobContainerAsyncClient(blobContainerItem.getName())
+              .getBlobAsyncClient(ReplicationConfig.REPLICA_TOKEN_FILE_NAME)
+              .getBlockBlobAsyncClient();
       try {
-        if (blobClient.exists()) {
-          blobClient.delete();
+        if (blockBlobAsyncClient.exists().toFuture().join()) {
+          blockBlobAsyncClient.delete().toFuture().join();
           tokensDeleted.incrementAndGet();
-          logger.info("Deleted token for partition {}", blobContainer.getName());
+          logger.info("Deleted token for partition {}", blobContainerItem.getName());
         }
-      } catch (Exception ex) {
-        logger.error("Failed delete for {}", blobContainer.getName(), ex);
+      } catch (Exception exception) {
+        exception = Utils.extractFutureExceptionCause(exception);
+        logger.error("Failed delete for {}", blobContainerItem.getName(), exception);
       }
     });
     return tokensDeleted.get();

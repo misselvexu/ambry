@@ -18,6 +18,7 @@ import com.codahale.metrics.MetricRegistry;
 import com.github.ambry.clustermap.ClusterMap;
 import com.github.ambry.clustermap.ClusterParticipant;
 import com.github.ambry.clustermap.DataNodeId;
+import com.github.ambry.clustermap.DiskId;
 import com.github.ambry.clustermap.HardwareState;
 import com.github.ambry.clustermap.PartitionId;
 import com.github.ambry.clustermap.PartitionState;
@@ -25,6 +26,7 @@ import com.github.ambry.clustermap.ReplicaId;
 import com.github.ambry.clustermap.ReplicaState;
 import com.github.ambry.clustermap.ReplicaStatusDelegate;
 import com.github.ambry.commons.ServerMetrics;
+import com.github.ambry.config.DiskManagerConfig;
 import com.github.ambry.config.ServerConfig;
 import com.github.ambry.network.NetworkRequest;
 import com.github.ambry.network.RequestResponseChannel;
@@ -32,6 +34,7 @@ import com.github.ambry.network.ServerNetworkResponseMetrics;
 import com.github.ambry.notification.NotificationSystem;
 import com.github.ambry.protocol.AdminRequest;
 import com.github.ambry.protocol.AdminResponse;
+import com.github.ambry.protocol.AdminResponseWithContent;
 import com.github.ambry.protocol.AmbryRequests;
 import com.github.ambry.protocol.BlobStoreControlAdminRequest;
 import com.github.ambry.protocol.CatchupStatusAdminRequest;
@@ -43,6 +46,8 @@ import com.github.ambry.replication.FindTokenHelper;
 import com.github.ambry.replication.ReplicationAPI;
 import com.github.ambry.replication.ReplicationManager;
 import com.github.ambry.store.BlobStore;
+import com.github.ambry.store.DiskHealthStatus;
+import com.github.ambry.store.DiskManager;
 import com.github.ambry.store.StorageManager;
 import com.github.ambry.store.Store;
 import com.github.ambry.store.StoreException;
@@ -51,12 +56,17 @@ import com.github.ambry.store.StoreKeyFactory;
 import com.github.ambry.utils.SystemTime;
 import java.io.DataInputStream;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import org.json.JSONArray;
+import org.json.JSONObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -76,6 +86,7 @@ public class AmbryServerRequests extends AmbryRequests {
           RequestOrResponseType.UndeleteRequest);
   private static final Logger logger = LoggerFactory.getLogger(AmbryServerRequests.class);
   private final ServerConfig serverConfig;
+  private final DiskManagerConfig diskManagerConfig;
   private final StatsManager statsManager;
   private final ClusterParticipant clusterParticipant;
   private final ConcurrentHashMap<RequestOrResponseType, Set<PartitionId>> requestsDisableInfo =
@@ -84,10 +95,11 @@ public class AmbryServerRequests extends AmbryRequests {
   AmbryServerRequests(StoreManager storeManager, RequestResponseChannel requestResponseChannel, ClusterMap clusterMap,
       DataNodeId nodeId, MetricRegistry registry, ServerMetrics serverMetrics, FindTokenHelper findTokenHelper,
       NotificationSystem operationNotification, ReplicationAPI replicationEngine, StoreKeyFactory storeKeyFactory,
-      ServerConfig serverConfig, StoreKeyConverterFactory storeKeyConverterFactory, StatsManager statsManager,
-      ClusterParticipant clusterParticipant) {
+      ServerConfig serverConfig, DiskManagerConfig diskManagerConfig, StoreKeyConverterFactory storeKeyConverterFactory,
+      StatsManager statsManager, ClusterParticipant clusterParticipant) {
     super(storeManager, requestResponseChannel, clusterMap, nodeId, registry, serverMetrics, findTokenHelper,
         operationNotification, replicationEngine, storeKeyFactory, storeKeyConverterFactory);
+    this.diskManagerConfig = diskManagerConfig;
     this.serverConfig = serverConfig;
     this.statsManager = statsManager;
     this.clusterParticipant = clusterParticipant;
@@ -213,6 +225,15 @@ public class AmbryServerRequests extends AmbryRequests {
           responseSendTimeHistogram = metrics.blobStoreControlResponseSendTimeInMs;
           requestTotalTimeHistogram = metrics.blobStoreControlRequestTotalTimeInMs;
           response = handleBlobStoreControlRequest(requestStream, adminRequest);
+          break;
+        case HealthCheck:
+          metrics.healthCheckRequestQueueTimeInMs.update(requestQueueTime);
+          metrics.healthCheckRequestRate.mark();
+          processingTimeHistogram = metrics.healthCheckRequestQueueTimeInMs;
+          responseQueueTimeHistogram = metrics.healthCheckRequestQueueTimeInMs;
+          responseSendTimeHistogram = metrics.healthCheckResponseSendTimeInMs;
+          requestTotalTimeHistogram = metrics.healthCheckRequestTotalTimeInMs;
+          response = handleHealthCheckRequest(requestStream, adminRequest);
           break;
       }
     } catch (Exception e) {
@@ -397,6 +418,83 @@ public class AmbryServerRequests extends AmbryRequests {
       logger.debug("The partition Id should not be null.");
     }
     return new AdminResponse(adminRequest.getCorrelationId(), adminRequest.getClientId(), error);
+  }
+
+  /**
+   * Handles {@link com.github.ambry.protocol.AdminRequestOrResponseType#HealthCheck}.
+   * @param requestStream the serialized bytes of the request.
+   * @param adminRequest the {@link AdminRequest} received.
+   * @return the {@link AdminResponse} to the request.
+   * @throws IOException if there is any I/O error reading from the {@code requestStream}.
+   */
+  private AdminResponse handleHealthCheckRequest(DataInputStream requestStream, AdminRequest adminRequest)
+      throws StoreException, IOException {
+    ServerHealthStatus serverHealthStatus = this.storeManager instanceof StorageManager ? ServerHealthStatus.GOOD
+        : ServerHealthStatus.BAD; //used to determine if the server is ever unhealthy
+    JSONArray brokenDisks = new JSONArray();        // indicate which disks didn't pass the disk healthcheck
+    JSONArray unstablePartitions = new JSONArray(); // indicate which partitions aren't in leader/standby state
+
+    if (this.storeManager instanceof StorageManager) {
+      StorageManager storageManager = (StorageManager) this.storeManager;
+
+      //Finds all partitions on this host
+      List<PartitionId> partitionsInThisHost = Collections.list(storageManager.getPartitionToDiskManager().keys());
+
+      /*
+       Checks if the Host's BlobStore exists,started and is Leader/Standby ReplicaState for all Partitions
+       this Host is apart of
+       */
+      for (PartitionId partitionId : partitionsInThisHost) {
+        BlobStore hostBlobStore = (BlobStore) storageManager.getStore(partitionId);
+
+        //if any fail, this host isn't healthy
+        if (hostBlobStore == null || !hostBlobStore.isStarted() || (
+            (hostBlobStore.getCurrentState() != ReplicaState.STANDBY) && (hostBlobStore.getCurrentState()
+                != ReplicaState.LEADER))) {
+
+          JSONObject unstablePartition = new JSONObject();
+          unstablePartition.put("partitionId", partitionId);
+          unstablePartition.put("reason", hostBlobStore != null ? hostBlobStore.getCurrentState() : "Missing");
+          unstablePartitions.put(unstablePartition);
+        }
+      }
+
+      /*
+       Checks if every disk that's assigned to a partition is also mounted and disk is healthy
+       */
+      if (diskManagerConfig.diskManagerDiskHealthCheckEnabled) {
+        HashSet<DiskManager> partitionsDiskManagers =
+            new HashSet<>(storageManager.getPartitionToDiskManager().values());
+        for (Map.Entry<DiskId, DiskManager> entry : storageManager.getDiskToDiskManager().entrySet()) {
+          DiskManager mountedDiskManager = entry.getValue();
+
+          //Checks Disk healthchecking is enabled and
+          // if a disk manager is assigned to a partition and isn't healthy then store it as part of the response
+          if (partitionsDiskManagers.contains(mountedDiskManager)
+              && mountedDiskManager.getDiskHealthStatus() != DiskHealthStatus.HEALTHY) {
+
+            JSONObject brokenDisk = new JSONObject();
+            brokenDisk.put("disk", entry.getKey().getMountPath());
+            brokenDisk.put("reason", mountedDiskManager.getDiskHealthStatus());
+            brokenDisks.put(brokenDisk);
+          }
+        }
+      }
+    }
+    //if there are any issues on the partition or disk state then considered BAD
+    serverHealthStatus =
+        unstablePartitions.length() > 0 || brokenDisks.length() > 0 ? ServerHealthStatus.BAD : serverHealthStatus;
+
+    //Initializing the content of the response as a json
+    JSONObject contentJSON = new JSONObject();
+    contentJSON.put("health", serverHealthStatus);
+    contentJSON.put("brokenDisks", brokenDisks);
+    contentJSON.put("unstablePartitions", unstablePartitions);
+
+    byte[] content = contentJSON.toString().getBytes(StandardCharsets.UTF_8);
+    ServerErrorCode error = ServerErrorCode.No_Error;
+
+    return new AdminResponseWithContent(adminRequest.getCorrelationId(), adminRequest.getClientId(), error, content);
   }
 
   /**

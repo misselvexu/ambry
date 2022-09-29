@@ -13,16 +13,17 @@
  */
 package com.github.ambry.cloud.azure;
 
+import com.azure.cosmos.CosmosException;
 import com.codahale.metrics.Timer;
 import com.github.ambry.cloud.CloudBlobMetadata;
 import com.github.ambry.cloud.FindResult;
 import com.github.ambry.replication.FindToken;
 import com.github.ambry.utils.Utils;
-import com.microsoft.azure.cosmosdb.DocumentClientException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -157,11 +158,11 @@ public final class CosmosChangeFeedBasedReplicationFeed implements AzureReplicat
    * @param partitionPath Partition for which change feed entries have to be returned.
    * @return {@link FindResult} instance that contains updated {@link FindToken} object which can act as a bookmark for
    * subsequent requests, and {@link List} of {@link CloudBlobMetadata} entries.
-   * @throws DocumentClientException if any cosmos query encounters error.
+   * @throws CosmosException if any cosmos query encounters error.
    */
   @Override
   public FindResult getNextEntriesAndUpdatedToken(FindToken curFindToken, long maxTotalSizeOfEntries,
-      String partitionPath) throws DocumentClientException {
+      String partitionPath) throws CosmosException {
     Timer.Context operationTimer = azureMetrics.replicationFeedQueryTime.time();
     try {
       List<CloudBlobMetadata> nextEntries = new ArrayList<>();
@@ -254,7 +255,7 @@ public final class CosmosChangeFeedBasedReplicationFeed implements AzureReplicat
    * @return {@link ChangeFeedCacheEntry} object representing new cache entry.
    */
   private ChangeFeedCacheEntry getNextChangeFeed(String partitionId, String startRequestContinuationToken)
-      throws DocumentClientException {
+      throws CosmosException {
     return getNextChangeFeed(partitionId, startRequestContinuationToken, UUID.randomUUID().toString());
   }
 
@@ -266,12 +267,20 @@ public final class CosmosChangeFeedBasedReplicationFeed implements AzureReplicat
    * @return {@link ChangeFeedCacheEntry} object representing new cache entry.
    */
   private ChangeFeedCacheEntry getNextChangeFeed(String partitionId, String startRequestContinuationToken,
-      String cacheSessionId) throws DocumentClientException {
+      String cacheSessionId) throws CosmosException {
     List<CloudBlobMetadata> changeFeedEntries = new ArrayList<>(defaultCacheSize);
-    String newRequestContinuationToken =
-        cosmosDataAccessor.queryChangeFeed(startRequestContinuationToken, defaultCacheSize, changeFeedEntries,
-            partitionId, azureMetrics.changeFeedQueryTime);
-    return new ChangeFeedCacheEntry(startRequestContinuationToken, newRequestContinuationToken, cacheSessionId,
-        changeFeedEntries, partitionId);
+    try {
+      String newRequestContinuationToken =
+          cosmosDataAccessor.queryChangeFeedAsync(startRequestContinuationToken, defaultCacheSize, changeFeedEntries,
+              partitionId, azureMetrics.changeFeedQueryTime).join();
+      return new ChangeFeedCacheEntry(startRequestContinuationToken, newRequestContinuationToken, cacheSessionId,
+          changeFeedEntries, partitionId);
+    } catch (CompletionException e) {
+      Exception ex = Utils.extractFutureExceptionCause(e);
+      if (ex instanceof CosmosException) {
+        throw ((CosmosException) ex);
+      }
+      throw new RuntimeException("Error getting change feed for partitionId " + partitionId, ex);
+    }
   }
 }

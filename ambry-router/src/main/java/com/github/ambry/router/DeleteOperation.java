@@ -26,11 +26,12 @@ import com.github.ambry.protocol.DeleteRequest;
 import com.github.ambry.protocol.DeleteResponse;
 import com.github.ambry.quota.QuotaChargeCallback;
 import com.github.ambry.quota.QuotaException;
+import com.github.ambry.quota.QuotaUtils;
 import com.github.ambry.server.ServerErrorCode;
 import com.github.ambry.utils.Time;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -62,7 +63,7 @@ class DeleteOperation {
   // The operation tracker that tracks the state of this operation.
   private final OperationTracker operationTracker;
   // A map used to find inflight requests using a correlation id.
-  private final Map<Integer, DeleteRequestInfo> deleteRequestInfos;
+  private final Map<Integer, RequestInfo> deleteRequestInfos;
   // The result of this operation to be set into FutureResult.
   private final Void operationResult = null;
   private final QuotaChargeCallback quotaChargeCallback;
@@ -99,13 +100,14 @@ class DeleteOperation {
     this.time = time;
     this.quotaChargeCallback = quotaChargeCallback;
     this.deletionTimeMs = time.milliseconds();
-    this.deleteRequestInfos = new TreeMap<Integer, DeleteRequestInfo>();
+    this.deleteRequestInfos = new LinkedHashMap<>();
     byte blobDcId = blobId.getDatacenterId();
     String originatingDcName = clusterMap.getDatacenterName(blobDcId);
     this.operationTracker =
         new SimpleOperationTracker(routerConfig, RouterOperation.DeleteOperation, blobId.getPartition(),
-            originatingDcName, false, routerMetrics);
-    operationQuotaCharger = new OperationQuotaCharger(quotaChargeCallback, blobId, this.getClass().getSimpleName());
+            originatingDcName, false, routerMetrics, blobId);
+    operationQuotaCharger =
+        new OperationQuotaCharger(quotaChargeCallback, blobId, this.getClass().getSimpleName(), routerMetrics);
   }
 
   /**
@@ -131,8 +133,10 @@ class DeleteOperation {
       String hostname = replica.getDataNodeId().getHostname();
       Port port = RouterUtils.getPortToConnectTo(replica, routerConfig.routerEnableHttp2NetworkClient);
       DeleteRequest deleteRequest = createDeleteRequest();
-      deleteRequestInfos.put(deleteRequest.getCorrelationId(), new DeleteRequestInfo(time.milliseconds(), replica));
-      RequestInfo requestInfo = new RequestInfo(hostname, port, deleteRequest, replica, operationQuotaCharger);
+      RequestInfo requestInfo =
+          new RequestInfo(hostname, port, deleteRequest, replica, operationQuotaCharger, time.milliseconds(),
+              routerConfig.routerRequestNetworkTimeoutMs, routerConfig.routerRequestTimeoutMs);
+      deleteRequestInfos.put(deleteRequest.getCorrelationId(), requestInfo);
       requestRegistrationCallback.registerRequestToSend(this, requestInfo);
       replicaIterator.remove();
       if (RouterUtils.isRemoteReplica(routerConfig, replica)) {
@@ -167,14 +171,19 @@ class DeleteOperation {
    */
   void handleResponse(ResponseInfo responseInfo, DeleteResponse deleteResponse) {
     DeleteRequest deleteRequest = (DeleteRequest) responseInfo.getRequestInfo().getRequest();
-    DeleteRequestInfo deleteRequestInfo = deleteRequestInfos.remove(deleteRequest.getCorrelationId());
+    RequestInfo deleteRequestInfo = deleteRequestInfos.remove(deleteRequest.getCorrelationId());
     // deleteRequestInfo can be null if this request was timed out before this response is received. No
     // metric is updated here, as corresponding metrics have been updated when the request was timed out.
     if (deleteRequestInfo == null) {
       return;
     }
-    ReplicaId replica = deleteRequestInfo.replica;
-    long requestLatencyMs = time.milliseconds() - deleteRequestInfo.startTimeMs;
+    ReplicaId replica = deleteRequestInfo.getReplicaId();
+    if (responseInfo.isQuotaRejected()) {
+      processQuotaRejectedResponse(deleteRequest.getCorrelationId(), replica);
+      return;
+    }
+    // Track the over all time taken for the response since the creation of the request.
+    long requestLatencyMs = time.milliseconds() - deleteRequestInfo.getRequestCreateTime();
     routerMetrics.routerRequestLatencyMs.update(requestLatencyMs);
     routerMetrics.getDataNodeBasedMetrics(replica.getDataNodeId()).deleteRequestLatencyMs.update(requestLatencyMs);
     // Check the error code from NetworkClient.
@@ -238,30 +247,56 @@ class DeleteOperation {
   }
 
   /**
+   * Process response if it was rejected due to quota compliance.
+   * @param correlationId correlation id of the request.
+   * @param replicaId {@link ReplicaId} of the request.
+   */
+  private void processQuotaRejectedResponse(int correlationId, ReplicaId replicaId) {
+    logger.trace("DeleteRequest with response correlationId {} was rejected because quota was exceeded.",
+        correlationId);
+    onErrorResponse(replicaId, new RouterException("QuotaExceeded", RouterErrorCode.TooManyRequests), false);
+    checkAndMaybeComplete();
+  }
+
+  /**
    * Goes through the inflight request list of this {@code DeleteOperation} and remove those that
    * have been timed out.
    * @param requestRegistrationCallback The callback to use to notify the networking layer of dropped requests.
    */
   private void cleanupExpiredInflightRequests(
       RequestRegistrationCallback<DeleteOperation> requestRegistrationCallback) {
-    Iterator<Map.Entry<Integer, DeleteRequestInfo>> itr = deleteRequestInfos.entrySet().iterator();
+    Iterator<Map.Entry<Integer, RequestInfo>> itr = deleteRequestInfos.entrySet().iterator();
     while (itr.hasNext()) {
-      Map.Entry<Integer, DeleteRequestInfo> entry = itr.next();
+      Map.Entry<Integer, RequestInfo> entry = itr.next();
       int correlationId = entry.getKey();
-      DeleteRequestInfo deleteRequestInfo = entry.getValue();
-      if (time.milliseconds() - deleteRequestInfo.startTimeMs > routerConfig.routerRequestTimeoutMs) {
+      RequestInfo requestInfo = entry.getValue();
+      // If request times out due to no response from server or due to being stuck in router itself (due to bandwidth
+      // throttling, etc) for long time, drop the request.
+      long currentTimeInMs = time.milliseconds();
+      RouterUtils.RouterRequestExpiryReason routerRequestExpiryReason =
+          RouterUtils.isRequestExpired(requestInfo, currentTimeInMs);
+      if (routerRequestExpiryReason != RouterUtils.RouterRequestExpiryReason.NO_TIMEOUT) {
         itr.remove();
-        logger.trace("Delete Request with correlationId {} in flight has expired for replica {} ", correlationId,
-            deleteRequestInfo.replica.getDataNodeId());
+        logger.trace("Delete Request with correlationId {} in flight has expired for replica {} due to {}",
+            correlationId, requestInfo.getReplicaId().getDataNodeId(), routerRequestExpiryReason.name());
         // Do not notify this as a failure to the response handler, as this timeout could simply be due to
         // connection unavailability. If there is indeed a network error, the NetworkClient will provide an error
         // response and the response handler will be notified accordingly.
-        onErrorResponse(deleteRequestInfo.replica,
-            RouterUtils.buildTimeoutException(correlationId, deleteRequestInfo.replica.getDataNodeId(), blobId));
+        onErrorResponse(requestInfo.getReplicaId(),
+            RouterUtils.buildTimeoutException(correlationId, requestInfo.getReplicaId().getDataNodeId(), blobId));
         requestRegistrationCallback.registerRequestToDrop(correlationId);
       } else {
-        // the entries are ordered by correlation id and time. Break on the first request that has not timed out.
-        break;
+        // Note: Even though the requests are ordered by correlation id and their creation time, we cannot break out of
+        // the while loop here. This is because time outs for all requests may not be equal now.
+
+        // For example, request 1 in the map may have been assigned high time out since it might be sent at a
+        // time when the load is high and request 2 may have been assigned lower time out value since the load might have
+        // decreased by the time it is sent out. In this case, we should continue iterating the loop and clean up
+        // request 2 in the map.
+
+        // The cost of iterating all entries should be okay since the map contains outstanding requests whose number
+        // should be small. The maximum outstanding requests possible would be equal to the operation parallelism value
+        // and may be few more if adaptive operation tracker is used.
       }
     }
   }
@@ -294,11 +329,23 @@ class DeleteOperation {
    * @param exception the {@link RouterException} associated with the failed response.
    */
   private void onErrorResponse(ReplicaId replicaId, RouterException exception) {
+    onErrorResponse(replicaId, exception, true);
+  }
+
+  /**
+   * Perform the necessary actions when a request to a replica fails.
+   * @param replicaId the {@link ReplicaId} associated with the failed response.
+   * @param exception the {@link RouterException} associated with the failed response.
+   * @param updateDataNodeMetrics {@code true} if data node metrics should be updated. {@code false} otherwise.
+   */
+  private void onErrorResponse(ReplicaId replicaId, RouterException exception, boolean updateDataNodeMetrics) {
     operationTracker.onResponse(replicaId,
         TrackedRequestFinalState.fromRouterErrorCodeToFinalState(exception.getErrorCode()));
     setOperationException(exception);
     routerMetrics.routerRequestErrorCount.inc();
-    routerMetrics.getDataNodeBasedMetrics(replicaId.getDataNodeId()).deleteRequestErrorCount.inc();
+    if (updateDataNodeMetrics) {
+      routerMetrics.getDataNodeBasedMetrics(replicaId.getDataNodeId()).deleteRequestErrorCount.inc();
+    }
   }
 
   /**
@@ -309,13 +356,31 @@ class DeleteOperation {
     if (operationTracker.isDone() || operationCompleted) {
       if (operationTracker.hasSucceeded()) {
         operationException.set(null);
-      } else if (operationTracker.hasFailedOnNotFound()) {
+      } else if (operationTracker.maybeFailedDueToOfflineReplicas()) {
         operationException.set(
-            new RouterException("DeleteOperation failed because of BlobNotFound", RouterErrorCode.BlobDoesNotExist));
+            new RouterException("DeleteOperation failed possibly because some replicas are unavailable",
+                RouterErrorCode.AmbryUnavailable));
+      } else if (operationTracker.hasFailedOnNotFound()) {
+        /*
+        We are relying on the fact that at least one replica has the blob. Scenarios like below are rare, so that we don’t need to handle them for now.
+          1. put parallelism is 3 && all three replicas of originating dc are down && remote replication is not caught up
+          2. put parallelism is 2 && 2 replicas are down (note that 2 replicas down happen all the time) && replication has not caught up such that blob doesn’t exist in at least one other replica.
+              i.e, its very rare for 2 replicas to be down simultaneously and immediately after taking a POST (with parallelism 2)
+         */
+        if (routerConfig.routerUnavailableDueToSuccessCountIsNonZeroForDelete && operationTracker.getSuccessCount() > 0) {
+          routerMetrics.failedMaybeDueToUnavailableReplicasCount.inc();
+          operationException.set(new RouterException("DeleteOperation failed possibly because of unavailable replicas",
+              RouterErrorCode.AmbryUnavailable));
+        } else {
+          //TODO: Temporarily return 404 when delete operation returns two NOT_FOUND.
+          //TODO: Will check all local replicas and return succeed if one replica return succeed in this case.
+          operationException.set(
+              new RouterException("DeleteOperation failed because of BlobNotFound", RouterErrorCode.BlobDoesNotExist));
+        }
       }
-      if (quotaChargeCallback != null) {
+      if (QuotaUtils.postProcessCharge(quotaChargeCallback)) {
         try {
-          quotaChargeCallback.charge();
+          quotaChargeCallback.checkAndCharge(false, true);
         } catch (QuotaException quotaException) {
           logger.error("Exception  {} in quota charge event listener during delete operation",
               quotaException.toString());
@@ -338,14 +403,16 @@ class DeleteOperation {
         return 1;
       case BlobExpired:
         return 2;
-      case AmbryUnavailable:
+      case TooManyRequests:
         return 3;
-      case UnexpectedInternalError:
+      case AmbryUnavailable:
         return 4;
-      case OperationTimedOut:
+      case UnexpectedInternalError:
         return 5;
-      case BlobDoesNotExist:
+      case OperationTimedOut:
         return 6;
+      case BlobDoesNotExist:
+        return 7;
       default:
         return Integer.MIN_VALUE;
     }
@@ -421,18 +488,5 @@ class DeleteOperation {
 
   long getSubmissionTimeMs() {
     return submissionTimeMs;
-  }
-
-  /**
-   * A wrapper class that is used to check if a request has been expired.
-   */
-  private class DeleteRequestInfo {
-    final long startTimeMs;
-    final ReplicaId replica;
-
-    DeleteRequestInfo(long submissionTime, ReplicaId replica) {
-      this.startTimeMs = submissionTime;
-      this.replica = replica;
-    }
   }
 }

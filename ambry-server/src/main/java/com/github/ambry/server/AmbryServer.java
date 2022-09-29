@@ -70,6 +70,7 @@ import com.github.ambry.rest.NioServerFactory;
 import com.github.ambry.rest.ServerSecurityService;
 import com.github.ambry.rest.ServerSecurityServiceFactory;
 import com.github.ambry.rest.StorageServerNettyFactory;
+import com.github.ambry.server.storagestats.AggregatedAccountStorageStats;
 import com.github.ambry.store.MessageInfo;
 import com.github.ambry.store.StorageManager;
 import com.github.ambry.store.StoreKeyConverterFactory;
@@ -283,7 +284,7 @@ public class AmbryServer {
       FindTokenHelper findTokenHelper = new FindTokenHelper(storeKeyFactory, replicationConfig);
       requests = new AmbryServerRequests(storageManager, networkServer.getRequestResponseChannel(), clusterMap, nodeId,
           registry, metrics, findTokenHelper, notificationSystem, replicationManager, storeKeyFactory, serverConfig,
-          storeKeyConverterFactory, statsManager, clusterParticipants.get(0));
+          diskManagerConfig, storeKeyConverterFactory, statsManager, clusterParticipants.get(0));
       requestHandlerPool = new RequestHandlerPool(serverConfig.serverRequestHandlerNumOfThreads,
           networkServer.getRequestResponseChannel(), requests);
       networkServer.start();
@@ -302,7 +303,7 @@ public class AmbryServer {
         AmbryServerRequests ambryServerRequestsForHttp2 =
             new AmbryServerRequests(storageManager, requestResponseChannel, clusterMap, nodeId, registry, metrics,
                 findTokenHelper, notificationSystem, replicationManager, storeKeyFactory, serverConfig,
-                storeKeyConverterFactory, statsManager, clusterParticipants.get(0));
+                diskManagerConfig, storeKeyConverterFactory, statsManager, clusterParticipants.get(0));
         requestHandlerPoolForHttp2 =
             new RequestHandlerPool(serverConfig.serverRequestHandlerNumOfThreads, requestResponseChannel,
                 ambryServerRequestsForHttp2);
@@ -332,7 +333,7 @@ public class AmbryServer {
       if (vcrClusterSpectator != null) {
         vcrClusterSpectator.spectate();
       }
-      Callback<StatsSnapshot> accountServiceCallback = new AccountServiceCallback(accountService);
+      Callback<AggregatedAccountStorageStats> accountServiceCallback = new AccountServiceCallback(accountService);
       for (ClusterParticipant clusterParticipant : clusterParticipants) {
         clusterParticipant.participate(ambryStatsReports, accountStatsMySqlStore, accountServiceCallback);
       }

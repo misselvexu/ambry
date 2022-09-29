@@ -32,6 +32,7 @@ public class FrontendConfig {
   // Property keys
   public static final String URL_SIGNER_ENDPOINTS = PREFIX + "url.signer.endpoints";
   public static final String CHUNK_UPLOAD_INITIAL_CHUNK_TTL_SECS_KEY = PREFIX + "chunk.upload.initial.chunk.ttl.secs";
+  public static final String CHUNK_UPLOAD_MAX_CHUNK_TTL_SECS_KEY = PREFIX + "chunk.upload.max.chunk.ttl.secs";
   public static final String FAIL_IF_TTL_REQUIRED_BUT_NOT_PROVIDED_KEY =
       PREFIX + "fail.if.ttl.required.but.not.provided";
   public static final String MAX_ACCEPTABLE_TTL_SECS_IF_TTL_REQUIRED_KEY =
@@ -41,6 +42,8 @@ public class FrontendConfig {
   public static final String NAMED_BLOB_DB_FACTORY = PREFIX + "named.blob.db.factory";
   public static final String CONTAINER_METRICS_EXCLUDED_ACCOUNTS = PREFIX + "container.metrics.excluded.accounts";
   public static final String ACCOUNT_STATS_STORE_FACTORY = PREFIX + "account.stats.store.factory";
+  public static final String CONTAINER_METRICS_ENABLED_REQUEST_TYPES = PREFIX + "container.metrics.enabled.request.types";
+  public static final String CONTAINER_METRICS_ENABLED_GET_REQUEST_TYPES = PREFIX + "container.metrics.enabled.get.request.types";
 
   // Default values
   private static final String DEFAULT_ENDPOINT = "http://localhost:1174";
@@ -49,6 +52,12 @@ public class FrontendConfig {
 
   private static final String DEFAULT_ACCOUNT_STATS_STORE_FACTORY =
       "com.github.ambry.accountstats.InmemoryAccountStatsStoreFactory";
+
+  private static final String DEFAULT_CONTAINER_METRICS_ENABLED_REQUEST_TYPES =
+      "DeleteBlob,GetBlob,GetBlobInfo,GetSignedUrl,PostBlob,UpdateBlobTtl,UndeleteBlob,PutBlob";
+
+  private static final String DEFAULT_CONTAINER_METRICS_ENABLED_GET_REQUEST_TYPES = "GetBlob,GetBlobInfo,GetSignedUrl";
+
 
   /**
    * Cache validity in seconds for non-private blobs for GET.
@@ -184,11 +193,18 @@ public class FrontendConfig {
   public final GetOption defaultRouterGetOption;
 
   /**
-   * The blob TTL in seconds to use for data chunks uploaded in a stitched upload session.
+   * The default blob TTL in seconds to use for data chunks uploaded in a stitched upload session.
    */
   @Config(CHUNK_UPLOAD_INITIAL_CHUNK_TTL_SECS_KEY)
   @Default("28 * 24 * 60 * 60")
   public final long chunkUploadInitialChunkTtlSecs;
+
+  /**
+   * Maximum value of the blob TTL in seconds to use for data chunks uploaded in a stitched upload session.
+   */
+  @Config(CHUNK_UPLOAD_MAX_CHUNK_TTL_SECS_KEY)
+  @Default("90 * 24 * 60 * 60")
+  public final long chunkUploadMaxChunkTtlSecs;
 
   @Config(FAIL_IF_TTL_REQUIRED_BUT_NOT_PROVIDED_KEY)
   @Default("false")
@@ -218,6 +234,20 @@ public class FrontendConfig {
   @Config(ACCOUNT_STATS_STORE_FACTORY)
   @Default(DEFAULT_ACCOUNT_STATS_STORE_FACTORY)
   public final String accountStatsStoreFactory;
+
+  /**
+   * The set of container metrics enabled request type.
+   */
+  @Config(CONTAINER_METRICS_ENABLED_REQUEST_TYPES)
+  @Default(DEFAULT_CONTAINER_METRICS_ENABLED_REQUEST_TYPES)
+  public final String containerMetricsEnabledRequestTypes;
+
+  /**
+   * The set of container metrics enabled get request type.
+   */
+  @Config(CONTAINER_METRICS_ENABLED_GET_REQUEST_TYPES)
+  @Default(DEFAULT_CONTAINER_METRICS_ENABLED_GET_REQUEST_TYPES)
+  public final String containerMetricsEnabledGetRequestTypes;
 
   /**
    * Can be set to a classname that implements {@link com.github.ambry.named.NamedBlobDbFactory} to enable named blob
@@ -262,7 +292,10 @@ public class FrontendConfig {
     allowServiceIdBasedPostRequest =
         verifiableProperties.getBoolean("frontend.allow.service.id.based.post.request", true);
     attachTrackingInfo = verifiableProperties.getBoolean("frontend.attach.tracking.info", true);
-
+    containerMetricsEnabledRequestTypes = verifiableProperties.getString(CONTAINER_METRICS_ENABLED_REQUEST_TYPES,
+        DEFAULT_CONTAINER_METRICS_ENABLED_REQUEST_TYPES);
+    containerMetricsEnabledGetRequestTypes = verifiableProperties.getString(CONTAINER_METRICS_ENABLED_GET_REQUEST_TYPES,
+        DEFAULT_CONTAINER_METRICS_ENABLED_GET_REQUEST_TYPES);
     urlSignerEndpoints = verifiableProperties.getString(URL_SIGNER_ENDPOINTS, DEFAULT_ENDPOINTS_STRING);
     urlSignerDefaultMaxUploadSizeBytes =
         verifiableProperties.getLongInRange("frontend.url.signer.default.max.upload.size.bytes", 100 * 1024 * 1024, 0,
@@ -276,6 +309,7 @@ public class FrontendConfig {
         GetOption.valueOf(verifiableProperties.getString("frontend.default.router.get.option", GetOption.None.name()));
     chunkUploadInitialChunkTtlSecs =
         verifiableProperties.getLong(CHUNK_UPLOAD_INITIAL_CHUNK_TTL_SECS_KEY, TimeUnit.DAYS.toSeconds(28));
+    chunkUploadMaxChunkTtlSecs = verifiableProperties.getLong(CHUNK_UPLOAD_MAX_CHUNK_TTL_SECS_KEY, TimeUnit.DAYS.toSeconds(90));
     failIfTtlRequiredButNotProvided = verifiableProperties.getBoolean(FAIL_IF_TTL_REQUIRED_BUT_NOT_PROVIDED_KEY, false);
     maxAcceptableTtlSecsIfTtlRequired = verifiableProperties.getIntInRange(MAX_ACCEPTABLE_TTL_SECS_IF_TTL_REQUIRED_KEY,
         (int) TimeUnit.DAYS.toSeconds(30), 0, Integer.MAX_VALUE);
