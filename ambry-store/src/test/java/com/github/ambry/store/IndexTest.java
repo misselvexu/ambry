@@ -448,12 +448,12 @@ public class IndexTest {
     // Back to first dataNode, missing several keys would clear the cache
     int numKeys = DEFAULT_NUMBER_CACHE_MISS_IN_FIND_MISSING_KEY_IN_BATCH_MODE;
     keys = new ArrayList<>(numKeys);
-    for (int i = 0; i < numKeys+1; i++) {
+    for (int i = 0; i < numKeys + 1; i++) {
       keys.add(state.getUniqueId());
     }
     keys.addAll(getRandomKeyFromIndexSegment(0, 1));
     long findKeyCallCountBefore = state.metrics.findTime.getCount();
-    Assert.assertEquals(numKeys+1, state.index.findMissingKeysInBatch(keys, dataNode).size());
+    Assert.assertEquals(numKeys + 1, state.index.findMissingKeysInBatch(keys, dataNode).size());
     long findKeyCallCountAfter = state.metrics.findTime.getCount();
     Assert.assertEquals(keys.size(), findKeyCallCountAfter - findKeyCallCountBefore);
     Assert.assertEquals(0, state.index.getCachedKeys().get(dataNode).size());
@@ -732,6 +732,63 @@ public class IndexTest {
     } catch (StoreException e) {
       assertEquals("Unexpected StoreErrorCode", StoreErrorCodes.ID_Undeleted, e.getErrorCode());
     }
+  }
+
+  /**
+   * Test the sanity check of the before and after index segment offsets.
+   */
+  @Test
+  public void testBeforeAndAfterOffsetSanityCheck() throws Exception {
+    assumeTrue(isLogSegmented && persistentIndexVersion >= PersistentIndex.VERSION_3);
+    // Adding valid before and after offsets for finished compaction
+    Map<Offset, Offset> beforeAndAfter = new HashMap<>();
+    Offset after = state.index.getIndexSegments().firstKey();
+    Offset before = new Offset(after.getName().getNextGenerationName(), LogSegment.HEADER_SIZE);
+    beforeAndAfter.put(before, after); // This is one redirection.
+    Offset beforeBefore = new Offset(before.getName().getNextGenerationName(), LogSegment.HEADER_SIZE);
+    beforeAndAfter.put(beforeBefore, before); // This is two redirections.
+    state.index.updateBeforeAndAfterCompactionIndexSegmentOffsets(state.time.milliseconds(), beforeAndAfter, false);
+    state.index.sanityCheckBeforeAndAfterCompactionIndexSegmentOffsets();
+    assertFalse(state.index.isSanityCheckFailed());
+
+    // Adding invalid before and after offsets for inprogress compaction
+    try {
+      state.index.updateBeforeAndAfterCompactionIndexSegmentOffsets(state.time.milliseconds(), beforeAndAfter, true);
+      fail("Before and after offsets should be invalid for inprogress compaction");
+    } catch (Exception e) {
+    }
+
+    // Adding invalid before and after offset for finished compaction.
+    beforeAndAfter.clear();
+    Offset secondIndexSegmentOffset = state.index.getIndexSegments().higherKey(after);
+    // Before offset exist in the current index
+    beforeAndAfter.put(secondIndexSegmentOffset, after);
+    state.index.updateBeforeAndAfterCompactionIndexSegmentOffsets(state.time.milliseconds(), beforeAndAfter, false);
+    state.index.sanityCheckBeforeAndAfterCompactionIndexSegmentOffsets();
+
+    assertTrue(state.index.isSanityCheckFailed());
+
+    state.reloadIndex(true, false);
+    assertFalse(state.index.isSanityCheckFailed());
+    beforeAndAfter.clear();
+    // Create two non-existing offsets
+    Offset nonExistingBefore =
+        new Offset(secondIndexSegmentOffset.getName().getNextGenerationName(), LogSegment.HEADER_SIZE);
+    Offset nonExistingAfter = new Offset(nonExistingBefore.getName().getNextGenerationName(), LogSegment.HEADER_SIZE);
+    beforeAndAfter.put(nonExistingBefore, nonExistingAfter);
+    state.index.updateBeforeAndAfterCompactionIndexSegmentOffsets(state.time.milliseconds(), beforeAndAfter, false);
+    state.index.sanityCheckBeforeAndAfterCompactionIndexSegmentOffsets();
+    assertTrue(state.index.isSanityCheckFailed());
+
+    state.reloadIndex(true, false);
+    assertFalse(state.index.isSanityCheckFailed());
+    beforeAndAfter.clear();
+    // Create a loop
+    beforeAndAfter.put(nonExistingBefore, nonExistingAfter);
+    beforeAndAfter.put(nonExistingAfter, nonExistingBefore);
+    state.index.updateBeforeAndAfterCompactionIndexSegmentOffsets(state.time.milliseconds(), beforeAndAfter, false);
+    state.index.sanityCheckBeforeAndAfterCompactionIndexSegmentOffsets();
+    assertTrue(state.index.isSanityCheckFailed());
   }
 
   /**
@@ -1670,6 +1727,81 @@ public class IndexTest {
     expectedToken = new StoreFindToken(firstKey, firstIndexSegment.getStartOffset(), stateForTokenTest.sessionId,
         stateForTokenTest.incarnationId, firstIndexSegment.getResetKey(), firstIndexSegment.getResetKeyType(),
         firstIndexSegment.getResetKeyLifeVersion());
+    compareTokens(expectedToken, token);
+  }
+
+  @Test
+  public void rebuildTokenBasedOnCompactionHistoryTest() throws StoreException {
+    assumeTrue(isLogSegmented);
+    stateForTokenTest.index.enableRebuildTokenBasedOnCompactionHistory();
+
+    IndexSegment firstIndexSegment = stateForTokenTest.index.getIndexSegments().firstEntry().getValue();
+    IndexSegment secondIndexSegment =
+        stateForTokenTest.index.getIndexSegments().higherEntry(firstIndexSegment.getStartOffset()).getValue();
+    long now = stateForTokenTest.time.milliseconds();
+    Map<Offset, Offset> indexSegmentOffsets = new HashMap<>();
+    Offset secondIndexSegmentOffset = secondIndexSegment.getStartOffset();
+    Offset before =
+        new Offset(secondIndexSegmentOffset.getName().getNextGenerationName(), secondIndexSegmentOffset.getOffset());
+    indexSegmentOffsets.put(before, secondIndexSegmentOffset);
+    stateForTokenTest.index.updateBeforeAndAfterCompactionIndexSegmentOffsets(now, indexSegmentOffsets, false);
+    stateForTokenTest.index.sanityCheckBeforeAndAfterCompactionIndexSegmentOffsets();
+
+    // 1. Generate an invalid index-based token with invalid offset, but it can be found in the before and after compaction map
+    Offset invalidOffset = before;
+    StoreKey keyFromFirstIndexSegment = firstIndexSegment.iterator().next().getKey();
+    StoreKey keyFromSecondIndexSegment = secondIndexSegment.iterator().next().getKey();
+    StoreFindToken startToken = new StoreFindToken(keyFromFirstIndexSegment, invalidOffset, stateForTokenTest.sessionId,
+        stateForTokenTest.incarnationId, null, null, (short) -1);
+    // The invalid token should be revalidated by looking up the before and after compaction index segment map
+    FindInfo findInfo = stateForTokenTest.index.findEntriesSince(startToken, 1);
+    StoreFindToken token = (StoreFindToken) findInfo.getFindToken();
+    StoreFindToken expectedToken =
+        new StoreFindToken(keyFromSecondIndexSegment, secondIndexSegmentOffset, stateForTokenTest.sessionId,
+            stateForTokenTest.incarnationId, secondIndexSegment.getResetKey(), secondIndexSegment.getResetKeyType(),
+            secondIndexSegment.getResetKeyLifeVersion());
+    compareTokens(expectedToken, token);
+
+    // 2. Generate an invalid index-based token with invalid offset, but it can't be found in the before and after compaction map
+    invalidOffset = new Offset(before.getName().getNextGenerationName(), before.getOffset());
+    startToken = new StoreFindToken(keyFromSecondIndexSegment, invalidOffset, stateForTokenTest.sessionId,
+        stateForTokenTest.incarnationId, null, null, (short) -1);
+    // The invalid token will be revalidated to the beginning of the log
+    findInfo = stateForTokenTest.index.findEntriesSince(startToken, 1);
+    token = (StoreFindToken) findInfo.getFindToken();
+    expectedToken =
+        new StoreFindToken(keyFromFirstIndexSegment, firstIndexSegment.getStartOffset(), stateForTokenTest.sessionId,
+            stateForTokenTest.incarnationId, firstIndexSegment.getResetKey(), firstIndexSegment.getResetKeyType(),
+            firstIndexSegment.getResetKeyLifeVersion());
+    compareTokens(expectedToken, token);
+
+    // 3. Generate an invalid index-based token with invalid offset, but it can be found by multiple redirections.
+    Offset beforeBefore = new Offset(before.getName().getNextGenerationName(), before.getOffset() + 100);
+    indexSegmentOffsets.put(beforeBefore, before);
+    stateForTokenTest.index.updateBeforeAndAfterCompactionIndexSegmentOffsets(now, indexSegmentOffsets, false);
+    stateForTokenTest.index.sanityCheckBeforeAndAfterCompactionIndexSegmentOffsets();
+    invalidOffset = beforeBefore;
+    startToken = new StoreFindToken(keyFromFirstIndexSegment, invalidOffset, stateForTokenTest.sessionId,
+        stateForTokenTest.incarnationId, null, null, (short) -1);
+    // The invalid token should be revalidated by looking up the before and after compaction index segment map
+    findInfo = stateForTokenTest.index.findEntriesSince(startToken, 1);
+    token = (StoreFindToken) findInfo.getFindToken();
+    expectedToken = new StoreFindToken(keyFromSecondIndexSegment, secondIndexSegmentOffset, stateForTokenTest.sessionId,
+        stateForTokenTest.incarnationId, secondIndexSegment.getResetKey(), secondIndexSegment.getResetKeyType(),
+        secondIndexSegment.getResetKeyLifeVersion());
+    compareTokens(expectedToken, token);
+
+    // Generate an invalid journal-based token with invalid offset, but it can be found in the before and after compaction map
+    invalidOffset = new Offset(before.getName(), before.getOffset() + 100);
+    startToken =
+        new StoreFindToken(invalidOffset, stateForTokenTest.sessionId, stateForTokenTest.incarnationId, false, null,
+            null, (short) -1);
+    // The invalid token should be revalidated by looking up the before and after compaction index segment map
+    findInfo = stateForTokenTest.index.findEntriesSince(startToken, 1);
+    token = (StoreFindToken) findInfo.getFindToken();
+    expectedToken = new StoreFindToken(keyFromSecondIndexSegment, secondIndexSegmentOffset, stateForTokenTest.sessionId,
+        stateForTokenTest.incarnationId, secondIndexSegment.getResetKey(), secondIndexSegment.getResetKeyType(),
+        secondIndexSegment.getResetKeyLifeVersion());
     compareTokens(expectedToken, token);
   }
 
